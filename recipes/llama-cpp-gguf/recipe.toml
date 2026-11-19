@@ -1,0 +1,164 @@
+api = 1
+id = "llama-cpp-gguf"
+version = "1.0.0"
+category = "llm"
+tags = ["GGUF", "llama.cpp", "OpenAI API", "Web Chat", "Auto-VRAM"]
+needs = ["hf_token"]
+
+[name]
+zh-CN = "部署 GGUF 大模型 (llama.cpp)"
+en = "Deploy GGUF LLM (llama.cpp)"
+
+[description]
+zh-CN = "使用预编译 CUDA 版 llama.cpp 极速运行 Hugging Face GGUF 模型，自动测算显存选择最佳量化与上下文长度，提供 OpenAI 兼容 /v1 接口与内置网页对话。"
+en = "Serve any Hugging Face GGUF model via prebuilt CUDA llama.cpp with automatic GPU VRAM quantization fitting, OpenAI-compatible /v1 API, and built-in Web UI."
+
+[provision]
+accelerator = "A100"
+min_vram_mib = 0
+high_mem = false
+
+[[inputs]]
+id = "repo"
+type = "hf-gguf"
+required = true
+default = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+[inputs.label]
+zh-CN = "GGUF 模型仓库"
+en = "GGUF Model Repository"
+[inputs.help]
+zh-CN = "支持搜索任意包含 .gguf 的 Hugging Face 仓库，例如 unsloth/Qwen3-8B-GGUF"
+en = "Any Hugging Face repository containing .gguf weights, e.g. unsloth/Qwen3-8B-GGUF"
+
+[[inputs]]
+id = "quant"
+type = "text"
+default = "auto"
+[inputs.label]
+zh-CN = "量化精度"
+en = "Quantization"
+[inputs.help]
+zh-CN = "auto 会根据分配到的 GPU 显存自动挑选最佳量化；也可填任意档位如 Q8_0, Q6_K, Q4_K_M, UD-Q4_K_XL, IQ4_XS, BF16"
+en = "auto picks the highest-precision quantization that fits VRAM, or enter any quant (e.g. Q8_0, Q6_K, Q4_K_M, UD-Q4_K_XL, IQ4_XS, BF16)"
+
+[[inputs]]
+id = "ctx"
+type = "number"
+default = 0
+min = 0
+max = 1048576
+[inputs.label]
+zh-CN = "上下文窗口 (Context)"
+en = "Context Length"
+[inputs.help]
+zh-CN = "0 表示使用模型最大上下文（显存不足时自动折半降级以保证顺利启动）"
+en = "0 uses model max context (automatically stepped down if needed to fit VRAM)"
+
+[[inputs]]
+id = "kv"
+type = "select"
+options = ["auto", "f16", "q8_0", "q4_0"]
+default = "auto"
+[inputs.label]
+zh-CN = "KV 缓存精度"
+en = "KV Cache Type"
+
+[[inputs]]
+id = "port"
+type = "number"
+default = 8000
+min = 1024
+max = 65535
+[inputs.label]
+zh-CN = "VM 服务端口"
+en = "VM Server Port"
+[inputs.help]
+zh-CN = "请勿使用 8080（Colab 内部占用），默认 8000"
+en = "Avoid 8080 (reserved by Colab); defaults to 8000"
+
+[[inputs]]
+id = "alias"
+type = "text"
+[inputs.label]
+zh-CN = "API 模型别名 (model id)"
+en = "Model Alias in API"
+[inputs.help]
+zh-CN = "留空则根据仓库名自动生成"
+en = "Leave blank to derive automatically from the repository name"
+
+[[inputs]]
+id = "mmproj"
+type = "text"
+default = "auto"
+[inputs.label]
+zh-CN = "多模态视觉投影 (mmproj)"
+en = "Vision Projector (mmproj)"
+[inputs.help]
+zh-CN = "auto 自动加载仓库内的视觉投影（优先 f16）；填 none 禁用"
+en = "auto loads vision projector if present (prefers f16); 'none' disables"
+
+[[inputs]]
+id = "mtp"
+type = "select"
+options = ["auto", "on", "off"]
+default = "auto"
+[inputs.label]
+zh-CN = "MTP 投机解码加速"
+en = "MTP Speculative Decoding"
+
+[[inputs]]
+id = "api_key"
+type = "secret"
+[inputs.label]
+zh-CN = "访问密钥 API Key（可选）"
+en = "API Key (Optional)"
+
+[[inputs]]
+id = "extra_args"
+type = "text"
+[inputs.label]
+zh-CN = "附加 llama-server 参数"
+en = "Extra llama-server Flags"
+
+[run]
+script = "worker.py"
+
+[[stages]]
+id = "detect"
+[stages.label]
+zh-CN = "探测 GPU 硬件与显存"
+en = "Probe GPU & VRAM"
+
+[[stages]]
+id = "plan"
+[stages.label]
+zh-CN = "测算最佳量化与 KV 方案"
+en = "Plan Quantization & KV Fit"
+
+[[stages]]
+id = "download"
+[stages.label]
+zh-CN = "并行拉取引擎与模型权重"
+en = "Download Engine & Weights"
+
+[[stages]]
+id = "server"
+[stages.label]
+zh-CN = "启动 CUDA 推理服务"
+en = "Launch llama-server (CUDA)"
+
+[[stages]]
+id = "warmup"
+[stages.label]
+zh-CN = "CUDA 算子预热与测速"
+en = "CUDA Warm-up & Speed Check"
+
+[[endpoints]]
+id = "openai_api"
+port_input = "port"
+path = "/v1"
+health = "/health"
+kind = "openai"
+[endpoints.label]
+zh-CN = "OpenAI 兼容 API 与内置 WebChat"
+en = "OpenAI-Compatible API & Web Chat"

@@ -1,0 +1,186 @@
+api = 1
+id = "minimax-h3-studio"
+version = "1.0.0"
+category = "vision"
+tags = ["MiniMax-H3", "ComfyUI", "G4 Blackwell", "3-Track Parallel", "SageAttention", "LatentSync"]
+needs = ["hf_token"]
+
+[name]
+zh-CN = "部署 MiniMax-H3 视频人物替换极速工作台 (三轨并发)"
+en = "Deploy MiniMax-H3 Video Studio (3-Track Parallel)"
+
+[description]
+zh-CN = "面向 Colab G4 Blackwell (96GB) 优化的 MiniMax-H3 Ref2VA + CharacterSwap v1.5 极速工作台：uv 并行装环境、hf_xet/aria2c 并发拉取 39.5GB 权重、预编译 SageAttention sm120 直装、支持热实例 0 秒复用与可选 LatentSync 口型精修节点。"
+en = "High-speed MiniMax-H3 Ref2VA + CharacterSwap v1.5 ComfyUI studio for Colab G4 Blackwell: 3-track parallel uv + hf_xet/aria2c bootstrap, precompiled SageAttention sm120 wheel support, 0-second warm-session reuse, and optional LatentSync lip-sync nodes."
+
+[provision]
+accelerator = "G4"
+min_vram_mib = 80000
+high_mem = true
+
+[[inputs]]
+id = "comfy_commit"
+type = "text"
+default = "fe298e4e20f1ff26d30e8639267bbd0b57811390"
+[inputs.label]
+zh-CN = "ComfyUI 版本提交 (Commit / latest)"
+en = "ComfyUI Commit (or 'latest')"
+[inputs.help]
+zh-CN = "默认锁定已验证的 MiniMax-H3 节点提交哈希；填 latest 拉取最新浅克隆"
+en = "Pinned verified MiniMax-H3 commit hash by default; enter 'latest' for HEAD shallow clone"
+
+[[inputs]]
+id = "pytorch_mode"
+type = "select"
+options = ["cu130_291", "reuse_system"]
+default = "cu130_291"
+[inputs.label]
+zh-CN = "PyTorch 环境策略"
+en = "PyTorch Environment Strategy"
+[inputs.help]
+zh-CN = "cu130_291 使用 uv 在隔离 venv 并发安装 PyTorch 2.9.1+cu130（适配 Blackwell sm120）；reuse_system 直接复用 Colab 系统 PyTorch"
+en = "cu130_291 installs PyTorch 2.9.1+cu130 via uv in parallel with model downloads; reuse_system reuses Colab system PyTorch"
+
+[[inputs]]
+id = "sage_mode"
+type = "select"
+options = ["wheel_or_compile", "wheel_only", "disabled"]
+default = "wheel_or_compile"
+[inputs.label]
+zh-CN = "SageAttention 2.2 加速模式"
+en = "SageAttention 2.2 Mode"
+[inputs.help]
+zh-CN = "优先秒装预编译 sm120 wheel（~2秒）；如未提供 wheel 且选 wheel_or_compile，将自动编译并归档至 keep/wheels 供下次复用"
+en = "Installs precompiled sm120 wheel in ~2s; compiles and archives wheel to keep/wheels when missing under wheel_or_compile"
+
+[[inputs]]
+id = "sage_wheel_url"
+type = "text"
+default = ""
+[inputs.label]
+zh-CN = "预编译 SageAttention Wheel 地址 (可选)"
+en = "Precompiled SageAttention Wheel URL (Optional)"
+[inputs.help]
+zh-CN = "支持直链 https://...whl 或 Hugging Face 格式 owner/repo::path/to/sageattention.whl，彻底免去 280 秒现场编译"
+en = "Direct https://...whl URL or Hugging Face 'owner/repo::filename.whl' to skip 280s CUDA compilation"
+
+[[inputs]]
+id = "download_h3_models"
+type = "bool"
+default = true
+[inputs.label]
+zh-CN = "并发预拉取 40.1GB MiniMax-H3 (含 Audio VAE) + CharacterSwap v1.5 权重"
+en = "Parallel Download 40.1GB MiniMax-H3 (incl. Audio VAE) + LoRA Weights"
+
+[[inputs]]
+id = "download_audio_vae"
+type = "bool"
+default = true
+[inputs.label]
+zh-CN = "加载原生 Audio VAE (minimax_h3_audio_vae_fp32.safetensors)"
+en = "Download Native Audio VAE (minimax_h3_audio_vae_fp32.safetensors)"
+[inputs.help]
+zh-CN = "仅 577 MB，与大模型并发拉取零额外耗时；接入 MiniMaxH3ReferenceToVideo.audio_vae + ref_video_audios 可启用原生音画联动口型"
+en = "577 MB downloaded in parallel (0 extra time); wire into MiniMaxH3ReferenceToVideo.audio_vae + ref_video_audios for native audio-driven lip sync"
+
+[[inputs]]
+id = "download_engine"
+type = "select"
+options = ["hf_xet_parallel", "aria2c_parallel"]
+default = "hf_xet_parallel"
+[inputs.label]
+zh-CN = "模型并发下载引擎"
+en = "Model Parallel Download Engine"
+[inputs.help]
+zh-CN = "hf_xet_parallel 通过 4 线程并发 + HF Xet 协议拉满 GCP 带宽；aria2c_parallel 使用多连接 16 线程并发拉取"
+en = "hf_xet_parallel uses 4-way concurrent HF Xet downloads; aria2c_parallel uses 16-connection aria2c per file"
+
+[[inputs]]
+id = "verify_sha256"
+type = "select"
+options = ["skip_lfs_etag", "parallel_sha256"]
+default = "skip_lfs_etag"
+[inputs.label]
+zh-CN = "权重完整性校验策略"
+en = "Weight Verification Mode"
+[inputs.help]
+zh-CN = "skip_lfs_etag 校验精确字节数并信任 HF LFS 锁定提交（最快，省 ~40秒读盘）；parallel_sha256 启用多核 sha256sum 并发核验"
+en = "skip_lfs_etag checks exact pinned byte sizes (saves ~40s disk re-read); parallel_sha256 runs multi-core sha256sum"
+
+[[inputs]]
+id = "install_lipsync_nodes"
+type = "bool"
+default = false
+[inputs.label]
+zh-CN = "同时安装口型精修节点 (LatentSync + 人声分离)"
+en = "Install Lip-Sync Refinement Nodes (LatentSync + Demucs)"
+[inputs.help]
+zh-CN = "在同实例内安装 ComfyUI-LatentSyncWrapper 与 Demucs 人声分离依赖，便于对 H3 换人后的唱歌特写镜做二阶段精准对口型"
+en = "Installs ComfyUI-LatentSyncWrapper and Demucs vocal separation inside the same ComfyUI instance for close-up lip-sync refinement"
+
+[[inputs]]
+id = "strict_g4_gate"
+type = "bool"
+default = true
+[inputs.label]
+zh-CN = "强制校验 G4 Blackwell (sm120 / ≥80GB)"
+en = "Enforce G4 Blackwell Gate (sm120 / >=80GB)"
+
+[[inputs]]
+id = "port"
+type = "number"
+default = 8188
+min = 1024
+max = 65535
+[inputs.label]
+zh-CN = "VM 服务端口"
+en = "VM Server Port"
+
+[run]
+script = "worker.py"
+
+[[stages]]
+id = "hardware"
+[stages.label]
+zh-CN = "校验 GPU 与显存规格"
+en = "Verify GPU & VRAM"
+
+[[stages]]
+id = "parallel_setup"
+[stages.label]
+zh-CN = "三轨并发：环境 + 39.5GB 权重 + 加速"
+en = "3-Track Parallel: Env + 39.5GB Models + Accel"
+
+[[stages]]
+id = "verify"
+[stages.label]
+zh-CN = "权重核验与加速模块就绪"
+en = "Verify Weights & Attention Backend"
+
+[[stages]]
+id = "server"
+[stages.label]
+zh-CN = "启动 MiniMax-H3 ComfyUI 服务"
+en = "Launch MiniMax-H3 ComfyUI Server"
+
+[[endpoints]]
+id = "webui"
+port_input = "port"
+path = "/"
+health = "/system_stats"
+kind = "http"
+[endpoints.label]
+zh-CN = "MiniMax-H3 ComfyUI 工作台 (8188)"
+en = "MiniMax-H3 ComfyUI Studio (8188)"
+
+[[keep]]
+path = "/content/minimax-h3/output"
+[keep.label]
+zh-CN = "MiniMax-H3 渲染成品视频目录"
+en = "MiniMax-H3 Rendered Video Outputs"
+
+[[keep]]
+path = "/content/minimax-h3/wheels"
+[keep.label]
+zh-CN = "预编译 SageAttention Wheel 缓存"
+en = "Precompiled SageAttention Wheel Cache"

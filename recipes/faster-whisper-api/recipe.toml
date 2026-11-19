@@ -1,0 +1,78 @@
+api = 1
+id = "faster-whisper-api"
+version = "1.0.0"
+category = "audio"
+tags = ["Faster-Whisper", "ASR / Subtitles", "Word Timestamps", "OpenAI Audio API"]
+needs = ["hf_token"]
+
+[name]
+zh-CN = "部署 Faster-Whisper 语音转写与字幕对齐服务"
+en = "Deploy Faster-Whisper ASR & Subtitle Server"
+
+[description]
+zh-CN = "在 Colab GPU 上部署 CTranslate2 加速版 Faster-Whisper（支持 large-v3-turbo），提供兼容 OpenAI /v1/audio/transcriptions 的高精度词级时间戳与双语字幕时间轴校准接口。"
+en = "Deploy GPU-accelerated Faster-Whisper (large-v3 / turbo) with an OpenAI-compatible /v1/audio/transcriptions endpoint and word-level subtitle timestamps."
+
+[provision]
+accelerator = "T4"
+min_vram_mib = 0
+high_mem = false
+
+[[inputs]]
+id = "model_size"
+type = "select"
+options = ["large-v3-turbo", "large-v3", "distil-large-v3", "medium"]
+default = "large-v3-turbo"
+[inputs.label]
+zh-CN = "Whisper 模型规格"
+en = "Whisper Model Size"
+
+[[inputs]]
+id = "compute_type"
+type = "select"
+options = ["float16", "int8_float16", "int8"]
+default = "float16"
+[inputs.label]
+zh-CN = "推理精度 (compute_type)"
+en = "Compute Precision"
+
+[[inputs]]
+id = "port"
+type = "number"
+default = 8002
+min = 1024
+max = 65535
+[inputs.label]
+zh-CN = "VM 服务端口"
+en = "VM Server Port"
+
+[run]
+script = "worker.py"
+
+[[stages]]
+id = "install"
+[stages.label]
+zh-CN = "安装 Faster-Whisper 与音频依赖"
+en = "Install Faster-Whisper & FastAPI"
+
+[[stages]]
+id = "download"
+[stages.label]
+zh-CN = "预拉取并加载 CUDA 语音模型"
+en = "Load Whisper Model onto GPU"
+
+[[stages]]
+id = "server"
+[stages.label]
+zh-CN = "启动 OpenAI 兼容语音转写 API"
+en = "Start OpenAI Audio API Server"
+
+[[endpoints]]
+id = "audio_api"
+port_input = "port"
+path = "/v1"
+health = "/health"
+kind = "audio"
+[endpoints.label]
+zh-CN = "Whisper 语音转写 /v1/audio/transcriptions"
+en = "Whisper OpenAI Audio Endpoint"

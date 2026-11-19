@@ -1,0 +1,18 @@
+# Byte-compiled / virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Local runtime state, credentials fallback, receipts & SSH keys
+data/
+.colab-boost/
+*.corrupt
+
+# Pytest / Ruff / Playwright snapshots
+.pytest_cache/
+.ruff_cache/
+.coverage
+.playwright-mcp/

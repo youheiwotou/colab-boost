@@ -1,0 +1,671 @@
+"""FastAPI control-plane server, WebSocket live event stream, and Playground proxy."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+import time
+from typing import Any, Optional
+
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import httpx
+from pydantic import BaseModel, Field
+
+from colab_boost.backends.base import ColabBackendError
+from colab_boost.gguf_planner import (
+    GgufRepoPlan,
+    build_hardware_fit_matrix,
+    inspect_hf_gguf_repo,
+    search_hf_gguf_repos,
+    validate_hf_repo_id,
+)
+from colab_boost.models import DeployRequest, ProvisionRequest
+from colab_boost.orchestrator import ConsoleOrchestrator
+from colab_boost.recipe_loader import RecipeValidationError
+
+
+class OAuthCompleteBody(BaseModel):
+    flow_id: str
+    code: str
+
+
+class ExtendDeadlineBody(BaseModel):
+    add_minutes: int = Field(default=120, ge=1, le=1440)
+
+
+class SessionExecBody(BaseModel):
+    code: str
+    shell: bool = False
+    env: Optional[dict[str, str]] = None
+    timeout_s: float = Field(default=60.0, ge=1.0, le=1800.0)
+
+
+class SessionUploadBody(BaseModel):
+    remote_path: str
+    local_path: Optional[str] = None
+    content_b64: Optional[str] = None
+
+
+class SessionDownloadBody(BaseModel):
+    remote_path: str
+    local_path: Optional[str] = None
+
+
+class OpenTunnelBody(BaseModel):
+    session_name: str
+    remote_port: int = Field(..., ge=1024, le=65535)
+    local_port: int = Field(default=0, ge=0, le=65535)
+    label: str = "Port Forward"
+    path: str = "/"
+    kind: str = "http"
+
+
+class SecretUpdateBody(BaseModel):
+    value: str
+
+
+class PlaygroundChatBody(BaseModel):
+    tunnel_id: Optional[str] = None
+    base_url: Optional[str] = None
+    model: str = "default"
+    api_key: Optional[str] = None
+    messages: list[dict[str, str]] = Field(default_factory=list)
+    max_tokens: int = Field(default=256, ge=1, le=8192)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+
+
+# Built-in preset GGUF catalog for instant fallback or quick-pick suggestions
+CURATED_GGUF_CATALOG: dict[str, dict[str, Any]] = {
+    "Qwen/Qwen2.5-7B-Instruct-GGUF": {
+        "arch": "qwen2",
+        "ctx": 32768,
+        "kv_bpt": 57344,
+        "files": [
+            ("qwen2.5-7b-instruct-q8_0.gguf", int(8.10 * 1024**3)),
+            ("qwen2.5-7b-instruct-q6_k.gguf", int(6.25 * 1024**3)),
+            ("qwen2.5-7b-instruct-q5_k_m.gguf", int(5.45 * 1024**3)),
+            ("qwen2.5-7b-instruct-q4_k_m.gguf", int(4.68 * 1024**3)),
+        ],
+    },
+    "unsloth/Qwen3-32B-GGUF": {
+        "arch": "qwen3",
+        "ctx": 40960,
+        "kv_bpt": 262144,
+        "files": [
+            ("Qwen3-32B-BF16.gguf", int(61.2 * 1024**3)),
+            ("Qwen3-32B-Q8_0.gguf", int(32.5 * 1024**3)),
+            ("Qwen3-32B-Q6_K.gguf", int(25.1 * 1024**3)),
+            ("Qwen3-32B-Q4_K_M.gguf", int(18.5 * 1024**3)),
+            ("Qwen3-32B-IQ4_XS.gguf", int(16.4 * 1024**3)),
+        ],
+    },
+    "bartowski/DeepSeek-R1-Distill-Qwen-32B-GGUF": {
+        "arch": "qwen2",
+        "ctx": 65536,
+        "kv_bpt": 262144,
+        "files": [
+            ("DeepSeek-R1-Distill-Qwen-32B-Q8_0.gguf", int(32.6 * 1024**3)),
+            ("DeepSeek-R1-Distill-Qwen-32B-Q6_K.gguf", int(25.2 * 1024**3)),
+            ("DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf", int(18.6 * 1024**3)),
+        ],
+    },
+}
+
+
+def _map_domain_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, RecipeValidationError):
+        return HTTPException(status_code=422, detail={"kind": "validation_error", "field": exc.field, "message": str(exc)})
+    if isinstance(exc, ColabBackendError):
+        code = 400
+        if exc.kind in ("auth_error", "missing_credential"):
+            code = 401
+        elif exc.kind == "not_entitled":
+            code = 403
+        elif exc.kind in ("runtime_lost", "session_missing"):
+            code = 404
+        elif exc.kind in ("capacity_412", "session_cap", "duplicate_name"):
+            code = 409
+        elif exc.kind in ("watchdog_failed", "kernel_unreachable", "kernel_dead", "exec_disconnected"):
+            code = 502
+        return HTTPException(status_code=code, detail={"kind": exc.kind, "message": exc.message})
+    if isinstance(exc, KeyError):
+        return HTTPException(status_code=404, detail={"kind": "not_found", "message": str(exc).strip("'")})
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail={"kind": "invalid_input", "message": str(exc)})
+    return HTTPException(status_code=500, detail={"kind": "internal_error", "message": f"{type(exc).__name__}: {exc}"})
+
+
+def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
+    orch = orchestrator or ConsoleOrchestrator()
+    ws_clients: set[WebSocket] = set()
+    loop_ref: list[Optional[asyncio.AbstractEventLoop]] = [None]
+
+    def on_orch_event(event: dict[str, Any]) -> None:
+        ev_loop = loop_ref[0]
+        if not ev_loop or not ws_clients:
+            return
+
+        async def _broadcast() -> None:
+            dead: list[WebSocket] = []
+            for ws in list(ws_clients):
+                try:
+                    await ws.send_json(event)
+                except Exception:
+                    dead.append(ws)
+            for d in dead:
+                ws_clients.discard(d)
+
+        try:
+            ev_loop.call_soon_threadsafe(lambda: asyncio.create_task(_broadcast()))
+        except RuntimeError:
+            pass
+
+    unsubscribe = orch.subscribe(on_orch_event)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        loop_ref[0] = asyncio.get_running_loop()
+        stop_bg = asyncio.Event()
+
+        async def guard_monitor_loop() -> None:
+            while not stop_bg.is_set():
+                try:
+                    await asyncio.wait_for(stop_bg.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await asyncio.to_thread(orch.evaluate_cost_guards)
+
+        guard_task = asyncio.create_task(guard_monitor_loop())
+        try:
+            yield
+        finally:
+            stop_bg.set()
+            guard_task.cancel()
+            unsubscribe()
+            orch.shutdown()
+
+    app = FastAPI(
+        title="Colab Boost Console API",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.state.orchestrator = orch
+
+    web_dir = Path(__file__).resolve().parent / "web"
+    app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_index() -> FileResponse:
+        return FileResponse(str(web_dir / "index.html"))
+
+    @app.get("/api/health")
+    async def api_health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "backend_mode": orch.settings.backend_mode,
+            "is_mock": orch.backend.is_mock,
+        }
+
+    @app.get("/api/bootstrap")
+    async def api_bootstrap() -> dict[str, Any]:
+        accounts = await asyncio.to_thread(orch.list_accounts, False)
+        sessions = await asyncio.to_thread(orch.list_sessions, True)
+        return {
+            "settings": orch.get_settings(),
+            "accounts": accounts,
+            "active_account": orch.active_account(),
+            "sessions": sessions,
+            "provision_ops": orch.list_provision_ops(),
+            "recipes": orch.list_recipes(),
+            "runs": orch.list_runs(),
+            "tunnels": orch.tunnels.list_tunnels(),
+            "receipts": orch.list_receipts(),
+            "secrets": orch.vault.secret_status(),
+            "curated_gguf_repos": list(CURATED_GGUF_CATALOG.keys()),
+        }
+
+    @app.patch("/api/settings")
+    async def api_update_settings(patch: dict[str, Any]) -> Any:
+        try:
+            return await asyncio.to_thread(orch.update_settings, patch)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    # -------------------- Accounts --------------------
+
+    @app.post("/api/accounts/login/begin")
+    async def api_login_begin() -> dict[str, str]:
+        try:
+            return await asyncio.to_thread(orch.begin_account_login)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/accounts/login/complete")
+    async def api_login_complete(body: OAuthCompleteBody) -> Any:
+        try:
+            return await asyncio.to_thread(orch.complete_account_login, body.flow_id, body.code)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/accounts/import-cli")
+    async def api_import_cli() -> Any:
+        try:
+            return await asyncio.to_thread(orch.import_colab_cli_credential)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/accounts/{account_id}/switch")
+    async def api_switch_account(account_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(orch.switch_active_account, account_id)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.delete("/api/accounts/{account_id}")
+    async def api_delete_account(account_id: str) -> dict[str, Any]:
+        ok = await asyncio.to_thread(orch.remove_account, account_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail={"kind": "not_found", "message": "Account not found"})
+        return {"removed": account_id}
+
+    @app.post("/api/accounts/refresh")
+    async def api_refresh_accounts() -> Any:
+        return await asyncio.to_thread(orch.list_accounts, True)
+
+    # -------------------- Sessions & Cost Guards --------------------
+
+    @app.get("/api/sessions")
+    async def api_list_sessions() -> Any:
+        return await asyncio.to_thread(orch.list_sessions, True)
+
+    @app.post("/api/sessions")
+    async def api_create_session(req: ProvisionRequest, async_mode: bool = Query(default=False)) -> Any:
+        try:
+            if async_mode:
+                return await asyncio.to_thread(orch.start_provision_async, req)
+            return await asyncio.to_thread(orch.provision_session, req)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/provision/{op_id}/cancel")
+    async def api_cancel_provision(op_id: str) -> dict[str, Any]:
+        ok = await asyncio.to_thread(orch.cancel_provision, op_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail={"kind": "not_found", "message": "Provision operation not active"})
+        return {"cancelled": op_id}
+
+    @app.post("/api/sessions/stop-all")
+    async def api_stop_all_sessions() -> dict[str, Any]:
+        try:
+            receipts = await asyncio.to_thread(orch.stop_all_sessions, "emergency_stop_all")
+            remaining = await asyncio.to_thread(orch.list_sessions, True)
+            return {
+                "stopped_count": len(receipts),
+                "remaining_sessions": len(remaining),
+                "zero_burn_verified": len(remaining) == 0,
+                "receipts": receipts,
+            }
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/sessions/{identifier}/stop")
+    async def api_stop_session(identifier: str, account_id: Optional[str] = Query(default=None)) -> Any:
+        try:
+            return await asyncio.to_thread(orch.stop_session, identifier, account_id=account_id, reason="manual_stop")
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/sessions/{session_name}/extend")
+    async def api_extend_session(session_name: str, body: ExtendDeadlineBody) -> Any:
+        try:
+            return await asyncio.to_thread(orch.extend_session_deadline, session_name, body.add_minutes)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/sessions/{identifier}/exec")
+    async def api_exec_session(identifier: str, body: SessionExecBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                orch.exec_on_session,
+                identifier,
+                body.code,
+                shell=body.shell,
+                env=body.env,
+                timeout_s=body.timeout_s,
+            )
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/sessions/{identifier}/upload")
+    async def api_upload_session(identifier: str, body: SessionUploadBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                orch.upload_to_session,
+                identifier,
+                body.remote_path,
+                local_path=body.local_path,
+                content_b64=body.content_b64,
+            )
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/sessions/{identifier}/download")
+    async def api_download_session(identifier: str, body: SessionDownloadBody) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                orch.download_from_session,
+                identifier,
+                body.remote_path,
+                local_path=body.local_path,
+            )
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/guards/evaluate")
+    async def api_evaluate_guards() -> dict[str, Any]:
+        receipts = await asyncio.to_thread(orch.evaluate_cost_guards)
+        return {"triggered_count": len(receipts), "receipts": receipts}
+
+    @app.get("/api/receipts")
+    async def api_list_receipts() -> Any:
+        return orch.list_receipts()
+
+    # -------------------- Tunnels --------------------
+
+    @app.get("/api/tunnels")
+    async def api_list_tunnels() -> Any:
+        return orch.tunnels.list_tunnels()
+
+    @app.post("/api/tunnels")
+    async def api_open_tunnel(body: OpenTunnelBody) -> Any:
+        try:
+            return await asyncio.to_thread(
+                orch.open_tunnel,
+                body.session_name,
+                body.remote_port,
+                body.local_port,
+                body.label,
+                body.path,
+                body.kind,
+            )
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.delete("/api/tunnels/{tunnel_id}")
+    async def api_close_tunnel(tunnel_id: str) -> dict[str, Any]:
+        ok = await asyncio.to_thread(orch.close_tunnel, tunnel_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail={"kind": "not_found", "message": "Tunnel not found"})
+        return {"closed": tunnel_id, "billing_notice": "Closing a port forward does NOT stop Colab VM billing."}
+
+    # -------------------- Recipes & Deployments --------------------
+
+    @app.get("/api/recipes")
+    async def api_list_recipes() -> Any:
+        return orch.list_recipes()
+
+    @app.get("/api/deployments")
+    async def api_list_deployments() -> Any:
+        return orch.list_runs()
+
+    @app.post("/api/deployments")
+    async def api_start_deployment(req: DeployRequest, sync: bool = Query(default=False)) -> Any:
+        try:
+            return await asyncio.to_thread(orch.start_deployment, req, run_sync=sync)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.get("/api/deployments/{run_id}")
+    async def api_get_deployment(run_id: str) -> Any:
+        try:
+            return orch.get_run(run_id)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/deployments/{run_id}/cancel")
+    async def api_cancel_deployment(run_id: str) -> Any:
+        try:
+            return await asyncio.to_thread(orch.cancel_deployment, run_id)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.post("/api/deployments/{run_id}/keep/sync")
+    async def api_sync_keep_artifacts(run_id: str) -> dict[str, Any]:
+        try:
+            items = await asyncio.to_thread(orch.sync_keep_artifacts, run_id)
+            return {"run_id": run_id, "keep_paths": items}
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.get("/api/deployments/{run_id}/keep/download")
+    async def api_download_keep_archive(run_id: str, index: int = Query(default=0, ge=0)) -> FileResponse:
+        try:
+            run = orch.get_run(run_id)
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+        if index >= len(run.keep_paths):
+            raise HTTPException(status_code=404, detail={"kind": "not_found", "message": "Keep path index out of range"})
+        kp = run.keep_paths[index]
+        if not kp.local_archive:
+            raise HTTPException(
+                status_code=404,
+                detail={"kind": "not_synced", "message": "Sync keep artifacts first before downloading archive"},
+            )
+        arc_file = Path(kp.local_archive).resolve()
+        keep_root = orch.paths.keep_dir.resolve()
+        if keep_root not in arc_file.parents or not arc_file.is_file():
+            raise HTTPException(status_code=404, detail={"kind": "not_found", "message": "Local archive file not found"})
+        return FileResponse(str(arc_file), media_type="application/gzip", filename=arc_file.name)
+
+    # -------------------- Hugging Face GGUF Search & VRAM Planner --------------------
+
+    @app.get("/api/hf/search")
+    async def api_hf_search(q: str = Query(default="")) -> dict[str, Any]:
+        hf_tok = orch.vault.get_secret("hf_token")
+        try:
+            items = await search_hf_gguf_repos(q, hf_token=hf_tok, limit=10)
+            return {"source": "huggingface", "items": items}
+        except Exception:
+            # Graceful fallback to curated catalog if offline or rate-limited
+            ql = q.strip().lower()
+            fallback = [
+                {"id": repo_id, "downloads": 125000, "likes": 420, "pipeline_tag": "text-generation"}
+                for repo_id in CURATED_GGUF_CATALOG
+                if not ql or ql in repo_id.lower()
+            ]
+            return {"source": "curated_fallback", "items": fallback}
+
+    @app.get("/api/hf/gguf-plan")
+    async def api_hf_gguf_plan(
+        repo: str = Query(...),
+        quant: str = Query(default="auto"),
+        ctx: int = Query(default=0, ge=0, le=1048576),
+        kv: str = Query(default="auto"),
+    ) -> dict[str, Any]:
+        try:
+            repo_id = validate_hf_repo_id(repo)
+        except ValueError as exc:
+            raise _map_domain_error(exc) from exc
+
+        hf_tok = orch.vault.get_secret("hf_token")
+        plan: Optional[GgufRepoPlan] = None
+        source = "huggingface"
+        try:
+            plan = await inspect_hf_gguf_repo(repo_id, hf_token=hf_tok)
+        except Exception as exc:
+            preset = CURATED_GGUF_CATALOG.get(repo_id)
+            if preset:
+                source = "curated_fallback"
+                from colab_boost.gguf_planner import group_gguf_files
+
+                variants, mmproj = group_gguf_files(preset["files"])
+                plan = GgufRepoPlan(
+                    repo=repo_id,
+                    variants=variants,
+                    mmproj_files=mmproj,
+                    preferred_mmproj=mmproj[0][0] if mmproj else None,
+                    architecture=preset["arch"],
+                    model_ctx=preset["ctx"],
+                    kv_bytes_per_token_f16=preset["kv_bpt"],
+                    has_mtp=False,
+                )
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail={"kind": "hf_unreachable", "message": f"Could not inspect Hugging Face repo '{repo_id}'."},
+                ) from exc
+
+        matrix = build_hardware_fit_matrix(plan, quant=quant, requested_ctx=ctx, kv_type=kv)
+        return {
+            "source": source,
+            "repo": plan.repo,
+            "architecture": plan.architecture,
+            "model_ctx": plan.model_ctx,
+            "kv_bytes_per_token_f16": plan.kv_bytes_per_token_f16,
+            "has_mtp": plan.has_mtp,
+            "preferred_mmproj": plan.preferred_mmproj,
+            "variants": [
+                {"quant": v.quant, "size_gib": v.size_gib, "files": v.files}
+                for v in plan.variants
+            ],
+            "hardware_matrix": matrix,
+        }
+
+    # -------------------- Vault Secrets --------------------
+
+    @app.put("/api/secrets/{slot}")
+    async def api_set_secret(slot: str, body: SecretUpdateBody) -> dict[str, Any]:
+        try:
+            orch.vault.set_secret(slot, body.value)
+            return {"secrets": orch.vault.secret_status()}
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    @app.delete("/api/secrets/{slot}")
+    async def api_delete_secret(slot: str) -> dict[str, Any]:
+        try:
+            orch.vault.delete_secret(slot)
+            return {"secrets": orch.vault.secret_status()}
+        except Exception as exc:
+            raise _map_domain_error(exc) from exc
+
+    # -------------------- Built-in OpenAI Playground Chat --------------------
+
+    @app.post("/api/playground/chat")
+    async def api_playground_chat(body: PlaygroundChatBody) -> dict[str, Any]:
+        if not body.messages:
+            raise HTTPException(status_code=400, detail={"kind": "invalid_input", "message": "messages cannot be empty"})
+
+        target_url = (body.base_url or "").strip().rstrip("/")
+        tun = None
+        if body.tunnel_id:
+            tun = next((t for t in orch.tunnels.list_tunnels() if t.id == body.tunnel_id), None)
+            if not tun:
+                raise HTTPException(status_code=404, detail={"kind": "not_found", "message": "Tunnel not found"})
+            target_url = tun.local_url.rstrip("/")
+
+        resolved_model = (body.model or "").strip()
+        if resolved_model in ("", "default", "auto") and tun is not None:
+            for run in reversed(orch.list_runs()):
+                if run.session_name == tun.session_name and run.state == "ready" and run.outputs.get("model_id"):
+                    resolved_model = str(run.outputs["model_id"])
+                    break
+
+        if orch.backend.is_mock:
+            eff_model = resolved_model or "default"
+            t0 = time.perf_counter()
+            await asyncio.sleep(0.08)
+            last_user = next((m.get("content", "") for m in reversed(body.messages) if m.get("role") == "user"), "")
+            endpoint_disp = target_url or "http://127.0.0.1:8000/v1"
+            if orch.settings.language == "en":
+                reply = (
+                    f"[Sandbox Demo Inference | Model `{eff_model}`]\n"
+                    f"Received via local tunnel `{endpoint_disp}`: \"{last_user[:80]}\".\n"
+                    "Switch to Real Colab Mode and sign in with Google to forward requests to a live llama.cpp / vLLM GPU instance."
+                )
+            else:
+                reply = (
+                    f"[演示沙盒推理回执 | 模型 `{eff_model}`]\n"
+                    f"已通过本地映射端点 `{endpoint_disp}` 收到消息：\"{last_user[:80]}\"。\n"
+                    "切换到「真实 Colab 模式」登录 Google 账号后，此处将直接转发至 Colab GPU 上的真实 llama.cpp / vLLM 实例。"
+                )
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            return {
+                "reply": reply,
+                "model": eff_model,
+                "latency_ms": elapsed_ms,
+                "tok_per_s": 78.4,
+                "is_mock": True,
+            }
+
+        if not target_url:
+            raise HTTPException(status_code=400, detail={"kind": "invalid_input", "message": "Select an active OpenAI tunnel or enter base_url"})
+        if not target_url.endswith("/v1") and "/v1/" not in target_url:
+            target_url = target_url + "/v1"
+
+        headers = {"Content-Type": "application/json"}
+        if body.api_key:
+            headers["Authorization"] = f"Bearer {body.api_key}"
+
+        t0 = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                if resolved_model in ("", "default", "auto"):
+                    try:
+                        m_resp = await client.get(f"{target_url}/models", headers=headers, timeout=10.0)
+                        if m_resp.status_code == 200:
+                            m_items = (m_resp.json() or {}).get("data") or []
+                            if isinstance(m_items, list) and m_items and isinstance(m_items[0], dict) and m_items[0].get("id"):
+                                resolved_model = str(m_items[0]["id"])
+                    except Exception:
+                        pass
+
+                eff_model = resolved_model or "default"
+                resp = await client.post(
+                    f"{target_url}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": eff_model,
+                        "messages": body.messages,
+                        "max_tokens": body.max_tokens,
+                        "temperature": body.temperature,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"kind": "upstream_error", "message": f"Model endpoint request failed: {exc}"},
+            ) from exc
+
+        elapsed_s = max(0.001, time.perf_counter() - t0)
+        choice = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        comp_tokens = (data.get("usage") or {}).get("completion_tokens") or 0
+        tps = round(float((data.get("timings") or {}).get("predicted_per_second") or (comp_tokens / elapsed_s if comp_tokens else 0.0)), 1)
+        return {
+            "reply": choice,
+            "model": data.get("model") or eff_model,
+            "latency_ms": round(elapsed_s * 1000, 1),
+            "tok_per_s": tps,
+            "is_mock": False,
+        }
+
+    # -------------------- Real-Time WebSocket Stream --------------------
+
+    @app.websocket("/ws/events")
+    async def ws_events(ws: WebSocket) -> None:
+        await ws.accept()
+        ws_clients.add(ws)
+        try:
+            await ws.send_json({"type": "connected", "data": {"backend_mode": orch.settings.backend_mode}})
+            while True:
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            ws_clients.discard(ws)
+
+    return app

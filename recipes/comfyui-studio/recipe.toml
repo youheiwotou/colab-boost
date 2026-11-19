@@ -1,0 +1,102 @@
+api = 1
+id = "comfyui-studio"
+version = "1.0.0"
+category = "vision"
+tags = ["ComfyUI", "Flux / Wan2.1", "Image & Video", "WebUI"]
+needs = ["hf_token", "civitai_token"]
+
+[name]
+zh-CN = "部署 ComfyUI 视觉/视频生成工作台"
+en = "Deploy ComfyUI Image & Video Studio"
+
+[description]
+zh-CN = "在 Colab L4/A100 上极速部署 ComfyUI + Manager，复用系统 CUDA PyTorch 免重装，支持预拉取 Hugging Face 权重并将 8188 端口映射到本地浏览器。"
+en = "Rapidly launch ComfyUI + Manager reusing Colab's preinstalled CUDA PyTorch, optionally pre-downloading weights and forwarding port 8188 locally."
+
+[provision]
+accelerator = "L4"
+min_vram_mib = 20000
+high_mem = false
+
+[[inputs]]
+id = "checkpoint_repo"
+type = "text"
+default = ""
+[inputs.label]
+zh-CN = "预下载模型仓库 (可选)"
+en = "Pre-download HF Repo (Optional)"
+[inputs.help]
+zh-CN = "填入 owner/repo（如 Comfy-Org/Wan_2.1_ComfyUI_repackaged）自动预拉取，留空则直接秒启纯净工作台"
+en = "Optional Hugging Face owner/repo to download into /content/ComfyUI/models; leave empty for instant launch"
+
+[[inputs]]
+id = "checkpoint_file"
+type = "text"
+default = ""
+[inputs.label]
+zh-CN = "指定权重文件路径 (可选)"
+en = "Specific File in Repo (Optional)"
+
+[[inputs]]
+id = "target_subdir"
+type = "select"
+options = ["checkpoints", "diffusion_models", "vae", "loras", "text_encoders"]
+default = "checkpoints"
+[inputs.label]
+zh-CN = "模型存放子目录"
+en = "Target Models Subfolder"
+
+[[inputs]]
+id = "install_manager"
+type = "bool"
+default = true
+[inputs.label]
+zh-CN = "自动安装 ComfyUI-Manager"
+en = "Install ComfyUI-Manager"
+
+[[inputs]]
+id = "port"
+type = "number"
+default = 8188
+min = 1024
+max = 65535
+[inputs.label]
+zh-CN = "VM 服务端口"
+en = "VM Server Port"
+
+[run]
+script = "worker.py"
+
+[[stages]]
+id = "setup"
+[stages.label]
+zh-CN = "克隆并安装 ComfyUI 依赖"
+en = "Clone & Configure ComfyUI"
+
+[[stages]]
+id = "models"
+[stages.label]
+zh-CN = "拉取指定底模/组件"
+en = "Fetch Selected Weights"
+
+[[stages]]
+id = "server"
+[stages.label]
+zh-CN = "启动 ComfyUI 节点引擎"
+en = "Start ComfyUI Server"
+
+[[endpoints]]
+id = "webui"
+port_input = "port"
+path = "/"
+health = "/system_stats"
+kind = "http"
+[endpoints.label]
+zh-CN = "ComfyUI 可视化工作流界面"
+en = "ComfyUI Visual Canvas"
+
+[[keep]]
+path = "/content/ComfyUI/output"
+[keep.label]
+zh-CN = "ComfyUI 渲染成品目录"
+en = "ComfyUI Rendered Outputs"

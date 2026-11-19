@@ -1,0 +1,131 @@
+api = 1
+id = "vllm-openai"
+version = "1.0.0"
+category = "llm"
+tags = ["vLLM", "Safetensors", "AWQ/GPTQ", "Multimodal VLM", "OpenAI API"]
+needs = ["hf_token"]
+
+[name]
+zh-CN = "部署 vLLM 高吞吐推理服务"
+en = "Deploy vLLM High-Throughput Server"
+
+[description]
+zh-CN = "基于 vLLM 部署 Hugging Face 标准 Safetensors / AWQ / GPTQ / 多模态视觉大模型（如 Qwen2.5-VL、Qwen3、DeepSeek-R1），提供高并发 OpenAI /v1 接口。"
+en = "Serve Hugging Face Safetensors, AWQ, GPTQ, or Multimodal VLMs with vLLM PagedAttention and an OpenAI-compatible /v1 API."
+
+[provision]
+accelerator = "A100"
+min_vram_mib = 38000
+high_mem = true
+
+[[inputs]]
+id = "repo"
+type = "hf-repo"
+required = true
+default = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+[inputs.label]
+zh-CN = "Hugging Face 模型仓库"
+en = "Hugging Face Model Repository"
+[inputs.help]
+zh-CN = "例如 Qwen/Qwen2.5-7B-Instruct-AWQ 或 Qwen/Qwen2.5-VL-7B-Instruct"
+en = "e.g. Qwen/Qwen2.5-7B-Instruct-AWQ or Qwen/Qwen2.5-VL-7B-Instruct"
+
+[[inputs]]
+id = "quantization"
+type = "select"
+options = ["auto", "awq", "gptq", "fp8", "bitsandbytes"]
+default = "auto"
+[inputs.label]
+zh-CN = "量化方式"
+en = "Quantization Mode"
+
+[[inputs]]
+id = "dtype"
+type = "select"
+options = ["auto", "bfloat16", "float16"]
+default = "auto"
+[inputs.label]
+zh-CN = "计算精度 (dtype)"
+en = "Compute Dtype"
+
+[[inputs]]
+id = "max_model_len"
+type = "number"
+default = 16384
+min = 1024
+max = 262144
+[inputs.label]
+zh-CN = "最大上下文长度 (max-model-len)"
+en = "Max Context Length"
+
+[[inputs]]
+id = "gpu_mem_util"
+type = "number"
+default = 92
+min = 50
+max = 98
+[inputs.label]
+zh-CN = "显存占用上限 (%)"
+en = "GPU Memory Utilization (%)"
+
+[[inputs]]
+id = "port"
+type = "number"
+default = 8000
+min = 1024
+max = 65535
+[inputs.label]
+zh-CN = "VM 服务端口"
+en = "VM Server Port"
+
+[[inputs]]
+id = "trust_remote_code"
+type = "bool"
+default = true
+[inputs.label]
+zh-CN = "允许远程模型代码 (trust-remote-code)"
+en = "Trust Remote Code"
+
+[[inputs]]
+id = "api_key"
+type = "secret"
+[inputs.label]
+zh-CN = "API 密钥（可选）"
+en = "API Key (Optional)"
+
+[run]
+script = "worker.py"
+
+[[stages]]
+id = "detect"
+[stages.label]
+zh-CN = "检查 GPU 环境"
+en = "Verify CUDA GPU"
+
+[[stages]]
+id = "install"
+[stages.label]
+zh-CN = "极速安装 vLLM 运行时 (uv)"
+en = "Install vLLM via uv"
+
+[[stages]]
+id = "download"
+[stages.label]
+zh-CN = "预拉取 Hugging Face 模型"
+en = "Pre-download Model Weights"
+
+[[stages]]
+id = "server"
+[stages.label]
+zh-CN = "编译 CUDA Graph 并启动 vLLM"
+en = "Start vLLM & Capture CUDA Graphs"
+
+[[endpoints]]
+id = "openai_api"
+port_input = "port"
+path = "/v1"
+health = "/health"
+kind = "openai"
+[endpoints.label]
+zh-CN = "vLLM OpenAI /v1 接口"
+en = "vLLM OpenAI /v1 Endpoint"

@@ -1,0 +1,51 @@
+[project]
+name = "colab-boost"
+version = "0.1.0"
+description = "Colab Boost Console — Native cross-platform control plane for rapid model deployment, multi-account CCU cost guards, VRAM auto-fitting, and localhost port forwarding on Google Colab."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "httpx>=0.28.0",
+    "requests>=2.32.0",
+    "google-auth>=2.36.0",
+    "google-auth-oauthlib>=1.2.0",
+    "keyring>=25.5.0",
+    "websocket-client>=1.8.0",
+]
+
+[project.scripts]
+colab-boost = "colab_boost.cli:main"
+colab-boost-ssh-proxy = "colab_boost.ssh_bridge:proxy_cli_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/colab_boost"]
+
+[dependency-groups]
+dev = [
+    "asyncssh>=2.24.1",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["src", "recipes", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501"]

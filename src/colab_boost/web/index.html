@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Colab Boost Console — 极速模型部署与算力护栏控制台</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%23111113'/><path d='M35 12L17 36h13l-2 16 19-24H34l1-16z' fill='%23fafafa'/></svg>" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- Minimalist Top Telemetry Bar -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        </div>
+        <span class="brand-name" data-i18n="brand_title">Colab Boost</span>
+      </div>
+      <span class="crumb-sep">/</span>
+      <span class="crumb-current" id="crumb-current">总览看板</span>
+      <button class="mode-badge mock" id="btn-toggle-mode" title="点击切换演示沙盒与真实 Colab 模式">
+        演示沙盒模式 · 0 计费
+      </button>
+    </div>
+
+    <div class="topbar-hud" id="topbar-hud">
+      <button class="cmd-trigger" id="btn-cmd-palette" type="button">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <span data-i18n="cmd_label">命令面板</span>
+        <kbd>Ctrl K</kbd>
+      </button>
+
+      <div class="telemetry-strip">
+        <div class="hud-pill" id="hud-account">账号 <strong>加载中...</strong></div>
+        <span class="tele-div"></span>
+        <div class="hud-pill" id="hud-balance">余额 <strong>--</strong></div>
+        <span class="tele-div"></span>
+        <div class="hud-pill" id="hud-burn">消耗 <strong>--</strong></div>
+      </div>
+
+      <button class="btn btn-danger btn-sm" id="btn-stop-all" style="display:none;">
+        停止全部
+      </button>
+      <button class="btn btn-icon-text btn-sm" id="btn-lang" type="button">EN</button>
+      <button class="btn btn-icon btn-sm" id="btn-theme" type="button" title="Toggle Theme">L</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <!-- Left Navigation Rail -->
+    <aside class="sidebar">
+      <nav class="nav-list" id="sidebar-nav">
+        <div class="nav-section-label" data-i18n="nav_group_work">工作台</div>
+        <button class="nav-btn active" data-route="overview" type="button">
+          <span class="nav-btn-left">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+            <span data-i18n="nav_overview">总览看板</span>
+          </span>
+        </button>
+        <button class="nav-btn" data-route="deploy" type="button">
+          <span class="nav-btn-left">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            <span data-i18n="nav_deploy">极速部署模型</span>
+          </span>
+          <span class="nav-count mono" id="badge-runs">0</span>
+        </button>
+        <button class="nav-btn" data-route="sessions" type="button">
+          <span class="nav-btn-left">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/></svg>
+            <span data-i18n="nav_sessions">算力实例管理</span>
+          </span>
+          <span class="nav-count mono" id="badge-sessions">0</span>
+        </button>
+        <button class="nav-btn" data-route="tunnels" type="button">
+          <span class="nav-btn-left">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            <span data-i18n="nav_tunnels">端口映射与对话</span>
+          </span>
+          <span class="nav-count mono" id="badge-tunnels">0</span>
+        </button>
+
+        <div class="nav-section-label nav-section-spaced" data-i18n="nav_group_audit">控制与审计</div>
+        <button class="nav-btn" data-route="accounts" type="button">
+          <span class="nav-btn-left">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            <span data-i18n="nav_accounts">多账号与关闭回执</span>
+          </span>
+          <span class="nav-count mono" id="badge-receipts">0</span>
+        </button>
+        <button class="nav-btn" data-route="settings" type="button">
+          <span class="nav-btn-left">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <span data-i18n="nav_settings">成本护栏与密钥</span>
+          </span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="ws-status-row">
+          <span class="dot dot-emerald" id="ws-dot"></span>
+          <span id="ws-indicator">实时状态流已连接</span>
+        </div>
+        <div class="footer-sub" data-i18n="footer_native">Windows 原生免 WSL 直连引擎</div>
+        <div class="footer-sub" data-i18n="footer_receipts">自动保存 Unassign 关闭回执</div>
+      </div>
+    </aside>
+
+    <!-- Main Dynamic View -->
+    <main class="content-area" id="main-view">
+      <div class="card">正在初始化控制台...</div>
+    </main>
+  </div>
+
+  <!-- Reusable Modal -->
+  <div class="modal-backdrop hidden" id="modal-backdrop">
+    <div class="modal" id="modal-body"></div>
+  </div>
+
+  <!-- Toast Notifications -->
+  <div class="toast-stack" id="toast-stack"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
