@@ -592,3 +592,792 @@ def test_playground_chat_real_mode_ssrf_protection(isolated_paths, monkeypatch) 
         )
         assert r_custom.status_code == 502
 
+
+def test_frontend_zero_inline_handlers_and_neutral_ws_default() -> None:
+    """Ensures index.html and app.js have zero inline on*= handlers and neutral initial WS dot."""
+    import re
+
+    from colab_boost.config import project_root
+
+    web_dir = project_root() / "src" / "colab_boost" / "web"
+    html_src = (web_dir / "index.html").read_text(encoding="utf-8")
+    js_src = (web_dir / "app.js").read_text(encoding="utf-8")
+
+    inline_re = re.compile(r"""\bon(?:click|input|change|submit|keydown|keyup|focus|blur|load|error)\s*=\s*["']""", re.I)
+    assert not inline_re.search(html_src), "Found inline on*= handler in index.html"
+    assert not inline_re.search(js_src), "Found inline on*= handler in app.js"
+
+    # Sidebar WS indicator must not default to green connected dot
+    assert 'id="ws-dot"' in html_src
+    assert 'class="dot dot-muted" id="ws-dot"' in html_src
+    assert "实时状态流已连接" not in html_src
+
+
+def test_frontend_phase2_state_ime_auth_alerts_and_contract_regressions(orchestrator: ConsoleOrchestrator) -> None:
+    """Comprehensive Node VM behavioral regressions for Phase 2 frontend fixes."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import pytest
+
+    from colab_boost.config import project_root
+
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node binary not available")
+
+    app = create_app(orchestrator)
+    with TestClient(app) as client:
+        boot_payload = client.get("/api/bootstrap").json()
+
+    app_js_path = project_root() / "src" / "colab_boost" / "web" / "app.js"
+
+    # --- Suite A: Command palette IME stability + keyboard nav, 401 token modal + URL token + Bearer/WS,
+    # timed_out_provisions banner, Playground decoupled history & real-mode empty tunnel,
+    # hours_remaining === 0, L4 highMem & H100/V6E1 & accelerator_specs/approx_burn_rates,
+    # warm VM filtering, secret DOM hygiene, dirty settings draft, modal clear, scrollTop, reqId races, WS backoff ---
+    harness = r"""
+const fs = require('fs');
+const vm = require('vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+
+function createHarness(opts = {}) {
+  const els = {};
+  const docListeners = {};
+  const storage = {};
+  const replacedUrls = [];
+  const wsCalls = [];
+  const fetchCalls = [];
+  const scheduledTimeouts = [];
+  let timerSeq = 1;
+
+  function makeEl(id = '', attrs = {}) {
+    const listeners = {};
+    const classes = new Set();
+    const el = {
+      id,
+      tagName: 'DIV',
+      className: '',
+      textContent: '',
+      _innerHTML: '',
+      value: '',
+      placeholder: '',
+      title: '',
+      disabled: false,
+      scrollTop: 0,
+      scrollHeight: 500,
+      clientHeight: 200,
+      style: {},
+      dataset: { ...(attrs.dataset || {}) },
+      classList: {
+        add(...cs) { cs.forEach((c) => classes.add(c)); },
+        remove(...cs) { cs.forEach((c) => classes.delete(c)); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (classes.has(c)) classes.delete(c); else classes.add(c);
+          } else if (force) classes.add(c);
+          else classes.delete(c);
+        },
+        contains(c) { return classes.has(c); },
+      },
+      setAttribute(k, v) { attrs[k] = v; },
+      getAttribute(k) { return k in attrs ? attrs[k] : null; },
+      appendChild(ch) { this.lastChild = ch; },
+      remove() {},
+      contains(target) { return target && !!els[target.id]; },
+      focus() { doc.activeElement = this; },
+      closest(sel) {
+        if (sel === '[data-action]' && this.dataset && this.dataset.action) return this;
+        if (sel === 'form[data-submit]' && this.dataset && this.dataset.submit) return this;
+        return null;
+      },
+      querySelector(sel) { return (opts.querySelector && opts.querySelector(sel, this)) || null; },
+      querySelectorAll(sel) { return (opts.querySelectorAll && opts.querySelectorAll(sel, this)) || []; },
+      addEventListener(ev, fn) {
+        listeners[ev] = listeners[ev] || [];
+        listeners[ev].push(fn);
+      },
+      dispatch(ev, eventObj = {}) {
+        const list = listeners[ev] || [];
+        let out;
+        for (const fn of list) {
+          out = fn({ target: this, currentTarget: this, preventDefault() {}, ...eventObj });
+        }
+        return out;
+      },
+      click() { return this.dispatch('click'); },
+      _listeners: listeners,
+    };
+    Object.defineProperty(el, 'innerHTML', {
+      get() { return this._innerHTML; },
+      set(v) {
+        this._innerHTML = String(v);
+        if (opts.onInnerHTML) opts.onInnerHTML(this, this._innerHTML);
+      },
+    });
+    return el;
+  }
+
+  const getEl = (id) => (els[id] = els[id] || makeEl(id));
+  [
+    'modal-backdrop', 'modal-body', 'toast-stack', 'btn-toggle-mode', 'btn-cmd-palette',
+    'hud-account', 'hud-balance', 'hud-burn', 'btn-stop-all', 'stop-all-group',
+    'btn-lang', 'btn-theme', 'badge-runs', 'badge-sessions', 'badge-tunnels',
+    'badge-receipts', 'ws-indicator', 'ws-dot', 'main-view', 'sidebar-nav',
+    'global-alert-banner', 'crumb-current',
+  ].forEach(getEl);
+
+  const doc = {
+    title: '',
+    lang: 'zh-CN',
+    activeElement: null,
+    documentElement: { lang: 'zh-CN', setAttribute() {} },
+    getElementById: (id) => (opts.strictGetEl ? (els[id] || null) : getEl(id)),
+    createElement: () => makeEl(),
+    querySelectorAll: () => [],
+    addEventListener(ev, fn) {
+      docListeners[ev] = docListeners[ev] || [];
+      docListeners[ev].push(fn);
+    },
+    dispatch(ev, eventObj = {}) {
+      let out;
+      for (const fn of (docListeners[ev] || [])) {
+        out = fn({ preventDefault() {}, ...eventObj });
+      }
+      return out;
+    },
+  };
+
+  class FakeWS {
+    constructor(url) {
+      this.url = url;
+      this.closed = false;
+      wsCalls.push(this);
+      if (opts.autoOpenWs !== false) {
+        setTimeout(() => { if (this.onopen) this.onopen(); }, 1);
+      }
+    }
+    close() { this.closed = true; }
+  }
+
+  const fakeSetTimeout = opts.captureTimeouts
+    ? (fn, delay) => {
+        const id = timerSeq++;
+        scheduledTimeouts.push({ id, fn, delay, cleared: false });
+        return id;
+      }
+    : setTimeout;
+  const fakeClearTimeout = opts.captureTimeouts
+    ? (id) => {
+        const item = scheduledTimeouts.find((t) => t.id === id);
+        if (item) item.cleared = true;
+      }
+    : clearTimeout;
+
+  const windowObj = {};
+  const ctx = vm.createContext({
+    window: windowObj,
+    document: doc,
+    location: {
+      protocol: 'http:',
+      host: '127.0.0.1:8765',
+      pathname: '/',
+      search: opts.search || '',
+      hash: '',
+    },
+    history: {
+      replaceState(_st, _t, url) { replacedUrls.push(url); },
+    },
+    sessionStorage: {
+      getItem(k) { return k in storage ? storage[k] : null; },
+      setItem(k, v) { storage[k] = String(v); },
+      removeItem(k) { delete storage[k]; },
+    },
+    CSS: { escape: (s) => s },
+    URLSearchParams,
+    AbortController,
+    WebSocket: FakeWS,
+    navigator: {
+      clipboard: {
+        writeText: opts.clipboardWriteText || (async () => {}),
+      },
+    },
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+    fetch: async (url, init = {}) => {
+      fetchCalls.push({ url, init });
+      return opts.fetch(url, init);
+    },
+  });
+
+  vm.runInContext(fs.readFileSync(input.appJs, 'utf8'), ctx);
+  return { windowObj, doc, els, getEl, makeEl, storage, replacedUrls, wsCalls, fetchCalls, scheduledTimeouts };
+}
+
+(async () => {
+  const results = {};
+
+  // 1. URL ?token= scrubbing, Bearer header, WS ?token=, and 401 auto token modal + retry
+  {
+    let requireToken = 'tok-secret-42';
+    const h = createHarness({
+      search: '?token=initial-tok&foo=bar',
+      fetch: async (url, init) => {
+        const auth = (init.headers && init.headers.Authorization) || '';
+        if (url.startsWith('/api/bootstrap')) {
+          if (auth !== `Bearer ${requireToken}`) {
+            return {
+              ok: false,
+              status: 401,
+              json: async () => ({ detail: { kind: 'unauthorized', message: 'Missing or invalid API bearer token' } }),
+            };
+          }
+          return { ok: true, status: 200, json: async () => input.boot };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const firstAuthHeader = h.fetchCalls[0].init.headers.Authorization;
+    const urlReplaced = h.replacedUrls[0];
+    const tokenModalOpenedOn401 = h.getEl('modal-body').innerHTML.includes('api-token-input');
+    const retryCardShown = h.getEl('main-view').innerHTML.includes('data-action="retry-bootstrap"');
+
+    // Submit valid token via modal
+    h.getEl('api-token-input').value = requireToken;
+    await h.windowObj._app.submitApiToken({ preventDefault() {} });
+    await new Promise((r) => setTimeout(r, 30));
+
+    const lastBootstrapAuth = h.fetchCalls.filter((c) => c.url.startsWith('/api/bootstrap')).slice(-1)[0].init.headers.Authorization;
+    const wsUrlWithToken = h.wsCalls.length > 0 ? h.wsCalls[h.wsCalls.length - 1].url : '';
+    const tokenInStorage = h.storage.colab_boost_api_token;
+    results.auth = {
+      firstAuthHeader,
+      urlReplaced,
+      tokenModalOpenedOn401,
+      retryCardShown,
+      lastBootstrapAuth,
+      wsUrlWithToken,
+      tokenInStorage,
+    };
+  }
+
+  // 2. Command Palette static shell (#cmd-search NOT rebuilt on filter or refreshBootstrap) + ArrowDown/Enter + IME guard
+  {
+    let modalBodySetCount = 0;
+    const h = createHarness({
+      onInnerHTML(el) {
+        if (el.id === 'modal-body') modalBodySetCount += 1;
+      },
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => input.boot };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    modalBodySetCount = 0;
+    h.windowObj._app.openCommandPalette();
+    const searchNodeBefore = h.getEl('cmd-search');
+    const afterOpenSets = modalBodySetCount;
+
+    // Filter command palette -> must NOT touch #modal-body or recreate #cmd-search
+    h.windowObj._app.filterCmdPalette('sessions');
+    const afterFilterSets = modalBodySetCount;
+    const listHtml = h.getEl('cmd-list').innerHTML;
+
+    // WS-driven refreshBootstrap while command palette is open -> must NOT rebuild #modal-body/#cmd-search
+    await h.windowObj._app.refreshBootstrap();
+    const afterRefreshSets = modalBodySetCount;
+    const sameSearchNode = h.getEl('cmd-search') === searchNodeBefore;
+
+    // IME composing Enter must NOT execute command
+    h.doc.dispatch('keydown', { key: 'Enter', isComposing: true });
+    const routeAfterComposingEnter = h.getEl('crumb-current').textContent;
+
+    // Real Enter executes filtered command ("sessions")
+    await h.doc.dispatch('keydown', { key: 'Enter', isComposing: false });
+    const routeAfterRealEnter = h.getEl('crumb-current').textContent;
+    const modalClearedOnClose = h.getEl('modal-body').innerHTML === '';
+
+    results.cmdPalette = {
+      afterOpenSets,
+      afterFilterSets,
+      afterRefreshSets,
+      sameSearchNode,
+      listHasActiveClass: listHtml.includes('cmd-item active'),
+      routeAfterComposingEnter,
+      routeAfterRealEnter,
+      modalClearedOnClose,
+    };
+  }
+
+  // 3. timed_out_provisions in global alert banner + hours_remaining === 0 + L4 highMem + H100/V6E1 + bootstrap specs + warm VM filter + formatBytes GiB
+  {
+    const customBoot = JSON.parse(JSON.stringify(input.boot));
+    customBoot.active_account.usage.hours_remaining = 0;
+    customBoot.active_account.usage.burn_rate_hourly = 6.93;
+    customBoot.accelerator_specs = [
+      { id: 'G4', kind: 'gpu', vram_mib: [97887], high_mem_only: false, approx_ccu_per_hour: 1.8 },
+      { id: 'A100', kind: 'gpu', vram_mib: [40960, 81920], high_mem_only: false, approx_ccu_per_hour: 6.93 },
+      { id: 'H100', kind: 'gpu', vram_mib: [81920], high_mem_only: false, approx_ccu_per_hour: 11.78 },
+      { id: 'L4', kind: 'gpu', vram_mib: [23034], high_mem_only: true, approx_ccu_per_hour: 2.82 },
+      { id: 'T4', kind: 'gpu', vram_mib: [15360], high_mem_only: false, approx_ccu_per_hour: 1.17 },
+      { id: 'V5E1', kind: 'tpu', vram_mib: [], high_mem_only: true, approx_ccu_per_hour: 2.11 },
+      { id: 'V6E1', kind: 'tpu', vram_mib: [], high_mem_only: true, approx_ccu_per_hour: 3.55 },
+      { id: 'NONE', kind: 'cpu', vram_mib: [], high_mem_only: false, approx_ccu_per_hour: 0.07 },
+    ];
+    customBoot.approx_burn_rates = { G4: 1.8, A100: 6.93, H100: 11.78, L4: 2.82, T4: 1.17, V5E1: 2.11, V6E1: 3.55, NONE: 0.07 };
+    // Make managed session "stopping" and keep unmanaged orphan -> NEITHER should be reusable warm VM!
+    customBoot.sessions = [
+      { ...customBoot.sessions[0], name: 'stopping-vm', managed: true, status: 'stopping' },
+      { ...customBoot.sessions[0], name: 'lost-vm', managed: true, status: 'lost' },
+      { ...customBoot.sessions[0], name: 'orphan-vm', managed: false, status: 'running' },
+    ];
+    // Include a run with 2.5 GiB keep artifact to verify formatBytes GiB
+    customBoot.runs = [{
+      run_id: 'run-gib',
+      recipe_id: 'comfyui-studio',
+      recipe_name: { 'zh-CN': 'ComfyUI', en: 'ComfyUI' },
+      session_name: 'stopping-vm',
+      state: 'ready',
+      stage: 'ready',
+      progress: 1.0,
+      message: 'Ready',
+      outputs: {},
+      endpoints: [],
+      keep_paths: [{ path: '/out', label: { 'zh-CN': '输出', en: 'Out' }, local_archive: '/tmp/a.tar.gz', file_count: 3, total_bytes: 2.5 * 1024 * 1024 * 1024 }],
+      log_tail: ['line1', 'line2'],
+    }];
+
+    const h = createHarness({
+      fetch: async (url, init) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => customBoot };
+        if (url === '/api/sessions/stop-all' && init.method === 'POST') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              stopped_count: 1,
+              remaining_sessions: 0,
+              timed_out_provisions: 2,
+              failed_accounts: [],
+              stop_errors: [],
+              zero_burn_verified: false,
+            }),
+          };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+
+    const overviewHtml = h.getEl('main-view').innerHTML;
+    const hudBurnHtml = h.getEl('hud-burn').innerHTML;
+
+    // Trigger stop-all -> confirm -> check timed_out_provisions in global alert banner
+    h.getEl('btn-stop-all').click();
+    await h.getEl('modal-body').dispatch('click', {
+      target: { closest: () => ({ dataset: { action: 'confirm-ok' }, disabled: false }) },
+    });
+    const alertZh = h.getEl('global-alert-banner').innerHTML;
+
+    // Deploy view checks: L4 data-high-mem="1", H100 card, no Reuse Warm VM, GiB formatting, advanced V6E1 & exact count
+    h.windowObj._app.pickRecipe(customBoot.recipes[0].id);
+    h.windowObj._app.toggleAdvanced(customBoot.recipes[0].id);
+    const deployHtml = h.getEl('main-view').innerHTML;
+
+    // New session modal checks: H100 & V6E1 options present
+    h.windowObj._app.openNewSessionModal();
+    const newSessHtml = h.getEl('modal-body').innerHTML;
+    h.windowObj._app.closeModal();
+
+    results.contract = {
+      overviewHasZeroHours: overviewHtml.includes('>0 <small>hours</small>'),
+      hudBurnHasZeroH: hudBurnHtml.includes('~0h'),
+      alertMentionsTimedOut2: alertZh.includes('(2)'),
+      l4HighMemTrue: /data-accel="L4"[^>]*data-high-mem="1"/.test(deployHtml),
+      hasH100Tier: deployHtml.includes('data-accel="H100"'),
+      hasV6E1InDeployAdv: deployHtml.includes('value="V6E1"'),
+      hasV6E1InNewSession: newSessHtml.includes('value="V6E1"'),
+      noWarmVmReused: !deployHtml.includes('复用热实例') && !deployHtml.includes('Reuse Warm VM'),
+      hasGiBFormat: deployHtml.includes('2.50 GiB'),
+      noHardcodedDeadCount: !deployHtml.includes('undefined'),
+    };
+  }
+
+  // 4. Playground decoupled [ERROR] & latency/tok/s metadata + real mode empty tunnel guard + secret DOM hygiene
+  {
+    const sentPayloads = [];
+    let chatCallIdx = 0;
+    const h = createHarness({
+      fetch: async (url, init) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => input.boot };
+        if (url === '/api/playground/chat') {
+          chatCallIdx += 1;
+          sentPayloads.push(JSON.parse(init.body));
+          if (chatCallIdx === 1) {
+            return { ok: true, status: 200, json: async () => ({ reply: 'Clean answer 1', latency_ms: 42.5, tok_per_s: 88.2, model: 'qwen' }) };
+          }
+          if (chatCallIdx === 2) {
+            return { ok: false, status: 502, json: async () => ({ detail: 'Upstream crashed' }) };
+          }
+          return { ok: true, status: 200, json: async () => ({ reply: 'Clean answer 3', latency_ms: 51.0, tok_per_s: 79.0, model: 'qwen' }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    h.windowObj._app.go('tunnels');
+    h.windowObj._app.setChatMeta('chatApiKey', 'sk-super-secret-999');
+    h.windowObj._app.go('tunnels');
+    const tunnelsHtmlWithSecret = h.getEl('main-view').innerHTML;
+
+    // Turn 1: ok
+    h.getEl('chat-input').value = 'Prompt 1';
+    await h.windowObj._app.sendChat({ preventDefault() {} });
+    // Turn 2: error
+    h.getEl('chat-input').value = 'Prompt 2';
+    await h.windowObj._app.sendChat({ preventDefault() {} });
+    // Turn 3: ok -> inspect messages sent on Turn 3
+    h.getEl('chat-input').value = 'Prompt 3';
+    await h.windowObj._app.sendChat({ preventDefault() {} });
+
+    const turn3Msgs = sentPayloads[2].messages;
+    const chatBoxHtml = h.getEl('main-view').innerHTML;
+
+    // Real mode with 0 tunnels -> clear prompt and sendChat blocked without calling fetch
+    const realBootNoTunnels = JSON.parse(JSON.stringify(input.boot));
+    realBootNoTunnels.settings.backend_mode = 'real';
+    realBootNoTunnels.tunnels = [];
+    const hReal = createHarness({
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => realBootNoTunnels };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    hReal.windowObj._app.go('tunnels');
+    const realTunnelsHtml = hReal.getEl('main-view').innerHTML;
+    const callsBeforeRealSend = hReal.fetchCalls.length;
+    hReal.getEl('chat-input').value = 'Should be blocked';
+    await hReal.windowObj._app.sendChat({ preventDefault() {} });
+    const callsAfterRealSend = hReal.fetchCalls.length;
+
+    results.playground = {
+      secretNotInDomHtml: !tunnelsHtmlWithSecret.includes('sk-super-secret-999'),
+      turn3Msgs,
+      chatBoxShowsMetaUi: chatBoxHtml.includes('42.5 ms | 88.2 tok/s'),
+      realModeShowsTunnelPrompt: realTunnelsHtml.includes('请先开启/绑定本地隧道') && !realTunnelsHtml.includes('默认沙盒端点'),
+      realModeBlockedFetch: callsAfterRealSend === callsBeforeRealSend,
+    };
+  }
+
+  // 5. Settings dirty draft survives WS refresh, modal explicit clear (""), reqId out-of-order guard, GGUF repo change clears plan, WS backoff
+  {
+    let bootCalls = 0;
+    let resolveSlowBoot = null;
+    const slowBoot = JSON.parse(JSON.stringify(input.boot));
+    slowBoot.settings.guards.auto_stop_minutes = 999;
+    const fastBoot = JSON.parse(JSON.stringify(input.boot));
+    fastBoot.settings.guards.auto_stop_minutes = 75;
+
+    const h = createHarness({
+      autoOpenWs: false,
+      captureTimeouts: true,
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) {
+          bootCalls += 1;
+          if (bootCalls === 1) return { ok: true, status: 200, json: async () => input.boot };
+          if (bootCalls === 2) {
+            return await new Promise((res) => {
+              resolveSlowBoot = () => res({ ok: true, status: 200, json: async () => slowBoot });
+            });
+          }
+          return { ok: true, status: 200, json: async () => fastBoot };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Race two refreshBootstrap calls: #2 slow (999), #3 fast (75) -> #2 resolves AFTER #3 and must be discarded!
+    const pSlow = h.windowObj._app.refreshBootstrap();
+    const pFast = h.windowObj._app.refreshBootstrap();
+    await pFast;
+    resolveSlowBoot();
+    await pSlow;
+    h.windowObj._app.go('settings');
+    const afterRaceHtml = h.getEl('main-view').innerHTML;
+
+    // Dirty settings draft + token draft survive refreshBootstrap() even when blurred
+    h.windowObj._app.setGuardDraftField('auto_stop_minutes', '180');
+    h.windowObj._app.setGuardDraftField('balance_floor_ccu', '12.5');
+    h.windowObj._app.setSecretDraft('hf_token', 'hf_unsaved_secret_xyz');
+    h.doc.activeElement = null;
+    await h.windowObj._app.refreshBootstrap();
+    const settingsHtmlAfterWs = h.getEl('main-view').innerHTML;
+    const hfValPreserved = h.getEl('inp-hf-token').value;
+    const hfNotInHtml = !settingsHtmlAfterWs.includes('hf_unsaved_secret_xyz');
+
+    // Modal explicit clear ("") survives renderActiveModal()
+    h.windowObj._app.openForwardModal('boost-a100-qwen');
+    const lblEl = h.getEl('f-label');
+    lblEl.value = '';
+    h.getEl('modal-body').dispatch('input', { target: lblEl });
+    await h.windowObj._app.refreshBootstrap();
+    const clearedLabelPreserved = h.getEl('f-label').value === '';
+    h.windowObj._app.closeModal();
+
+    // WS exponential backoff: 1000 -> 2000 -> 4000, onclose clears debounce timer, onerror defined
+    const ws1 = h.wsCalls[0];
+    const hasOnError = typeof ws1.onerror === 'function';
+    ws1.onmessage({});
+    const debounceScheduled = h.scheduledTimeouts.find((t) => t.delay === 180);
+    ws1.onclose();
+    const debounceClearedOnClose = !!(debounceScheduled && debounceScheduled.cleared);
+    const delay1 = h.scheduledTimeouts.filter((t) => t.delay >= 1000).slice(-1)[0].delay;
+    // Fire reconnect #1 and close again -> delay should double to 2000
+    h.scheduledTimeouts.filter((t) => t.delay >= 1000).slice(-1)[0].fn();
+    h.wsCalls[h.wsCalls.length - 1].onclose();
+    const delay2 = h.scheduledTimeouts.filter((t) => t.delay >= 1000).slice(-1)[0].delay;
+    // Fire reconnect #2 and close again -> delay should double to 4000
+    h.scheduledTimeouts.filter((t) => t.delay >= 1000).slice(-1)[0].fn();
+    h.wsCalls[h.wsCalls.length - 1].onclose();
+    const delay3 = h.scheduledTimeouts.filter((t) => t.delay >= 1000).slice(-1)[0].delay;
+
+    results.resilience = {
+      raceKeptFast75: afterRaceHtml.includes('value="75"') && !afterRaceHtml.includes('value="999"'),
+      dirtyGuardsPreserved: settingsHtmlAfterWs.includes('value="180"') && settingsHtmlAfterWs.includes('value="12.5"'),
+      hfValPreserved,
+      hfNotInHtml,
+      clearedLabelPreserved,
+      hasOnError,
+      debounceClearedOnClose,
+      wsBackoffDelays: [delay1, delay2, delay3],
+    };
+  }
+
+  // 6. Scroll preservation for #chat-box and .terminal + GGUF reqId race & repo change clears plan + secret cleared on submitDeploy
+  {
+    let ggufCalls = 0;
+    let resolveSlowGguf = null;
+    const terminals = [
+      { scrollTop: 135, getAttribute: (k) => (k === 'data-run-id' ? 'run-1' : null) },
+    ];
+    const h = createHarness({
+      querySelectorAll(sel) {
+        if (sel === '.terminal') return terminals;
+        return [];
+      },
+      fetch: async (url, init) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => input.boot };
+        if (url.startsWith('/api/hf/gguf-plan')) {
+          ggufCalls += 1;
+          if (ggufCalls === 1) {
+            return await new Promise((res) => {
+              resolveSlowGguf = () => res({
+                ok: true,
+                status: 200,
+                json: async () => ({ repo: 'old/repo', architecture: 'old', model_ctx: 4096, variants: [], hardware_matrix: [] }),
+              });
+            });
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ repo: 'new/repo', architecture: 'qwen3', model_ctx: 32768, variants: [], hardware_matrix: [] }),
+          };
+        }
+        if (url === '/api/deployments' && init.method === 'POST') {
+          return { ok: true, status: 200, json: async () => ({ run_id: 'r-ok' }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Scroll preservation
+    h.windowObj._app.go('tunnels');
+    h.getEl('chat-box').scrollTop = 77;
+    h.getEl('chat-box').scrollHeight = 600;
+    h.getEl('chat-box').clientHeight = 200;
+    await h.windowObj._app.refreshBootstrap();
+    const chatScrollPreserved = h.getEl('chat-box').scrollTop === 77;
+    const terminalScrollPreserved = terminals[0].scrollTop === 135;
+
+    // GGUF race + repo change clears stale plan
+    h.windowObj._app.pickRecipe('llama-cpp-gguf');
+    h.windowObj._app.updateDraft('llama-cpp-gguf', 'repo', 'old/repo', false);
+    const pOld = h.windowObj._app.analyzeGguf();
+    h.windowObj._app.updateDraft('llama-cpp-gguf', 'repo', 'new/repo', false);
+    const pNew = h.windowObj._app.analyzeGguf();
+    await pNew;
+    resolveSlowGguf();
+    await pOld;
+    const ggufHtmlAfterRace = h.getEl('main-view').innerHTML;
+
+    // Changing repo again clears state.ggufPlan immediately
+    h.windowObj._app.updateDraft('llama-cpp-gguf', 'repo', 'changed/repo', false);
+    const plannerCleared = h.getEl('gguf-planner-host').innerHTML === '';
+
+    // Deploy secret cleared after submitDeploy succeeds and never written to innerHTML
+    h.windowObj._app.updateDraft('llama-cpp-gguf', 'api_key', 'deploy-secret-777', true);
+    const deployHtmlBeforeSubmit = h.getEl('main-view').innerHTML;
+    await h.windowObj._app.submitDeploy({ preventDefault() {} });
+    const deployHtmlAfterSubmit = h.getEl('main-view').innerHTML;
+
+    results.scrollAndGguf = {
+      chatScrollPreserved,
+      terminalScrollPreserved,
+      ggufRaceKeptNew: ggufHtmlAfterRace.includes('new/repo') && !ggufHtmlAfterRace.includes('old/repo'),
+      plannerCleared,
+      deploySecretNotInHtml: !deployHtmlBeforeSubmit.includes('deploy-secret-777'),
+      deploySecretPlaceholderClearedAfterSubmit: !deployHtmlAfterSubmit.includes('已在内存中暂存密钥'),
+    };
+  }
+
+  process.stdout.write(JSON.stringify(results));
+})();
+"""
+
+    proc = subprocess.run(
+        [node_bin, "-e", harness],
+        input=json.dumps({"boot": boot_payload, "appJs": str(app_js_path)}),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    res = json.loads(proc.stdout)
+
+    # 1. Auth & 401 Token Modal
+    assert res["auth"]["firstAuthHeader"] == "Bearer initial-tok"
+    assert res["auth"]["urlReplaced"] == "/?foo=bar"
+    assert res["auth"]["tokenModalOpenedOn401"] is True
+    assert res["auth"]["retryCardShown"] is True
+    assert res["auth"]["lastBootstrapAuth"] == "Bearer tok-secret-42"
+    assert res["auth"]["wsUrlWithToken"].endswith("/ws/events?token=tok-secret-42")
+    assert res["auth"]["tokenInStorage"] == "tok-secret-42"
+
+    # 2. Command Palette static shell & keyboard navigation
+    assert res["cmdPalette"]["afterOpenSets"] == 1
+    assert res["cmdPalette"]["afterFilterSets"] == 1
+    assert res["cmdPalette"]["afterRefreshSets"] == 1
+    assert res["cmdPalette"]["sameSearchNode"] is True
+    assert res["cmdPalette"]["listHasActiveClass"] is True
+    assert res["cmdPalette"]["routeAfterComposingEnter"] != res["cmdPalette"]["routeAfterRealEnter"]
+    assert res["cmdPalette"]["routeAfterRealEnter"] in ("算力实例管理", "GPU Sessions")
+    assert res["cmdPalette"]["modalClearedOnClose"] is True
+
+    # 3. Contract alignment, timed_out_provisions, hours_remaining === 0, L4 highMem, H100/V6E1, warm VM filter, GiB
+    assert res["contract"]["overviewHasZeroHours"] is True
+    assert res["contract"]["hudBurnHasZeroH"] is True
+    assert res["contract"]["alertMentionsTimedOut2"] is True
+    assert res["contract"]["l4HighMemTrue"] is True
+    assert res["contract"]["hasH100Tier"] is True
+    assert res["contract"]["hasV6E1InDeployAdv"] is True
+    assert res["contract"]["hasV6E1InNewSession"] is True
+    assert res["contract"]["noWarmVmReused"] is True
+    assert res["contract"]["hasGiBFormat"] is True
+    assert res["contract"]["noHardcodedDeadCount"] is True
+
+    # 4. Playground decoupled history, real mode tunnel guard, secret hygiene
+    assert res["playground"]["secretNotInDomHtml"] is True
+    assert res["playground"]["chatBoxShowsMetaUi"] is True
+    assert res["playground"]["realModeShowsTunnelPrompt"] is True
+    assert res["playground"]["realModeBlockedFetch"] is True
+    turn3 = res["playground"]["turn3Msgs"]
+    assert len(turn3) == 4
+    assert [m["role"] for m in turn3] == ["user", "assistant", "user", "user"]
+    assert turn3[1]["content"] == "Clean answer 1"
+    assert all("[ERROR]" not in m["content"] and "tok/s" not in m["content"] for m in turn3)
+    assert all(set(m.keys()) == {"role", "content"} for m in turn3)
+
+    # 5. ReqId race, dirty Settings draft, modal explicit clear, WS backoff
+    assert res["resilience"]["raceKeptFast75"] is True
+    assert res["resilience"]["dirtyGuardsPreserved"] is True
+    assert res["resilience"]["hfValPreserved"] == "hf_unsaved_secret_xyz"
+    assert res["resilience"]["hfNotInHtml"] is True
+    assert res["resilience"]["clearedLabelPreserved"] is True
+    assert res["resilience"]["hasOnError"] is True
+    assert res["resilience"]["debounceClearedOnClose"] is True
+    assert res["resilience"]["wsBackoffDelays"] == [1000, 2000, 4000]
+
+    # 6. ScrollTop preservation, GGUF race & clear, deploy secret cleanup
+    assert res["scrollAndGguf"]["chatScrollPreserved"] is True
+    assert res["scrollAndGguf"]["terminalScrollPreserved"] is True
+    assert res["scrollAndGguf"]["ggufRaceKeptNew"] is True
+    assert res["scrollAndGguf"]["plannerCleared"] is True
+    assert res["scrollAndGguf"]["deploySecretNotInHtml"] is True
+    assert res["scrollAndGguf"]["deploySecretPlaceholderClearedAfterSubmit"] is True
+
+    # Bonus: ensure new Phase 2 modals/banners have zero leaked CJK in English mode
+    cjk_re = re.compile(r"[\u4e00-\u9fff]")
+    en_boot = json.loads(json.dumps(boot_payload))
+    en_boot["settings"]["language"] = "en"
+    en_boot["settings"]["backend_mode"] = "real"
+    en_boot["tunnels"] = []
+    en_check = r"""
+const fs = require('fs');
+const vm = require('vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const els = {};
+function makeEl(id = '') {
+  const ls = {};
+  return {
+    id, tagName: 'DIV', className: '', textContent: '', innerHTML: '', value: '', placeholder: '', title: '', style: {},
+    dataset: {}, classList: { add() {}, remove() {}, toggle() {} },
+    setAttribute() {}, getAttribute() { return null; }, appendChild() {}, remove() {}, contains() { return false; },
+    focus() {}, closest() { return null; }, addEventListener(e, fn) { ls[e] = fn; },
+    click() { if (ls.click) return ls.click({ target: this, preventDefault() {} }); },
+  };
+}
+const getEl = (id) => (els[id] = els[id] || makeEl(id));
+const doc = {
+  title: '', lang: 'en', activeElement: null,
+  documentElement: { lang: 'en', setAttribute() {} },
+  getElementById: getEl, createElement: () => makeEl(), querySelectorAll: () => [], addEventListener() {},
+};
+const windowObj = {};
+const ctx = vm.createContext({
+  window: windowObj, document: doc, location: { protocol: 'http:', host: '127.0.0.1:8765', search: '' },
+  CSS: { escape: (s) => s }, URLSearchParams, WebSocket: class { constructor() {} },
+  navigator: { clipboard: { writeText: async () => {} } }, setTimeout, clearTimeout,
+  fetch: async (url) => {
+    if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => input.boot };
+    return { ok: true, status: 200, json: async () => ({}) };
+  },
+});
+vm.runInContext(fs.readFileSync(input.appJs, 'utf8'), ctx);
+(async () => {
+  await new Promise((r) => setTimeout(r, 25));
+  const out = {};
+  windowObj._app.openApiTokenModal('Unauthorized');
+  out.apiTokenModal = getEl('modal-body').innerHTML;
+  windowObj._app.openCommandPalette();
+  out.cmdPalette = getEl('modal-body').innerHTML;
+  windowObj._app.go('tunnels');
+  out.realEmptyTunnels = getEl('main-view').innerHTML;
+  windowObj._app.go('settings');
+  windowObj._app.setGuardDraftField('auto_stop_minutes', '150');
+  windowObj._app.go('settings');
+  out.dirtySettings = getEl('main-view').innerHTML;
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+    en_proc = subprocess.run(
+        [node_bin, "-e", en_check],
+        input=json.dumps({"boot": en_boot, "appJs": str(app_js_path)}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    en_res = json.loads(en_proc.stdout)
+    for scope, html_text in en_res.items():
+        leaked = cjk_re.findall(html_text)
+        assert not leaked, f"Leaked CJK in Phase 2 {scope} under language='en': {leaked}"
+
+

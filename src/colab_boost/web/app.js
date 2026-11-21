@@ -17,7 +17,7 @@
     chevronUp: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>',
   };
 
-  const APPROX_BURN = {
+  const DEFAULT_APPROX_BURN = {
     G4: 1.80,
     A100: 6.93,
     H100: 11.78,
@@ -27,6 +27,53 @@
     V6E1: 3.55,
     NONE: 0.07,
   };
+
+  const DEFAULT_ACCELERATOR_SPECS = [
+    { id: "G4", kind: "gpu", vram_mib: [97887], high_mem_only: false, approx_ccu_per_hour: 1.80 },
+    { id: "A100", kind: "gpu", vram_mib: [40960, 81920], high_mem_only: false, approx_ccu_per_hour: 6.93 },
+    { id: "H100", kind: "gpu", vram_mib: [81920], high_mem_only: false, approx_ccu_per_hour: 11.78 },
+    { id: "L4", kind: "gpu", vram_mib: [23034], high_mem_only: true, approx_ccu_per_hour: 2.82 },
+    { id: "T4", kind: "gpu", vram_mib: [15360], high_mem_only: false, approx_ccu_per_hour: 1.17 },
+    { id: "V5E1", kind: "tpu", vram_mib: [], high_mem_only: true, approx_ccu_per_hour: 2.11 },
+    { id: "V6E1", kind: "tpu", vram_mib: [], high_mem_only: true, approx_ccu_per_hour: 3.55 },
+    { id: "NONE", kind: "cpu", vram_mib: [], high_mem_only: false, approx_ccu_per_hour: 0.07 },
+  ];
+
+  const DEFAULT_HIGH_MEM_ONLY = new Set(["L4", "V5E1", "V6E1"]);
+  const API_TOKEN_STORAGE_KEY = "colab_boost_api_token";
+  const DEFAULT_API_TIMEOUT_MS = 30000;
+  const WS_BACKOFF_BASE_MS = 1000;
+  const WS_BACKOFF_MAX_MS = 30000;
+
+  const GUARD_FIELDS = [
+    { id: "set-autostop", key: "auto_stop_minutes", fallback: 120 },
+    { id: "set-idlestop", key: "idle_stop_minutes", fallback: 30 },
+    { id: "set-floor", key: "balance_floor_ccu", fallback: 5 },
+    { id: "set-cap", key: "session_spend_cap_ccu", fallback: 20 },
+    { id: "set-retries", key: "max_vram_retries", fallback: 4 },
+    { id: "set-maxsess", key: "max_managed_sessions", fallback: 3 },
+  ];
+
+  const MODAL_FIELD_IDS = [
+    "m-accel",
+    "m-vram",
+    "m-autostop",
+    "m-highmem",
+    "f-rport",
+    "f-lport",
+    "f-label",
+    "oauth-code",
+    "api-token-input",
+  ];
+
+  let bootstrapReqId = 0;
+  let ggufReqId = 0;
+  let apiTokenMemory = "";
+  let wsSocket = null;
+  let wsReconnectTimer = null;
+  let wsDebounceTimer = null;
+  let wsReconnectDelay = WS_BACKOFF_BASE_MS;
+  let pendingScrollChatToBottom = false;
 
   const state = {
     route: "overview",
@@ -41,9 +88,13 @@
     receipts: [],
     secrets: {},
     curatedRepos: [],
+    acceleratorSpecs: DEFAULT_ACCELERATOR_SPECS.slice(),
+    approxBurnRates: { ...DEFAULT_APPROX_BURN },
     selectedRecipeId: "minimax-h3-studio",
     deployDraft: {},
     advancedOpen: {},
+    settingsDraft: {},
+    secretDrafts: { hf_token: "", civitai_token: "" },
     ggufPlan: null,
     ggufPlanLoading: false,
     wsState: "connecting",
@@ -54,10 +105,14 @@
     chatApiKey: "",
     selectedChatTunnelId: "",
     activeModal: null,
+    modalEdits: {},
+    modalInitialValues: {},
     pendingConfirm: null,
     zeroBurnAlert: null,
+    bootstrapError: null,
     busy: {},
     cmdQuery: "",
+    cmdActiveIndex: 0,
   };
 
   const I18N = {
@@ -110,10 +165,142 @@
 
   function formatBytes(bytes) {
     const n = Number(bytes || 0);
-    if (n <= 0) return "0 B";
-    if (n < 1024) return `${n} B`;
+    if (!Number.isFinite(n) || n <= 0) return "0 B";
+    if (n < 1024) return `${Math.round(n)} B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
-    return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  }
+
+  function getApiToken() {
+    if (apiTokenMemory) return apiTokenMemory;
+    try {
+      if (typeof sessionStorage !== "undefined" && typeof sessionStorage.getItem === "function") {
+        const stored = (sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || "").trim();
+        if (stored) {
+          apiTokenMemory = stored;
+          return stored;
+        }
+      }
+    } catch (_) {}
+    return "";
+  }
+
+  function setApiToken(token) {
+    const cleaned = String(token ?? "").trim();
+    apiTokenMemory = cleaned;
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        if (cleaned && typeof sessionStorage.setItem === "function") {
+          sessionStorage.setItem(API_TOKEN_STORAGE_KEY, cleaned);
+        } else if (!cleaned && typeof sessionStorage.removeItem === "function") {
+          sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+        }
+      }
+    } catch (_) {}
+  }
+
+  function initApiTokenFromUrl() {
+    try {
+      const search = typeof location !== "undefined" && location ? (location.search || "") : "";
+      if (!search) return;
+      const params = new URLSearchParams(search);
+      if (!params.has("token")) return;
+      const tok = (params.get("token") || "").trim();
+      if (tok) setApiToken(tok);
+      params.delete("token");
+      const remaining = params.toString();
+      const pathname = (location && location.pathname) || "/";
+      const hash = (location && location.hash) || "";
+      const cleanUrl = `${pathname}${remaining ? `?${remaining}` : ""}${hash}`;
+      if (typeof history !== "undefined" && typeof history.replaceState === "function") {
+        history.replaceState(null, "", cleanUrl);
+      }
+    } catch (_) {}
+  }
+
+  function normalizeAcceleratorSpecs(raw) {
+    if (Array.isArray(raw) && raw.length > 0) {
+      return raw
+        .filter((item) => item && item.id)
+        .map((item) => ({
+          id: String(item.id),
+          kind: item.kind || (item.id === "NONE" ? "cpu" : ["V5E1", "V6E1"].includes(item.id) ? "tpu" : "gpu"),
+          vram_mib: Array.isArray(item.vram_mib) ? item.vram_mib : [],
+          high_mem_only: item.high_mem_only !== undefined ? !!item.high_mem_only : DEFAULT_HIGH_MEM_ONLY.has(String(item.id)),
+          approx_ccu_per_hour:
+            item.approx_ccu_per_hour !== undefined && item.approx_ccu_per_hour !== null
+              ? Number(item.approx_ccu_per_hour)
+              : (DEFAULT_APPROX_BURN[item.id] ?? 2.0),
+        }));
+    }
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const entries = Object.entries(raw);
+      if (entries.length > 0) {
+        return entries.map(([id, item]) => ({
+          id,
+          kind: item?.kind || (id === "NONE" ? "cpu" : ["V5E1", "V6E1"].includes(id) ? "tpu" : "gpu"),
+          vram_mib: Array.isArray(item?.vram_mib) ? item.vram_mib : [],
+          high_mem_only: item?.high_mem_only !== undefined ? !!item.high_mem_only : DEFAULT_HIGH_MEM_ONLY.has(id),
+          approx_ccu_per_hour:
+            item?.approx_ccu_per_hour !== undefined && item?.approx_ccu_per_hour !== null
+              ? Number(item.approx_ccu_per_hour)
+              : (DEFAULT_APPROX_BURN[id] ?? 2.0),
+        }));
+      }
+    }
+    return DEFAULT_ACCELERATOR_SPECS.slice();
+  }
+
+  function normalizeBurnRates(rawRates, specs) {
+    const merged = { ...DEFAULT_APPROX_BURN };
+    for (const sp of specs || []) {
+      if (sp && sp.id && Number.isFinite(Number(sp.approx_ccu_per_hour))) {
+        merged[sp.id] = Number(sp.approx_ccu_per_hour);
+      }
+    }
+    if (rawRates && typeof rawRates === "object") {
+      for (const [k, v] of Object.entries(rawRates)) {
+        const num = Number(v);
+        if (Number.isFinite(num)) merged[k] = num;
+      }
+    }
+    return merged;
+  }
+
+  function getAcceleratorSpecs() {
+    return Array.isArray(state.acceleratorSpecs) && state.acceleratorSpecs.length > 0
+      ? state.acceleratorSpecs
+      : DEFAULT_ACCELERATOR_SPECS;
+  }
+
+  function getAcceleratorSpec(accelId) {
+    return getAcceleratorSpecs().find((s) => s.id === accelId) || null;
+  }
+
+  function isHighMemOnlyAccelerator(accelId) {
+    const spec = getAcceleratorSpec(accelId);
+    if (spec && spec.high_mem_only !== undefined) return !!spec.high_mem_only;
+    return DEFAULT_HIGH_MEM_ONLY.has(accelId);
+  }
+
+  function getBurnRate(accelId) {
+    if (state.approxBurnRates && state.approxBurnRates[accelId] !== undefined) {
+      return Number(state.approxBurnRates[accelId]);
+    }
+    const spec = getAcceleratorSpec(accelId);
+    if (spec && spec.approx_ccu_per_hour !== undefined) return Number(spec.approx_ccu_per_hour);
+    return DEFAULT_APPROX_BURN[accelId] ?? 2.0;
+  }
+
+  function getReusableSessions() {
+    return state.sessions.filter(
+      (s) => s && s.managed !== false && s.status !== "stopping" && s.status !== "lost"
+    );
+  }
+
+  function hasDirtySettingsDraft() {
+    return Object.keys(state.settingsDraft).length > 0;
   }
 
   function esc(val) {
@@ -210,35 +397,128 @@
   }
 
   async function api(path, options = {}) {
-    const resp = await fetch(path, {
-      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-      ...options,
-    });
+    const { timeoutMs, headers, ...fetchOpts } = options;
+    const reqHeaders = { "Content-Type": "application/json", ...(headers || {}) };
+    const hasAuthHeader = Object.keys(reqHeaders).some((k) => k.toLowerCase() === "authorization");
+    const token = getApiToken();
+    if (token && !hasAuthHeader) {
+      reqHeaders.Authorization = `Bearer ${token}`;
+    }
+
+    const effectiveTimeout = timeoutMs !== undefined ? timeoutMs : DEFAULT_API_TIMEOUT_MS;
+    let controller = null;
+    let timeoutId = null;
+    let signal = fetchOpts.signal;
+    if (!signal && effectiveTimeout > 0) {
+      if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+        signal = AbortSignal.timeout(effectiveTimeout);
+      } else if (typeof AbortController !== "undefined") {
+        controller = new AbortController();
+        signal = controller.signal;
+        timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+      }
+    }
+
+    let resp;
+    try {
+      const init = { ...fetchOpts, headers: reqHeaders };
+      if (signal) init.signal = signal;
+      resp = await fetch(path, init);
+    } catch (err) {
+      if (err && (err.name === "AbortError" || err.name === "TimeoutError")) {
+        const timeoutErr = new Error(
+          tr("请求超时，请检查后端服务状态后重试", "Request timed out; check backend service and retry")
+        );
+        timeoutErr.isTimeout = true;
+        throw timeoutErr;
+      }
+      throw err;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      throw new Error(formatApiDetail(data?.detail, resp.status));
+      const msg = formatApiDetail(data?.detail, resp.status);
+      const err = new Error(msg);
+      err.status = resp.status;
+      err.detail = data?.detail;
+      if (resp.status === 401) {
+        const detailKind = data?.detail && typeof data.detail === "object" ? data.detail.kind : "";
+        const isColabOAuthErr = detailKind === "auth_error" || detailKind === "missing_credential";
+        if (!isColabOAuthErr && state.activeModal?.type !== "api_token") {
+          openApiTokenModal(msg);
+        }
+      }
+      throw err;
     }
     return data;
   }
 
-  function openModal(html, modalMeta = null) {
+  function snapshotModalInitialValues() {
+    const initial = {};
+    for (const fid of MODAL_FIELD_IDS) {
+      const el = document.getElementById(fid);
+      if (el && el.value !== undefined) initial[fid] = el.value;
+    }
+    state.modalInitialValues = initial;
+  }
+
+  function openModal(html, modalMeta = null, opts = {}) {
+    const preserveEdits = !!opts.preserveEdits;
+    if (!preserveEdits) {
+      state.modalEdits = {};
+      state.modalInitialValues = {};
+    }
     state.activeModal = modalMeta;
     const bd = document.getElementById("modal-backdrop");
     const body = document.getElementById("modal-body");
-    body.innerHTML = html;
-    bd.classList.remove("hidden");
+    if (body) body.innerHTML = html;
+    if (bd) bd.classList.remove("hidden");
+    if (!preserveEdits) {
+      snapshotModalInitialValues();
+    }
   }
 
   function closeModal() {
     state.activeModal = null;
     state.pendingConfirm = null;
+    state.modalEdits = {};
+    state.modalInitialValues = {};
+    state.cmdActiveIndex = 0;
     const bd = document.getElementById("modal-backdrop");
     const body = document.getElementById("modal-body");
     if (bd) bd.classList.add("hidden");
     if (body) body.innerHTML = "";
   }
 
-  function openConfirmModal(meta, onConfirm) {
+  function openApiTokenModal(reason = "", opts = {}) {
+    const hasExisting = !!getApiToken();
+    openModal(`
+      <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("需要控制台 API 访问令牌", "Console API Token Required")}</h3>
+      <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;">
+        ${tr(
+          "当前后端已启用 <code>COLAB_BOOST_API_TOKEN</code> 访问鉴权。请输入正确的 Bearer Token 后自动重试。",
+          "This backend requires a <code>COLAB_BOOST_API_TOKEN</code> bearer token. Enter your token below to authenticate and retry."
+        )}
+      </p>
+      ${reason ? `<div class="banner danger" style="margin-bottom:12px;font-size:12px;">${esc(reason)}</div>` : ""}
+      <form data-submit="api-token" class="form-grid">
+        <div class="field full">
+          <label>${tr("API Bearer Token", "API Bearer Token")}</label>
+          <input type="password" id="api-token-input" autocomplete="off" required placeholder="${hasExisting ? tr("已保存令牌（重新输入以替换）", "Token set in session (type to replace)") : tr("输入 COLAB_BOOST_API_TOKEN", "Enter COLAB_BOOST_API_TOKEN")}" />
+        </div>
+        <div class="field full row-actions" style="justify-content:flex-end;">
+          <button type="button" class="btn" data-action="close-modal">${tr("取消", "Cancel")}</button>
+          <button type="submit" class="btn btn-primary">${tr("保存并重试", "Save & Retry")}</button>
+        </div>
+      </form>
+    `, { type: "api_token", reason }, opts);
+    const inp = document.getElementById("api-token-input");
+    if (inp && typeof inp.focus === "function") inp.focus();
+  }
+
+  function openConfirmModal(meta, onConfirm, opts = {}) {
     state.pendingConfirm = onConfirm;
     const isDanger = meta.tone !== "primary";
     const title = typeof meta.title === "function" ? meta.title() : meta.title;
@@ -251,7 +531,7 @@
         <button class="btn" type="button" data-action="close-modal">${tr("取消", "Cancel")}</button>
         <button class="btn ${isDanger ? "btn-danger" : "btn-primary"}" type="button" data-action="confirm-ok">${esc(confirmLabel)}</button>
       </div>
-    `, { type: "confirm", meta });
+    `, { type: "confirm", meta }, opts);
   }
 
   function renderGlobalAlert() {
@@ -278,13 +558,21 @@
           `Stopped ${alert.stoppedCount} session(s), but remaining active sessions: ${alert.remaining}`
         )
       );
-      if (alert.failedAccounts.length > 0) {
+      if ((alert.timedOutProvisions || 0) > 0) {
+        parts.push(
+          tr(
+            `超时未结束的在途分配任务 (${alert.timedOutProvisions})：请稍候再次点击重试停止以防漏网计费`,
+            `Timed-out in-flight provisions (${alert.timedOutProvisions}): retry Stop All shortly to prevent leaked billing`
+          )
+        );
+      }
+      if ((alert.failedAccounts || []).length > 0) {
         const accList = alert.failedAccounts
           .map((item) => (typeof item === "string" ? item : (item?.email || item?.account_id || JSON.stringify(item))))
           .join(", ");
         parts.push(tr(`查询失败账号 (${alert.failedAccounts.length}): ${accList}`, `Failed account checks (${alert.failedAccounts.length}): ${accList}`));
       }
-      if (alert.stopErrors.length > 0) {
+      if ((alert.stopErrors || []).length > 0) {
         const errList = alert.stopErrors
           .map((item) => (typeof item === "string" ? item : (item?.error || item?.message || JSON.stringify(item))))
           .join("; ");
@@ -336,21 +624,41 @@
   function renderActiveModal() {
     const active = state.activeModal;
     if (!active) return;
-    const modalFieldIds = ["m-accel", "m-vram", "m-autostop", "m-highmem", "f-rport", "f-lport", "f-label", "oauth-code", "cmd-search"];
-    const saved = {};
-    for (const fid of modalFieldIds) {
-      const el = document.getElementById(fid);
-      if (el && el.value !== undefined && el.value !== "") saved[fid] = el.value;
+    if (active.type === "cmd_palette") {
+      openCommandPalette();
+      return;
     }
-    if (active.type === "new_session") window._app.openNewSessionModal();
-    else if (active.type === "forward") window._app.openForwardModal(active.sessionName);
-    else if (active.type === "login" && active.flow) window._app.renderLoginModalWithFlow(active.flow);
-    else if (active.type === "toggle_mode") openToggleModeModal(active.nextMode);
-    else if (active.type === "cmd_palette") openCommandPalette();
-    else if (active.type === "confirm" && active.meta && state.pendingConfirm) openConfirmModal(active.meta, state.pendingConfirm);
-    for (const [fid, val] of Object.entries(saved)) {
+
+    const saved = {};
+    for (const fid of MODAL_FIELD_IDS) {
+      const el = document.getElementById(fid);
+      const wasEdited = Object.prototype.hasOwnProperty.call(state.modalEdits, fid);
+      if (wasEdited) {
+        saved[fid] = el && el.value !== undefined ? el.value : state.modalEdits[fid];
+      } else if (el && el.value !== undefined) {
+        const hasInit = Object.prototype.hasOwnProperty.call(state.modalInitialValues, fid);
+        if ((hasInit && el.value !== state.modalInitialValues[fid]) || (!hasInit && el.value !== "")) {
+          saved[fid] = el.value;
+        }
+      }
+    }
+
+    const rerenderOpts = { preserveEdits: true };
+    if (active.type === "new_session") window._app.openNewSessionModal(rerenderOpts);
+    else if (active.type === "forward") window._app.openForwardModal(active.sessionName, rerenderOpts);
+    else if (active.type === "login" && active.flow) window._app.renderLoginModalWithFlow(active.flow, rerenderOpts);
+    else if (active.type === "toggle_mode") openToggleModeModal(active.nextMode, rerenderOpts);
+    else if (active.type === "api_token") openApiTokenModal(active.reason || "", rerenderOpts);
+    else if (active.type === "confirm" && active.meta && state.pendingConfirm) openConfirmModal(active.meta, state.pendingConfirm, rerenderOpts);
+
+    for (const fid of MODAL_FIELD_IDS) {
       const restored = document.getElementById(fid);
-      if (restored) restored.value = val;
+      if (!restored) continue;
+      if (Object.prototype.hasOwnProperty.call(saved, fid)) {
+        restored.value = saved[fid];
+      } else if (restored.value !== undefined) {
+        state.modalInitialValues[fid] = restored.value;
+      }
     }
   }
 
@@ -359,7 +667,16 @@
   });
 
   async function refreshBootstrap() {
-    const snap = await api("/api/bootstrap");
+    const reqId = ++bootstrapReqId;
+    let snap;
+    try {
+      snap = await api("/api/bootstrap");
+    } catch (err) {
+      if (reqId !== bootstrapReqId) return null;
+      throw err;
+    }
+    if (reqId !== bootstrapReqId) return null;
+
     state.settings = snap.settings;
     state.accounts = snap.accounts || [];
     state.activeAccount = snap.active_account;
@@ -371,6 +688,9 @@
     state.receipts = snap.receipts || [];
     state.secrets = snap.secrets || {};
     state.curatedRepos = snap.curated_gguf_repos || [];
+    state.acceleratorSpecs = normalizeAcceleratorSpecs(snap.accelerator_specs);
+    state.approxBurnRates = normalizeBurnRates(snap.approx_burn_rates, state.acceleratorSpecs);
+    state.bootstrapError = null;
 
     if (!state.recipes.find((r) => r.id === state.selectedRecipeId) && state.recipes.length > 0) {
       state.selectedRecipeId = state.recipes[0].id;
@@ -379,6 +699,7 @@
     renderChrome();
     renderMain();
     if (state.activeModal) renderActiveModal();
+    return snap;
   }
 
   function formatRemainingDeadline(epochSec) {
@@ -387,6 +708,17 @@
     const h = Math.floor(diffMin / 60);
     const m = diffMin % 60;
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  }
+
+  function refreshWatchdogCountdowns() {
+    if (state.route !== "sessions") return;
+    const view = document.getElementById("main-view");
+    if (!view || typeof view.querySelectorAll !== "function") return;
+    view.querySelectorAll("[data-watchdog-deadline]").forEach((node) => {
+      const raw = node.getAttribute("data-watchdog-deadline");
+      const epoch = raw ? Number(raw) : 0;
+      node.textContent = formatRemainingDeadline(epoch || null);
+    });
   }
 
   function renderWsIndicator() {
@@ -402,7 +734,13 @@
       }
     }
     if (dot) {
-      dot.className = `dot ${state.wsState === "connected" ? "dot-emerald" : "dot-amber"}`;
+      const dotCls =
+        state.wsState === "connected"
+          ? "dot-emerald"
+          : state.wsState === "reconnecting"
+            ? "dot-amber"
+            : "dot-muted";
+      dot.className = `dot ${dotCls}`;
     }
   }
 
@@ -445,7 +783,8 @@
       } else {
         const staleMark = u.status === "stale" ? ` (${tr("陈旧", "Stale")})` : "";
         balEl.innerHTML = `${tr("余额", "Balance")} <strong>${u.balance_ccu.toFixed(2)} CCU${staleMark}</strong>`;
-        const hrs = u.hours_remaining ? ` · ~${u.hours_remaining}h` : "";
+        const hasHrs = u.hours_remaining !== null && u.hours_remaining !== undefined;
+        const hrs = hasHrs ? ` · ~${u.hours_remaining}h` : "";
         burnEl.innerHTML = `${tr("消耗", "Burn")} <strong>${(u.burn_rate_hourly ?? 0).toFixed(2)}/h${hrs}</strong>`;
       }
     }
@@ -499,7 +838,8 @@
 
     const balText = (u.balance_ccu !== null && u.balance_ccu !== undefined) ? `${u.balance_ccu.toFixed(2)}` : tr("未知", "Unknown");
     const burnText = (u.burn_rate_hourly !== null && u.burn_rate_hourly !== undefined) ? `${u.burn_rate_hourly.toFixed(2)}` : "--";
-    const timeText = u.hours_remaining ? `${u.hours_remaining}` : (u.burn_rate_hourly === 0 ? "INF" : "--");
+    const hasHrs = u.hours_remaining !== null && u.hours_remaining !== undefined;
+    const timeText = hasHrs ? `${u.hours_remaining}` : (u.burn_rate_hourly === 0 ? "INF" : "--");
 
     let html = `
       <div class="page-header">
@@ -622,11 +962,12 @@
 
   function ensureDeployDraft(recipe) {
     if (!state.deployDraft[recipe.id]) {
+      const accel = recipe.provision.accelerator;
       const init = {
         _sessionMode: "new",
-        _accelerator: recipe.provision.accelerator,
+        _accelerator: accel,
         _minVram: recipe.provision.min_vram_mib || 0,
-        _highMem: !!recipe.provision.high_mem,
+        _highMem: !!recipe.provision.high_mem || isHighMemOnlyAccelerator(accel),
       };
       for (const inp of recipe.inputs || []) {
         init[inp.id] = inp.default !== null && inp.default !== undefined ? inp.default : "";
@@ -640,7 +981,7 @@
     const acc = state.activeAccount;
     const bal = acc?.usage?.balance_ccu;
     const accel = draft._accelerator || recipe.provision.accelerator || "A100";
-    const estBurn = APPROX_BURN[accel] ?? 2.0;
+    const estBurn = getBurnRate(accel);
     const estHours = (bal !== null && bal !== undefined && estBurn > 0) ? (bal / estBurn).toFixed(1) : "--";
     const g = state.settings.guards || {};
     const managedSessions = state.sessions.filter((s) => s.managed);
@@ -746,6 +1087,52 @@
     `;
   }
 
+  function buildDeployGpuTiers() {
+    const tierMeta = {
+      G4: { name: "G4 Blackwell", vram: "96 GB", sub: "sm120 · High-RAM", minVram: 80000, highMem: true, tag: tr("视频推荐", "Video") },
+      A100: { name: "A100 80GB", vram: "80 GB", sub: tr("自动退回 40G", "Auto-retry 40G"), minVram: 70000, highMem: true, tag: tr("锁显存", "80G Lock") },
+      H100: { name: "H100 80GB", vram: "80 GB", sub: tr("Hopper · 旗舰", "Hopper · Flagship"), minVram: 70000, highMem: true, tag: tr("旗舰", "Flagship") },
+      L4: { name: "L4", vram: "24 GB", sub: tr("Ada · High-RAM", "Ada · High-RAM"), minVram: 0, highMem: true, tag: "" },
+      T4: { name: "T4", vram: "16 GB", sub: tr("轻量 / 音频", "Light / ASR"), minVram: 0, highMem: false, tag: "" },
+    };
+    const gpuSpecs = getAcceleratorSpecs().filter((sp) => sp.kind === "gpu" || tierMeta[sp.id]);
+    const orderedIds = gpuSpecs.length > 0 ? gpuSpecs.map((sp) => sp.id) : ["G4", "A100", "H100", "L4", "T4"];
+    return orderedIds
+      .filter((id) => tierMeta[id] || getAcceleratorSpec(id)?.kind === "gpu")
+      .map((id) => {
+        const spec = getAcceleratorSpec(id);
+        const meta = tierMeta[id] || {};
+        const maxVramMib = spec && Array.isArray(spec.vram_mib) && spec.vram_mib.length > 0
+          ? Math.max(...spec.vram_mib)
+          : 0;
+        const vramLabel = meta.vram || (maxVramMib > 0 ? `${Math.round(maxVramMib / 1024)} GB` : "--");
+        const highMem = meta.highMem !== undefined ? (meta.highMem || isHighMemOnlyAccelerator(id)) : isHighMemOnlyAccelerator(id);
+        return {
+          id,
+          name: meta.name || id,
+          vram: vramLabel,
+          sub: meta.sub || (highMem ? "High-RAM" : "Standard"),
+          minVram: meta.minVram ?? 0,
+          highMem,
+          tag: meta.tag || "",
+          burnRate: getBurnRate(id),
+        };
+      });
+  }
+
+  function formatAcceleratorOptionLabel(spec) {
+    const id = spec.id;
+    if (id === "NONE") return "CPU (NONE)";
+    if (id === "G4") return "G4 Blackwell (96 GB)";
+    if (id === "A100") return "A100 GPU (40/80 GB)";
+    if (id === "H100") return "H100 GPU (80 GB)";
+    if (id === "L4") return "L4 GPU (24 GB · High-RAM)";
+    if (id === "T4") return "T4 GPU (16 GB)";
+    if (id === "V5E1") return "TPU v5e-1 (High-RAM)";
+    if (id === "V6E1") return "TPU v6e-1 (High-RAM)";
+    return id;
+  }
+
   function renderDeploy() {
     const recipe = state.recipes.find((r) => r.id === state.selectedRecipeId) || state.recipes[0];
     if (!recipe) return `<div class="card">${tr("未找到部署模板", "No deployment recipes found")}</div>`;
@@ -755,14 +1142,13 @@
     const primaryInputs = allInputs.slice(0, 4);
     const advancedInputs = allInputs.slice(4);
     const advOpen = !!state.advancedOpen[recipe.id];
-    const firstWarm = state.sessions[0] || null;
-
-    const gpuTiers = [
-      { id: "G4", name: "G4 Blackwell", vram: "96 GB", sub: "sm120 · High-RAM", minVram: 80000, highMem: true, tag: tr("视频推荐", "Video") },
-      { id: "A100", name: "A100 80GB", vram: "80 GB", sub: tr("自动退回 40G", "Auto-retry 40G"), minVram: 70000, highMem: true, tag: tr("锁显存", "80G Lock") },
-      { id: "L4", name: "L4", vram: "24 GB", sub: tr("Ada · 性价比", "Ada · Balanced"), minVram: 0, highMem: false, tag: "" },
-      { id: "T4", name: "T4", vram: "16 GB", sub: tr("轻量 / 音频", "Light / ASR"), minVram: 0, highMem: false, tag: "" },
-    ];
+    const reusableSessions = getReusableSessions();
+    if (draft._sessionMode !== "new" && !reusableSessions.find((s) => s.name === draft._sessionMode)) {
+      draft._sessionMode = "new";
+    }
+    const firstWarm = reusableSessions[0] || null;
+    const gpuTiers = buildDeployGpuTiers();
+    const advItemCount = advancedInputs.length + (draft._sessionMode === "new" ? 4 : 1);
 
     let leftHtml = `
       <div class="recipe-strip">
@@ -800,7 +1186,7 @@
                   <div class="gpu-vram mono">${esc(g.vram)} <small>VRAM</small></div>
                   <div class="gpu-foot mono">
                     <span>${esc(g.sub)}</span>
-                    <span>~${(APPROX_BURN[g.id] || 1.0).toFixed(2)}/h</span>
+                    <span>~${g.burnRate.toFixed(2)}/h</span>
                   </div>
                 </button>
               `;
@@ -826,17 +1212,15 @@
             ${primaryInputs.map((inp) => renderRecipeInputField(recipe.id, inp, draft[inp.id])).join("")}
           </div>
 
-          ${recipe.id === "llama-cpp-gguf" ? renderGgufPlannerBox(draft) : ""}
+          ${recipe.id === "llama-cpp-gguf" ? `<div id="gguf-planner-host">${renderGgufPlannerBox(draft)}</div>` : ""}
 
-          ${advancedInputs.length > 0 || true ? `
-            <button type="button" class="disclosure-btn" data-action="toggle-advanced" data-recipe-id="${esc(recipe.id)}">
-              <span>${tr("高级参数与精细显存保底设置", "Advanced Recipe Inputs & Hardware Fine-Tuning")}</span>
-              <span class="mono row-actions" style="gap:5px;">
-                <span>${advOpen ? tr("收起", "Hide") : tr(`展开 ${advancedInputs.length + 3} 项`, `Show ${advancedInputs.length + 3}`)}</span>
-                ${advOpen ? IC.chevronUp : IC.chevronDown}
-              </span>
-            </button>
-          ` : ""}
+          <button type="button" class="disclosure-btn" data-action="toggle-advanced" data-recipe-id="${esc(recipe.id)}">
+            <span>${tr("高级参数与精细显存保底设置", "Advanced Recipe Inputs & Hardware Fine-Tuning")}</span>
+            <span class="mono row-actions" style="gap:5px;">
+              <span>${advOpen ? tr("收起", "Hide") : tr(`展开 ${advItemCount} 项`, `Show ${advItemCount}`)}</span>
+              ${advOpen ? IC.chevronUp : IC.chevronDown}
+            </span>
+          </button>
 
           ${advOpen ? `
             <div class="advanced-drawer">
@@ -846,7 +1230,7 @@
                   <label>${tr("运行位置", "Target Session")}</label>
                   <select name="_sessionMode" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_sessionMode" data-rerender="1">
                     <option value="new" ${draft._sessionMode === "new" ? "selected" : ""}>${tr("新建专属 GPU 实例（失败自动释放）", "Create Fresh GPU Session")}</option>
-                    ${state.sessions.map((s) => `
+                    ${reusableSessions.map((s) => `
                       <option value="${esc(s.name)}" ${draft._sessionMode === s.name ? "selected" : ""}>
                         ${tr("复用运行中", "Reuse Active")}: ${esc(s.name)} (${esc(s.gpu_name || s.accelerator)})
                       </option>
@@ -857,20 +1241,20 @@
                   <div class="field">
                     <label>${tr("加速器型号", "Accelerator")}</label>
                     <select name="_accelerator" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_accelerator" data-rerender="1">
-                      ${["G4", "A100", "H100", "L4", "T4", "NONE"].map((acc) => `
-                        <option value="${acc}" ${draft._accelerator === acc ? "selected" : ""}>${acc === "NONE" ? "CPU (NONE)" : acc}</option>
+                      ${getAcceleratorSpecs().map((sp) => `
+                        <option value="${esc(sp.id)}" ${draft._accelerator === sp.id ? "selected" : ""}>${esc(formatAcceleratorOptionLabel(sp))}</option>
                       `).join("")}
                     </select>
                   </div>
                   <div class="field">
                     <label>${tr("最低显存保底 (MiB，不达标自动重抽)", "Min VRAM MiB (Auto-Retry)")}</label>
-                    <input type="number" min="0" max="163840" step="1024" value="${esc(draft._minVram)}"
-                      data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_minVram" data-val-type="number" />
+                    <input type="number" min="0" max="163840" step="1024" value="${draft._minVram !== null && draft._minVram !== undefined ? esc(draft._minVram) : ""}"
+                      data-input="draft" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_minVram" data-val-type="number-optional" />
                   </div>
                   <div class="field">
                     <label>${tr("高内存机型 (High-RAM)", "High-RAM Shape")}</label>
                     <select data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_highMem" data-val-type="bool">
-                      <option value="0" ${!draft._highMem ? "selected" : ""}>Standard RAM</option>
+                      <option value="0" ${!draft._highMem ? "selected" : ""} ${isHighMemOnlyAccelerator(draft._accelerator) ? "disabled" : ""}>Standard RAM</option>
                       <option value="1" ${draft._highMem ? "selected" : ""}>High-RAM</option>
                     </select>
                   </div>
@@ -968,7 +1352,7 @@
               </div>
             ` : ""}
 
-            ${r.log_tail?.length ? `<div class="terminal">${esc(r.log_tail.join("\n"))}</div>` : ""}
+            ${r.log_tail?.length ? `<div class="terminal" data-run-id="${esc(r.run_id)}">${esc(r.log_tail.join("\n"))}</div>` : ""}
           </div>
         `;
       }
@@ -1008,13 +1392,20 @@
         </select>
       `;
     } else if (inp.type === "number") {
+      const hasMin = inp.min !== null && inp.min !== undefined;
+      const hasMax = inp.max !== null && inp.max !== undefined;
+      const numVal = val !== null && val !== undefined ? esc(val) : "";
       control = `
-        <input type="number" data-field-key="${esc(fkey)}" value="${esc(val)}" ${inp.min != null ? `min="${inp.min}"` : ""} ${inp.max != null ? `max="${inp.max}"` : ""}
+        <input type="number" data-field-key="${esc(fkey)}" value="${numVal}" ${hasMin ? `min="${inp.min}"` : ""} ${hasMax ? `max="${inp.max}"` : ""}
           data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" data-val-type="number-optional" />
       `;
     } else if (inp.type === "secret") {
+      const hasSecret = typeof val === "string" ? val.length > 0 : !!val;
+      const secretPlaceholder = hasSecret
+        ? tr("已在内存中暂存密钥（输入新值覆盖，或清空）", "Secret entered in memory (type to replace)")
+        : tr("留空表示不启用密钥验证", "Leave blank if no API key required");
       control = `
-        <input type="password" autocomplete="off" data-field-key="${esc(fkey)}" value="${esc(val)}" placeholder="${tr("留空表示不启用密钥验证", "Leave blank if no API key required")}"
+        <input type="password" autocomplete="off" data-field-key="${esc(fkey)}" data-secret-field="1" placeholder="${esc(secretPlaceholder)}"
           data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
       `;
     } else if (inp.type === "hf-gguf") {
@@ -1168,7 +1559,7 @@
 
                 <div class="kv-row mono" style="font-size:12px;background:var(--bg-input);border:1px solid var(--border-subtle);padding:9px 11px;border-radius:var(--radius-sm);">
                   <span>${tr("预估速率", "Est. Burn")}: <strong>~${s.estimated_burn_hourly} CCU/h</strong> (${tr("累计", "Spent")} ~${s.estimated_spent_ccu})</span>
-                  <span>${tr("看门狗倒计时", "Watchdog")}: <strong>${formatRemainingDeadline(s.watchdog?.deadline_epoch)}</strong></span>
+                  <span>${tr("看门狗倒计时", "Watchdog")}: <strong data-watchdog-deadline="${s.watchdog?.deadline_epoch ?? ""}">${formatRemainingDeadline(s.watchdog?.deadline_epoch)}</strong></span>
                 </div>
 
                 ${s.watchdog?.warning ? `<div style="font-size:12px;color:var(--warning);">${esc(s.watchdog.warning)}</div>` : ""}
@@ -1195,17 +1586,23 @@
       state.selectedChatTunnelId = "";
     }
     const activeTunnelId = state.selectedChatTunnelId || (openTunnels[0]?.id || "");
+    const isReal = state.settings.backend_mode === "real";
+    const noRealTunnel = isReal && openTunnels.length === 0;
+    const forwardableSession = getReusableSessions()[0] || state.sessions.find((s) => s.status !== "stopping" && s.status !== "lost") || null;
     const welcomeText = tr(
       "部署好 GGUF 或 vLLM 模型并开启本地映射后，可直接在此测试推理延迟与吞吐速度 (tok/s)。",
       "Deploy a GGUF or vLLM model and forward its local port to benchmark inference latency and throughput (tok/s) here."
     );
+    const apiKeyPlaceholder = state.chatApiKey
+      ? tr("API Key（已输入）", "API Key (entered)")
+      : tr("API Key (可选)", "API Key (optional)");
     return `
       <div class="page-header">
         <div>
           <h1 class="page-title">${tr("本地端口映射与对话演练场", "Localhost Port Forwards & API Playground")}</h1>
           <p class="page-subtitle">${tr("通过原生 OpenSSH + Colab WebSocket 多路复用将云端端口安全映射至 127.0.0.1（不修改 ~/.ssh/config）。", "Multiplexes Colab VM ports to 127.0.0.1 via native OpenSSH over WebSocket without editing ~/.ssh/config.")}</p>
         </div>
-        ${state.sessions.length > 0 ? `<button class="btn btn-primary" type="button" data-action="open-forward" data-session-name="${esc(state.sessions[0].name)}">${IC.plus} <span>${tr("新建端口映射", "New Port Forward")}</span></button>` : ""}
+        ${forwardableSession ? `<button class="btn btn-primary" type="button" data-action="open-forward" data-session-name="${esc(forwardableSession.name)}">${IC.plus} <span>${tr("新建端口映射", "New Port Forward")}</span></button>` : ""}
       </div>
 
       <div class="banner warning">
@@ -1256,24 +1653,38 @@
             <select id="chat-tunnel-select" data-change="chat-tunnel" style="padding:6px 10px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;">
               ${openTunnels.length > 0
                 ? openTunnels.map((t) => `<option value="${esc(t.id)}" ${t.id === activeTunnelId ? "selected" : ""}>${esc(t.session_name)} — ${esc(t.local_url)}</option>`).join("")
-                : `<option value="">${tr("默认沙盒端点 (127.0.0.1:8000/v1)", "Default Sandbox (127.0.0.1:8000/v1)")}</option>`}
+                : (isReal
+                  ? `<option value="">${tr("请先开启/绑定本地隧道", "Please open or bind a local tunnel first")}</option>`
+                  : `<option value="">${tr("默认沙盒端点 (127.0.0.1:8000/v1)", "Default Sandbox (127.0.0.1:8000/v1)")}</option>`)}
             </select>
             <input type="text" id="chat-model-input" value="${esc(state.chatModel)}" data-input="chat-meta" data-meta-field="chatModel"
               placeholder="model (auto)" title="${tr("模型名，auto 自动识别已部署模型", "Model ID; 'auto' detects active model")}"
               style="width:130px;padding:6px 9px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;" />
-            <input type="password" autocomplete="off" id="chat-apikey-input" value="${esc(state.chatApiKey)}" data-input="chat-meta" data-meta-field="chatApiKey"
-              placeholder="${tr("API Key (可选)", "API Key (optional)")}"
+            <input type="password" autocomplete="off" id="chat-apikey-input" data-input="chat-meta" data-meta-field="chatApiKey"
+              placeholder="${esc(apiKeyPlaceholder)}"
               style="width:135px;padding:6px 9px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;" />
           </div>
         </div>
+        ${noRealTunnel ? `
+          <div class="banner info" style="margin-bottom:12px;font-size:12px;">
+            <span>${tr("真实 Colab 模式下暂无可用本地隧道：请先完成模型部署或点击上方「新建端口映射」绑定本地端口后再发起推理对话。", "No open local tunnel in Real Colab Mode: deploy a model or open a local port forward above before sending prompts.")}</span>
+          </div>
+        ` : ""}
         <div class="chat-box" id="chat-box">
-          ${state.chatMessages.map((m) => `<div class="chat-msg ${esc(m.role)}">${esc(m._welcome ? welcomeText : m.content)}</div>`).join("")}
+          ${state.chatMessages.map((m) => {
+            const cls = `chat-msg ${esc(m.role)}${m._error ? " error" : ""}`;
+            const text = esc(m._welcome ? welcomeText : m.content);
+            const metaHtml = m.meta
+              ? `<div class="chat-msg-meta mono">— ${esc(m.meta.latency_ms)} ms | ${esc(m.meta.tok_per_s)} tok/s</div>`
+              : "";
+            return `<div class="${cls}"><div>${text}</div>${metaHtml}</div>`;
+          }).join("")}
         </div>
         <form class="row-actions" data-submit="chat">
           <input type="text" id="chat-input" value="${esc(state.chatDraft)}" data-input="chat-meta" data-meta-field="chatDraft"
             style="flex:1;padding:9px 11px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);background:var(--bg-input);color:var(--text-primary);font-size:13px;"
-            placeholder="${tr("输入测试提示词以实测延迟与 tok/s...", "Enter a test prompt to measure latency & tok/s...")}" ${state.chatBusy ? "disabled" : ""} />
-          <button type="submit" class="btn btn-primary" ${state.chatBusy ? "disabled" : ""}>${IC.send} <span>${state.chatBusy ? tr("生成中...", "Generating...") : tr("发送测试", "Send")}</span></button>
+            placeholder="${noRealTunnel ? tr("请先开启/绑定本地隧道...", "Open or bind a local tunnel first...") : tr("输入测试提示词以实测延迟与 tok/s...", "Enter a test prompt to measure latency & tok/s...")}" ${state.chatBusy || noRealTunnel ? "disabled" : ""} />
+          <button type="submit" class="btn btn-primary" ${state.chatBusy || noRealTunnel ? "disabled" : ""}>${IC.send} <span>${state.chatBusy ? tr("生成中...", "Generating...") : tr("发送测试", "Send")}</span></button>
         </form>
       </div>
     `;
@@ -1369,8 +1780,18 @@
     `;
   }
 
-  function renderSettings() {
+  function getGuardDraftVal(key, fallback) {
+    if (Object.prototype.hasOwnProperty.call(state.settingsDraft, key)) {
+      return state.settingsDraft[key];
+    }
     const g = state.settings.guards || {};
+    return g[key] ?? fallback;
+  }
+
+  function renderSettings() {
+    const dirty = hasDirtySettingsDraft();
+    const hfDraftSet = !!(state.secretDrafts && state.secretDrafts.hf_token);
+    const civDraftSet = !!(state.secretDrafts && state.secretDrafts.civitai_token);
     return `
       <div class="page-header">
         <div>
@@ -1383,36 +1804,44 @@
         <div class="card">
           <div class="card-head">
             <span class="card-title">${tr("算力成本护栏策略", "Compute Cost Guard Policies")}</span>
+            ${dirty ? `<span class="tag warn">${tr("有未保存修改", "Unsaved changes")}</span>` : ""}
           </div>
           <form data-submit="guard-settings" class="form-grid">
             <div class="field">
               <label>${tr("默认 VM 自动关机限时 (分钟，0=不限时)", "Default VM Auto-Stop (minutes, 0=unlimited)")}</label>
-              <input type="number" id="set-autostop" min="0" max="1440" value="${g.auto_stop_minutes ?? 120}" />
+              <input type="number" id="set-autostop" min="0" max="1440" value="${esc(getGuardDraftVal("auto_stop_minutes", 120))}"
+                data-input="settings-guard" data-change="settings-guard" data-guard-key="auto_stop_minutes" />
               <span class="field-help">${tr("运行在 Colab VM 内部，关闭本地电脑也会准时 unassign", "Runs detached inside Colab VM; unassigns even if console is closed")}</span>
             </div>
             <div class="field">
               <label>${tr("GPU 空闲自动关机 (分钟，0=禁用)", "GPU Idle Auto-Stop (minutes, 0=disabled)")}</label>
-              <input type="number" id="set-idlestop" min="0" max="720" value="${g.idle_stop_minutes ?? 30}" />
+              <input type="number" id="set-idlestop" min="0" max="720" value="${esc(getGuardDraftVal("idle_stop_minutes", 30))}"
+                data-input="settings-guard" data-change="settings-guard" data-guard-key="idle_stop_minutes" />
               <span class="field-help">${tr("同时检测任务心跳与 nvidia-smi 利用率 <5%", "Checks both worker heartbeat and nvidia-smi <5%")}</span>
             </div>
             <div class="field">
               <label>${tr("账号算力余额保护红线 (CCU)", "Account Balance Floor (CCU)")}</label>
-              <input type="number" step="0.5" min="0" id="set-floor" value="${g.balance_floor_ccu ?? 5}" />
+              <input type="number" step="0.5" min="0" id="set-floor" value="${esc(getGuardDraftVal("balance_floor_ccu", 5))}"
+                data-input="settings-guard" data-change="settings-guard" data-guard-key="balance_floor_ccu" />
               <span class="field-help">${tr("低于此余额自动释放该账号下所有实例", "Stops all runtimes on the account when live balance drops to floor")}</span>
             </div>
             <div class="field">
               <label>${tr("单实例累计消耗上限 (CCU)", "Per-Session Spend Cap (CCU)")}</label>
-              <input type="number" step="1" min="0" id="set-cap" value="${g.session_spend_cap_ccu ?? 20}" />
+              <input type="number" step="1" min="0" id="set-cap" value="${esc(getGuardDraftVal("session_spend_cap_ccu", 20))}"
+                data-input="settings-guard" data-change="settings-guard" data-guard-key="session_spend_cap_ccu" />
             </div>
             <div class="field">
               <label>${tr("显存不达标最大重抽次数", "Max VRAM Provisioning Retries")}</label>
-              <input type="number" min="1" max="8" id="set-retries" value="${g.max_vram_retries ?? 4}" />
+              <input type="number" min="1" max="8" id="set-retries" value="${esc(getGuardDraftVal("max_vram_retries", 4))}"
+                data-input="settings-guard" data-change="settings-guard" data-guard-key="max_vram_retries" />
             </div>
             <div class="field">
               <label>${tr("最大受管实例并发上限", "Max Managed Sessions")}</label>
-              <input type="number" min="1" max="5" id="set-maxsess" value="${g.max_managed_sessions ?? 3}" />
+              <input type="number" min="1" max="5" id="set-maxsess" value="${esc(getGuardDraftVal("max_managed_sessions", 3))}"
+                data-input="settings-guard" data-change="settings-guard" data-guard-key="max_managed_sessions" />
             </div>
-            <div class="field full" style="align-items:flex-end;">
+            <div class="field full row-actions" style="justify-content:flex-end;">
+              ${dirty ? `<button type="button" class="btn" data-action="reset-guard-draft">${tr("重置未保存修改", "Reset Unsaved")}</button>` : ""}
               <button type="submit" class="btn btn-primary${isBusy("settings:guards") ? " is-busy" : ""}" ${isBusy("settings:guards") ? "disabled" : ""}>${tr("保存护栏配置", "Save Guard Settings")}</button>
             </div>
           </form>
@@ -1428,7 +1857,9 @@
           <div class="field" style="margin-bottom:14px;">
             <label>Hugging Face Token — ${state.secrets.hf_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
             <div class="row-actions">
-              <input type="password" autocomplete="off" id="inp-hf-token" style="flex:1;" placeholder="hf_xxxxxxxxxxxxxxxxxxxx" />
+              <input type="password" autocomplete="off" id="inp-hf-token" style="flex:1;"
+                data-input="secret-draft" data-slot="hf_token"
+                placeholder="${hfDraftSet ? tr("已输入未保存令牌（点击保存生效）", "Unsaved token entered (click Save)") : "hf_xxxxxxxxxxxxxxxxxxxx"}" />
               <button class="btn btn-sm btn-primary${isBusy("secret:save:hf_token") ? " is-busy" : ""}" type="button" data-action="save-secret" data-slot="hf_token" data-input-id="inp-hf-token" ${isBusy("secret:save:hf_token") ? "disabled" : ""}>${tr("保存", "Save")}</button>
               ${state.secrets.hf_token ? `<button class="btn btn-sm btn-danger${isBusy("secret:delete:hf_token") ? " is-busy" : ""}" type="button" data-action="delete-secret" data-slot="hf_token" ${isBusy("secret:delete:hf_token") ? "disabled" : ""}>${tr("清除", "Clear")}</button>` : ""}
             </div>
@@ -1437,7 +1868,9 @@
           <div class="field" style="margin-bottom:18px;">
             <label>Civitai API Token — ${state.secrets.civitai_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
             <div class="row-actions">
-              <input type="password" autocomplete="off" id="inp-civ-token" style="flex:1;" placeholder="Civitai API Token" />
+              <input type="password" autocomplete="off" id="inp-civ-token" style="flex:1;"
+                data-input="secret-draft" data-slot="civitai_token"
+                placeholder="${civDraftSet ? tr("已输入未保存令牌（点击保存生效）", "Unsaved token entered (click Save)") : "Civitai API Token"}" />
               <button class="btn btn-sm btn-primary${isBusy("secret:save:civitai_token") ? " is-busy" : ""}" type="button" data-action="save-secret" data-slot="civitai_token" data-input-id="inp-civ-token" ${isBusy("secret:save:civitai_token") ? "disabled" : ""}>${tr("保存", "Save")}</button>
               ${state.secrets.civitai_token ? `<button class="btn btn-sm btn-danger${isBusy("secret:delete:civitai_token") ? " is-busy" : ""}" type="button" data-action="delete-secret" data-slot="civitai_token" ${isBusy("secret:delete:civitai_token") ? "disabled" : ""}>${tr("清除", "Clear")}</button>` : ""}
             </div>
@@ -1458,19 +1891,65 @@
     `;
   }
 
+  function restoreInMemorySecretInputs(view) {
+    if (state.route === "settings") {
+      const hfEl = document.getElementById("inp-hf-token");
+      if (hfEl && state.secretDrafts.hf_token) hfEl.value = state.secretDrafts.hf_token;
+      const civEl = document.getElementById("inp-civ-token");
+      if (civEl && state.secretDrafts.civitai_token) civEl.value = state.secretDrafts.civitai_token;
+    } else if (state.route === "tunnels") {
+      const keyEl = document.getElementById("chat-apikey-input");
+      if (keyEl && state.chatApiKey) keyEl.value = state.chatApiKey;
+    } else if (state.route === "deploy" && view && typeof view.querySelector === "function") {
+      const recipe = state.recipes.find((r) => r.id === state.selectedRecipeId) || state.recipes[0];
+      const draft = recipe ? state.deployDraft[recipe.id] : null;
+      if (recipe && draft) {
+        for (const inp of recipe.inputs || []) {
+          if (inp.type === "secret" && draft[inp.id]) {
+            const fkey = `${recipe.id}:${inp.id}`;
+            const el = view.querySelector(`[data-field-key="${CSS.escape(fkey)}"]`);
+            if (el) el.value = draft[inp.id];
+          }
+        }
+      }
+    }
+  }
+
   function renderMain() {
     const view = document.getElementById("main-view");
+    if (!view) return;
     const active = document.activeElement;
     let focusSnap = null;
-    if (active && view.contains(active) && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName)) {
+    if (active && typeof view.contains === "function" && view.contains(active) && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName)) {
       focusSnap = {
         id: active.id || "",
-        fkey: active.getAttribute("data-field-key") || "",
+        fkey: typeof active.getAttribute === "function" ? (active.getAttribute("data-field-key") || "") : "",
         value: active.value,
         preserveValue: ["inp-hf-token", "inp-civ-token", "set-autostop", "set-idlestop", "set-floor", "set-cap", "set-retries", "set-maxsess"].includes(active.id || ""),
         selStart: typeof active.selectionStart === "number" ? active.selectionStart : null,
         selEnd: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
       };
+    }
+
+    // Preserve .terminal and #chat-box scroll positions across re-renders
+    let chatScrollSnap = null;
+    const prevChatBox = document.getElementById("chat-box");
+    if (prevChatBox && typeof prevChatBox.scrollTop === "number") {
+      const sh = Number(prevChatBox.scrollHeight || 0);
+      const ch = Number(prevChatBox.clientHeight || 0);
+      chatScrollSnap = {
+        scrollTop: prevChatBox.scrollTop,
+        atBottom: sh > 0 && ch > 0 ? (sh - prevChatBox.scrollTop - ch <= 24) : false,
+      };
+    }
+    const terminalScrollSnaps = new Map();
+    if (typeof view.querySelectorAll === "function") {
+      view.querySelectorAll(".terminal").forEach((el, idx) => {
+        if (typeof el.scrollTop === "number") {
+          const key = (typeof el.getAttribute === "function" && el.getAttribute("data-run-id")) || `idx:${idx}`;
+          terminalScrollSnaps.set(key, el.scrollTop);
+        }
+      });
     }
 
     if (state.route === "overview") view.innerHTML = renderOverview();
@@ -1480,13 +1959,38 @@
     else if (state.route === "accounts") view.innerHTML = renderAccountsAndReceipts();
     else if (state.route === "settings") view.innerHTML = renderSettings();
 
+    restoreInMemorySecretInputs(view);
+
+    // Restore scroll positions
+    const nextChatBox = document.getElementById("chat-box");
+    if (nextChatBox) {
+      if (pendingScrollChatToBottom) {
+        nextChatBox.scrollTop = nextChatBox.scrollHeight || 0;
+        pendingScrollChatToBottom = false;
+      } else if (chatScrollSnap) {
+        nextChatBox.scrollTop = chatScrollSnap.atBottom && nextChatBox.scrollHeight
+          ? nextChatBox.scrollHeight
+          : chatScrollSnap.scrollTop;
+      }
+    }
+    if (terminalScrollSnaps.size > 0 && typeof view.querySelectorAll === "function") {
+      view.querySelectorAll(".terminal").forEach((el, idx) => {
+        const key = (typeof el.getAttribute === "function" && el.getAttribute("data-run-id")) || `idx:${idx}`;
+        if (terminalScrollSnaps.has(key)) {
+          el.scrollTop = terminalScrollSnaps.get(key);
+        }
+      });
+    }
+
     if (focusSnap) {
       let restored = null;
       if (focusSnap.id) restored = document.getElementById(focusSnap.id);
-      else if (focusSnap.fkey) restored = view.querySelector(`[data-field-key="${CSS.escape(focusSnap.fkey)}"]`);
+      else if (focusSnap.fkey && typeof view.querySelector === "function") {
+        restored = view.querySelector(`[data-field-key="${CSS.escape(focusSnap.fkey)}"]`);
+      }
       if (restored) {
         if (focusSnap.preserveValue) restored.value = focusSnap.value;
-        restored.focus({ preventScroll: true });
+        if (typeof restored.focus === "function") restored.focus({ preventScroll: true });
         if (focusSnap.selStart !== null && typeof restored.setSelectionRange === "function") {
           try { restored.setSelectionRange(focusSnap.selStart, focusSnap.selEnd); } catch (_) {}
         }
@@ -1494,9 +1998,9 @@
     }
   }
 
-  function renderCommandPaletteItems() {
+  function getFilteredCommandActions() {
     const q = (state.cmdQuery || "").trim().toLowerCase();
-    const actions = [
+    return [
       { label: tr("前往：总览看板", "Go to: Overview"), sub: "overview", kind: "go", arg: "overview" },
       { label: tr("前往：模型极速部署", "Go to: Quick Deploy"), sub: "deploy", kind: "go", arg: "deploy" },
       { label: tr("前往：算力实例管理", "Go to: GPU Sessions"), sub: "sessions", kind: "go", arg: "sessions" },
@@ -1512,19 +2016,67 @@
         arg: r.id,
       })),
     ].filter((a) => !q || a.label.toLowerCase().includes(q) || a.sub.toLowerCase().includes(q));
+  }
 
-    return actions.map((a) => `
-      <button type="button" class="cmd-item" data-action="cmd-exec" data-cmd-kind="${esc(a.kind)}" data-cmd-arg="${esc(a.arg)}">
+  function renderCommandPaletteItems() {
+    const actions = getFilteredCommandActions();
+    if (actions.length === 0) {
+      state.cmdActiveIndex = 0;
+      return `<div class="kpi-foot" style="padding:12px;text-align:center;">${tr("无匹配命令", "No matching commands")}</div>`;
+    }
+    if (state.cmdActiveIndex < 0 || state.cmdActiveIndex >= actions.length) {
+      state.cmdActiveIndex = 0;
+    }
+    return actions.map((a, idx) => `
+      <button type="button" class="cmd-item${idx === state.cmdActiveIndex ? " active" : ""}" data-action="cmd-exec" data-cmd-idx="${idx}" data-cmd-kind="${esc(a.kind)}" data-cmd-arg="${esc(a.arg)}" aria-selected="${idx === state.cmdActiveIndex ? "true" : "false"}">
         <span>${esc(a.label)}</span>
         <span class="cmd-sub mono">${esc(a.sub)}</span>
       </button>
-    `).join("") || `<div class="kpi-foot" style="padding:12px;text-align:center;">${tr("无匹配命令", "No matching commands")}</div>`;
+    `).join("");
   }
 
-  function openCommandPalette() {
+  async function executeCommandAction(kind, arg) {
+    if (kind === "go") {
+      closeModal();
+      window._app.go(arg);
+    } else if (kind === "new-session") {
+      window._app.openNewSessionModal();
+    } else if (kind === "refresh-usage") {
+      closeModal();
+      await window._app.refreshUsage();
+    } else if (kind === "pick-recipe") {
+      closeModal();
+      window._app.pickRecipe(arg);
+    }
+  }
+
+  function openCommandPalette(opts = {}) {
+    const placeholder = tr(
+      "输入命令、页面或配方名快速跳转 (↑↓ 选择 · Enter 执行 · Esc 关闭)...",
+      "Type a command, page, or recipe name (↑↓ select · Enter run · Esc close)..."
+    );
+    const existingSearch = document.getElementById("cmd-search");
+    const existingList = document.getElementById("cmd-list");
+    const modalBody = document.getElementById("modal-body");
+    const alreadyMounted =
+      state.activeModal &&
+      state.activeModal.type === "cmd_palette" &&
+      existingSearch &&
+      existingList &&
+      (!modalBody || typeof modalBody.contains !== "function" || modalBody.contains(existingSearch));
+
+    if (alreadyMounted) {
+      // Static shell: NEVER rebuild #cmd-search so Chinese IME composition is never interrupted
+      existingSearch.placeholder = placeholder;
+      if (opts.resetQuery) existingSearch.value = state.cmdQuery;
+      existingList.innerHTML = renderCommandPaletteItems();
+      return;
+    }
+
+    state.cmdActiveIndex = 0;
     openModal(`
       <div class="field">
-        <input type="text" id="cmd-search" value="${esc(state.cmdQuery)}" placeholder="${tr("输入命令、页面或配方名快速跳转 (Esc 关闭)...", "Type a command, page, or recipe name (Esc to close)...")}"
+        <input type="text" id="cmd-search" autocomplete="off" value="${esc(state.cmdQuery)}" placeholder="${esc(placeholder)}"
           data-input="cmd-filter" />
       </div>
       <div class="cmd-list" id="cmd-list">
@@ -1540,13 +2092,15 @@
   async function executeStopAll(triggerEl = null) {
     return runLocked("sessions:stop-all", triggerEl, async () => {
       try {
-        const res = await api("/api/sessions/stop-all", { method: "POST" });
+        const res = await api("/api/sessions/stop-all", { method: "POST", timeoutMs: 90000 });
         const remaining = Number(res.remaining_sessions || 0);
+        const timedOutProvisions = Number(res.timed_out_provisions || 0);
         const failedAccounts = Array.isArray(res.failed_accounts) ? res.failed_accounts : [];
         const stopErrors = Array.isArray(res.stop_errors) ? res.stop_errors : [];
         const verified =
           res.zero_burn_verified === true &&
           remaining === 0 &&
+          timedOutProvisions === 0 &&
           failedAccounts.length === 0 &&
           stopErrors.length === 0;
 
@@ -1565,14 +2119,15 @@
             kind: "stop_all_unverified",
             stoppedCount: res.stopped_count ?? 0,
             remaining,
+            timedOutProvisions,
             failedAccounts,
             stopErrors,
           };
           renderGlobalAlert();
           toast(
             tr(
-              `零燃费核验失败：残留 ${remaining} 个实例或存在未确认异常，请查看顶部告警并重试！`,
-              `Zero-burn verification failed: ${remaining} remaining session(s) or unverified errors — check alert banner and retry!`
+              `零燃费核验失败：残留 ${remaining} 个实例${timedOutProvisions > 0 ? `、${timedOutProvisions} 个超时分配` : ""}或存在未确认异常，请查看顶部告警并重试！`,
+              `Zero-burn verification failed: ${remaining} remaining session(s)${timedOutProvisions > 0 ? `, ${timedOutProvisions} timed-out provision(s)` : ""} or unverified errors — check alert banner and retry!`
             ),
             "err"
           );
@@ -1616,8 +2171,7 @@
   function parseDraftFieldValue(el) {
     const valType = el.dataset.valType || "";
     if (valType === "bool") return el.value === "1";
-    if (valType === "number") return Number(el.value);
-    if (valType === "number-optional") return el.value === "" ? "" : Number(el.value);
+    if (valType === "number" || valType === "number-optional") return el.value === "" ? "" : Number(el.value);
     return el.value;
   }
 
@@ -1626,8 +2180,13 @@
     closeModal,
     refreshBootstrap,
     openCommandPalette,
+    openApiTokenModal,
+    getApiToken,
+    setApiToken,
+    refreshWatchdogCountdowns,
     filterCmdPalette(val) {
       state.cmdQuery = val;
+      state.cmdActiveIndex = 0;
       const list = document.getElementById("cmd-list");
       if (list) list.innerHTML = renderCommandPaletteItems();
       else openCommandPalette();
@@ -1664,13 +2223,26 @@
       d._sessionMode = "new";
       d._accelerator = accel;
       d._minVram = minVram;
-      d._highMem = !!highMem;
+      d._highMem = !!highMem || isHighMemOnlyAccelerator(accel);
       state.deployDraft[recipeId] = d;
       renderMain();
     },
     updateDraft(recipeId, key, val, rerender = false) {
       if (!state.deployDraft[recipeId]) state.deployDraft[recipeId] = {};
+      const prevVal = state.deployDraft[recipeId][key];
       state.deployDraft[recipeId][key] = val;
+      if (key === "_accelerator" && isHighMemOnlyAccelerator(val)) {
+        state.deployDraft[recipeId]._highMem = true;
+      }
+      if (recipeId === "llama-cpp-gguf" && key === "repo" && val !== prevVal) {
+        ggufReqId += 1;
+        state.ggufPlan = null;
+        state.ggufPlanLoading = false;
+        if (!rerender) {
+          const host = document.getElementById("gguf-planner-host");
+          if (host) host.innerHTML = "";
+        }
+      }
       if (rerender) renderMain();
     },
     pickCuratedRepo(repo) {
@@ -1682,6 +2254,7 @@
       d._sessionMode = "new";
       d._accelerator = accel;
       d._minVram = minVram;
+      d._highMem = isHighMemOnlyAccelerator(accel) || minVram >= 70000;
       state.deployDraft["llama-cpp-gguf"] = d;
       toast(
         tr(
@@ -1696,6 +2269,7 @@
       const d = state.deployDraft["llama-cpp-gguf"] || {};
       const repo = (d.repo || "").trim();
       if (!repo) return toast(tr("请先输入 Hugging Face GGUF 仓库名", "Please enter a Hugging Face GGUF repository ID"), "err");
+      const reqId = ++ggufReqId;
       state.ggufPlanLoading = true;
       renderMain();
       try {
@@ -1705,12 +2279,17 @@
           ctx: String(d.ctx || 0),
           kv: d.kv || "auto",
         });
-        state.ggufPlan = await api(`/api/hf/gguf-plan?${q.toString()}`);
+        const plan = await api(`/api/hf/gguf-plan?${q.toString()}`);
+        if (reqId !== ggufReqId) return;
+        state.ggufPlan = plan;
       } catch (err) {
+        if (reqId !== ggufReqId) return;
         toast(err.message, "err");
       } finally {
-        state.ggufPlanLoading = false;
-        renderMain();
+        if (reqId === ggufReqId) {
+          state.ggufPlanLoading = false;
+          renderMain();
+        }
       }
     },
     async submitDeploy(ev, triggerEl = null) {
@@ -1733,13 +2312,16 @@
         provision: draft._sessionMode === "new" ? {
           accelerator: accel,
           min_vram_mib: minVram,
-          high_mem: !!draft._highMem,
+          high_mem: !!draft._highMem || isHighMemOnlyAccelerator(accel),
         } : null,
       };
 
       const executeDeploy = () => runLocked("deploy:submit", triggerEl, async () => {
         try {
           await api("/api/deployments", { method: "POST", body: JSON.stringify(body) });
+          for (const inp of recipe.inputs || []) {
+            if (inp.type === "secret") draft[inp.id] = "";
+          }
           toast(tr("部署任务已启动，正在实时追踪进度...", "Deployment started; streaming live progress..."), "ok");
           await refreshBootstrap();
         } catch (err) {
@@ -1748,7 +2330,7 @@
       });
 
       if (state.settings.backend_mode === "real" && draft._sessionMode === "new") {
-        const estBurn = APPROX_BURN[accel] ?? 2.0;
+        const estBurn = getBurnRate(accel);
         const bal = state.activeAccount?.usage?.balance_ccu;
         const autoStop = state.settings.guards?.auto_stop_minutes ?? 120;
         openConfirmModal(
@@ -1762,7 +2344,7 @@
               )}</p>
               <div class="confirm-cost-box">
                 <div class="kv-row"><span>${tr("部署模板", "Recipe")}</span><span class="strong">${esc(locObj(recipe.name))}</span></div>
-                <div class="kv-row"><span>${tr("目标算力", "Target Accelerator")}</span><span class="mono strong">${esc(accel)}${minVram > 0 ? ` (>= ${minVram} MiB)` : ""}${draft._highMem ? " · High-RAM" : ""}</span></div>
+                <div class="kv-row"><span>${tr("目标算力", "Target Accelerator")}</span><span class="mono strong">${esc(accel)}${minVram > 0 ? ` (>= ${minVram} MiB)` : ""}${body.provision?.high_mem ? " · High-RAM" : ""}</span></div>
                 <div class="kv-row"><span>${tr("预估消耗速率", "Estimated Burn Rate")}</span><span class="mono strong">~${estBurn.toFixed(2)} CCU/h</span></div>
                 <div class="kv-row"><span>${tr("当前账号余额", "Account Balance")}</span><span class="mono strong">${bal !== null && bal !== undefined ? `${bal.toFixed(2)} CCU` : tr("未知", "Unknown")}</span></div>
                 <div class="kv-row"><span>${tr("VM 看门狗限时", "VM Auto-Stop Limit")}</span><span class="mono strong">${autoStop > 0 ? `${autoStop} min` : tr("不限时 (高风险)", "Unlimited (High Risk)")}</span></div>
@@ -1812,7 +2394,7 @@
     async syncKeep(runId, triggerEl = null) {
       return runLocked(`run:sync:${runId}`, triggerEl, async () => {
         try {
-          await api(`/api/deployments/${encodeURIComponent(runId)}/keep/sync`, { method: "POST" });
+          await api(`/api/deployments/${encodeURIComponent(runId)}/keep/sync`, { method: "POST", timeoutMs: 90000 });
           toast(tr("已同步并打包保留成品目录至本地 data/keep/", "Synced keep artifacts locally to data/keep/"), "ok");
           await refreshBootstrap();
         } catch (err) {
@@ -1898,20 +2480,14 @@
         }
       });
     },
-    openNewSessionModal() {
+    openNewSessionModal(opts = {}) {
       openModal(`
         <h3 style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("新建 Colab 算力实例", "New Colab GPU Session")}</h3>
         <form data-submit="new-session" class="form-grid">
           <div class="field">
             <label>${tr("加速器型号", "Accelerator")}</label>
             <select id="m-accel">
-              <option value="G4">G4 Blackwell (96 GB)</option>
-              <option value="A100">A100 GPU (40/80 GB)</option>
-              <option value="L4">L4 GPU (24 GB)</option>
-              <option value="T4">T4 GPU (16 GB)</option>
-              <option value="H100">H100 GPU (80 GB)</option>
-              <option value="V5E1">TPU v5e-1</option>
-              <option value="NONE">CPU (NONE)</option>
+              ${getAcceleratorSpecs().map((sp) => `<option value="${esc(sp.id)}">${esc(formatAcceleratorOptionLabel(sp))}</option>`).join("")}
             </select>
           </div>
           <div class="field">
@@ -1935,7 +2511,7 @@
             <button type="submit" class="btn btn-primary${isBusy("session:create") ? " is-busy" : ""}" ${isBusy("session:create") ? "disabled" : ""}>${tr("立即申请实例", "Allocate Session")}</button>
           </div>
         </form>
-      `, { type: "new_session" });
+      `, { type: "new_session" }, opts);
     },
     async submitNewSession(ev, triggerEl = null) {
       ev.preventDefault();
@@ -1944,11 +2520,12 @@
       const vramEl = document.getElementById("m-vram");
       const autoEl = document.getElementById("m-autostop");
       const highEl = document.getElementById("m-highmem");
+      const accel = accelEl ? accelEl.value : "G4";
       const body = {
-        accelerator: accelEl ? accelEl.value : "G4",
+        accelerator: accel,
         min_vram_mib: Number((vramEl && vramEl.value) || 0),
         auto_stop_minutes: autoEl && autoEl.value !== "" ? Number(autoEl.value) : 120,
-        high_mem: highEl ? highEl.value === "1" : false,
+        high_mem: isHighMemOnlyAccelerator(accel) ? true : (highEl ? highEl.value === "1" : false),
       };
 
       const executeProvision = () => runLocked("session:create", triggerEl, async () => {
@@ -1962,7 +2539,7 @@
       });
 
       if (state.settings.backend_mode === "real") {
-        const estBurn = APPROX_BURN[body.accelerator] ?? 2.0;
+        const estBurn = getBurnRate(body.accelerator);
         const bal = state.activeAccount?.usage?.balance_ccu;
         openConfirmModal(
           {
@@ -2004,7 +2581,7 @@
         }
       });
     },
-    openForwardModal(sessionName) {
+    openForwardModal(sessionName, opts = {}) {
       openModal(`
         <h3 style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("映射云端端口至本机 127.0.0.1", "Forward Colab VM Port to 127.0.0.1")}</h3>
         <form data-submit="forward" data-session-name="${esc(sessionName)}" class="form-grid">
@@ -2025,7 +2602,7 @@
             <button type="submit" class="btn btn-primary">${tr("开启映射", "Start Forward")}</button>
           </div>
         </form>
-      `, { type: "forward", sessionName });
+      `, { type: "forward", sessionName }, opts);
     },
     async submitForward(ev, sessionName) {
       ev.preventDefault();
@@ -2073,37 +2650,55 @@
       if (!text) return;
       const tunSel = document.getElementById("chat-tunnel-select");
       const tunnelId = tunSel?.value || state.selectedChatTunnelId || null;
+      if (state.settings.backend_mode === "real" && !tunnelId) {
+        toast(tr("真实模式下请先开启/绑定本地隧道后再发送对话", "Please open or bind a local tunnel first in Real Mode"), "err");
+        return;
+      }
       state.selectedChatTunnelId = tunnelId || "";
       state.chatMessages.push({ role: "user", content: text });
       state.chatDraft = "";
       if (inp) inp.value = "";
       state.chatBusy = true;
+      pendingScrollChatToBottom = true;
       renderMain();
+
+      const outboundMessages = state.chatMessages
+        .filter((m) => (m.role === "user" || m.role === "assistant") && !m._welcome && !m._error)
+        .map((m) => ({ role: m.role, content: m.content }));
 
       try {
         const res = await api("/api/playground/chat", {
           method: "POST",
+          timeoutMs: 185000,
           body: JSON.stringify({
             tunnel_id: tunnelId || null,
             model: (state.chatModel || "auto").trim() || "auto",
             api_key: (state.chatApiKey || "").trim() || null,
-            messages: state.chatMessages.filter((m) => m.role !== "system" && !m._welcome),
+            messages: outboundMessages,
           }),
         });
         state.chatMessages.push({
           role: "assistant",
-          content: `${res.reply}\n\n— ${res.latency_ms} ms | ${res.tok_per_s} tok/s`,
+          content: res.reply,
+          meta: {
+            latency_ms: res.latency_ms,
+            tok_per_s: res.tok_per_s,
+            model: res.model || "",
+          },
         });
       } catch (err) {
-        state.chatMessages.push({ role: "assistant", content: `[ERROR] ${tr("请求失败", "Request failed")}: ${err.message}` });
+        state.chatMessages.push({
+          role: "assistant",
+          _error: true,
+          content: `[ERROR] ${tr("请求失败", "Request failed")}: ${err.message}`,
+        });
       } finally {
         state.chatBusy = false;
+        pendingScrollChatToBottom = true;
         renderMain();
-        const box = document.getElementById("chat-box");
-        if (box) box.scrollTop = box.scrollHeight;
       }
     },
-    renderLoginModalWithFlow(flow) {
+    renderLoginModalWithFlow(flow, opts = {}) {
       const isMock = state.settings.backend_mode === "mock";
       openModal(`
         <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("添加 Google Colab 账号", "Add Google Colab Account")}</h3>
@@ -2129,7 +2724,7 @@
             <button type="submit" class="btn btn-primary">${tr("完成验证并保存", "Verify & Save Account")}</button>
           </div>
         </form>
-      `, { type: "login", flow });
+      `, { type: "login", flow }, opts);
     },
     async openLoginModal() {
       try {
@@ -2212,19 +2807,47 @@
         }
       );
     },
+    setGuardDraftField(key, rawVal) {
+      if (!key) return;
+      state.settingsDraft[key] = rawVal;
+    },
+    resetGuardDraft() {
+      state.settingsDraft = {};
+      renderMain();
+    },
+    setSecretDraft(slot, val) {
+      if (!slot) return;
+      state.secretDrafts[slot] = val;
+    },
+    async submitApiToken(ev) {
+      ev.preventDefault();
+      const inp = document.getElementById("api-token-input");
+      const val = (inp ? inp.value : "").trim();
+      if (!val) {
+        toast(tr("请输入有效的 API Token", "Please enter a valid API token"), "err");
+        return;
+      }
+      setApiToken(val);
+      closeModal();
+      wsReconnectDelay = WS_BACKOFF_BASE_MS;
+      await initConsole();
+    },
     async saveGuardSettings(ev, triggerEl = null) {
       ev.preventDefault();
-      const guards = {
-        auto_stop_minutes: Number(document.getElementById("set-autostop").value),
-        idle_stop_minutes: Number(document.getElementById("set-idlestop").value),
-        balance_floor_ccu: Number(document.getElementById("set-floor").value),
-        session_spend_cap_ccu: Number(document.getElementById("set-cap").value),
-        max_vram_retries: Number(document.getElementById("set-retries").value),
-        max_managed_sessions: Number(document.getElementById("set-maxsess").value),
-      };
+      const guards = {};
+      for (const f of GUARD_FIELDS) {
+        const el = document.getElementById(f.id);
+        const raw = el ? el.value : getGuardDraftVal(f.key, f.fallback);
+        if (raw === "" || raw === null || raw === undefined || !Number.isFinite(Number(raw))) {
+          toast(tr("护栏数值不能为空或无效数字", "Guard settings require valid numeric values"), "err");
+          return;
+        }
+        guards[f.key] = Number(raw);
+      }
       return runLocked("settings:guards", triggerEl, async () => {
         try {
           await api("/api/settings", { method: "PATCH", body: JSON.stringify({ guards }) });
+          state.settingsDraft = {};
           toast(tr("成本护栏配置已保存", "Cost guard settings saved"), "ok");
           await refreshBootstrap();
         } catch (err) {
@@ -2234,7 +2857,7 @@
     },
     async saveSecret(slot, inputId, triggerEl = null) {
       const inp = document.getElementById(inputId);
-      const val = inp ? inp.value.trim() : "";
+      const val = ((inp ? inp.value : "") || state.secretDrafts[slot] || "").trim();
       if (!val) return toast(tr("请输入有效 Token", "Please enter a valid token"), "err");
       return runLocked(`secret:save:${slot}`, triggerEl, async () => {
         try {
@@ -2242,6 +2865,7 @@
             method: "PUT",
             body: JSON.stringify({ value: val }),
           });
+          state.secretDrafts[slot] = "";
           if (inp) inp.value = "";
           toast(tr(`${slot} 已安全存入系统凭据管理器`, `${slot} saved to OS credential vault`), "ok");
           await refreshBootstrap();
@@ -2269,6 +2893,7 @@
           await runLocked(`secret:delete:${slot}`, triggerEl, async () => {
             try {
               await api(`/api/secrets/${encodeURIComponent(slot)}`, { method: "DELETE" });
+              state.secretDrafts[slot] = "";
               toast(tr(`${slot} 已清除`, `${slot} cleared`), "ok");
               await refreshBootstrap();
             } catch (err) {
@@ -2317,6 +2942,12 @@
       } catch (err) {
         toast(err.message, "err");
       }
+    } else if (action === "retry-bootstrap") {
+      await initConsole();
+    } else if (action === "open-api-token") {
+      openApiTokenModal(state.bootstrapError?.message || "");
+    } else if (action === "reset-guard-draft") {
+      window._app.resetGuardDraft();
     } else if (action === "retry-stop-all") {
       await executeStopAll(el);
     } else if (action === "dismiss-alert") {
@@ -2394,26 +3025,17 @@
     } else if (action === "set-mock-scenario") {
       await window._app.setMockScenario(el.dataset.scenario || "demo");
     } else if (action === "cmd-exec") {
-      const kind = el.dataset.cmdKind || "";
-      const arg = el.dataset.cmdArg || "";
-      if (kind === "go") {
-        closeModal();
-        window._app.go(arg);
-      } else if (kind === "new-session") {
-        window._app.openNewSessionModal();
-      } else if (kind === "refresh-usage") {
-        closeModal();
-        await window._app.refreshUsage();
-      } else if (kind === "pick-recipe") {
-        closeModal();
-        window._app.pickRecipe(arg);
-      }
+      await executeCommandAction(el.dataset.cmdKind || "", el.dataset.cmdArg || "");
     }
   }
 
   function handleFieldInput(ev) {
     const el = ev.target;
-    if (!el || !el.dataset) return;
+    if (!el) return;
+    if (el.id && MODAL_FIELD_IDS.includes(el.id)) {
+      state.modalEdits[el.id] = el.value;
+    }
+    if (!el.dataset) return;
     const mode = el.dataset.input;
     if (mode === "draft") {
       window._app.updateDraft(el.dataset.recipeId || "", el.dataset.key || "", parseDraftFieldValue(el), false);
@@ -2421,12 +3043,27 @@
       window._app.setChatMeta(el.dataset.metaField || "", el.value);
     } else if (mode === "cmd-filter") {
       window._app.filterCmdPalette(el.value);
+    } else if (mode === "settings-guard") {
+      window._app.setGuardDraftField(el.dataset.guardKey || "", el.value);
+    } else if (mode === "secret-draft") {
+      window._app.setSecretDraft(el.dataset.slot || "", el.value);
     }
   }
 
   function handleFieldChange(ev) {
     const el = ev.target;
-    if (!el || !el.dataset) return;
+    if (!el) return;
+    if (el.id && MODAL_FIELD_IDS.includes(el.id)) {
+      state.modalEdits[el.id] = el.value;
+    }
+    if (el.id === "m-accel" && isHighMemOnlyAccelerator(el.value)) {
+      const highEl = document.getElementById("m-highmem");
+      if (highEl) {
+        highEl.value = "1";
+        state.modalEdits["m-highmem"] = "1";
+      }
+    }
+    if (!el.dataset) return;
     const mode = el.dataset.change;
     if (mode === "draft") {
       window._app.updateDraft(
@@ -2437,6 +3074,8 @@
       );
     } else if (mode === "chat-tunnel") {
       window._app.setChatTunnel(el.value);
+    } else if (mode === "settings-guard") {
+      window._app.setGuardDraftField(el.dataset.guardKey || "", el.value);
     }
   }
 
@@ -2457,6 +3096,8 @@
       await window._app.submitForward(ev, form.dataset.sessionName || "");
     } else if (kind === "complete-login") {
       await window._app.completeLogin(ev, form.dataset.flowId || "");
+    } else if (kind === "api-token") {
+      await window._app.submitApiToken(ev);
     }
   }
 
@@ -2480,23 +3121,51 @@
   if (cmdBtn) {
     cmdBtn.addEventListener("click", () => {
       state.cmdQuery = "";
-      openCommandPalette();
+      state.cmdActiveIndex = 0;
+      openCommandPalette({ resetQuery: true });
     });
+  }
+
+  async function handleGlobalKeydown(ev) {
+    if (!ev) return;
+    if ((ev.ctrlKey || ev.metaKey) && String(ev.key || "").toLowerCase() === "k") {
+      ev.preventDefault();
+      state.cmdQuery = "";
+      state.cmdActiveIndex = 0;
+      openCommandPalette({ resetQuery: true });
+      return;
+    }
+    if (ev.key === "Escape" && state.activeModal) {
+      closeModal();
+      return;
+    }
+    if (state.activeModal && state.activeModal.type === "cmd_palette") {
+      if (ev.isComposing || ev.keyCode === 229) return;
+      const actions = getFilteredCommandActions();
+      if (actions.length === 0) return;
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        state.cmdActiveIndex = (state.cmdActiveIndex + 1) % actions.length;
+        const list = document.getElementById("cmd-list");
+        if (list) list.innerHTML = renderCommandPaletteItems();
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        state.cmdActiveIndex = (state.cmdActiveIndex - 1 + actions.length) % actions.length;
+        const list = document.getElementById("cmd-list");
+        if (list) list.innerHTML = renderCommandPaletteItems();
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        const chosen = actions[state.cmdActiveIndex] || actions[0];
+        if (chosen) await executeCommandAction(chosen.kind, chosen.arg);
+      }
+    }
   }
 
   if (typeof document.addEventListener === "function") {
-    document.addEventListener("keydown", (ev) => {
-      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "k") {
-        ev.preventDefault();
-        state.cmdQuery = "";
-        openCommandPalette();
-      } else if (ev.key === "Escape" && state.activeModal) {
-        closeModal();
-      }
-    });
+    document.addEventListener("keydown", handleGlobalKeydown);
   }
 
-  function openToggleModeModal(nextMode) {
+  function openToggleModeModal(nextMode, opts = {}) {
     openModal(`
       <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("切换控制台后端模式", "Switch Console Backend Mode")}</h3>
       <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:16px;">
@@ -2514,7 +3183,7 @@
         <button class="btn" type="button" data-action="close-modal">${tr("取消", "Cancel")}</button>
         <button class="btn ${nextMode === "real" ? "btn-danger" : "btn-primary"}" type="button" id="confirm-mode-switch" data-action="confirm-mode-switch" data-next-mode="${esc(nextMode)}">${nextMode === "real" ? tr("确认切换至真实模式", "Switch to Real Mode") : tr("确认切换至演示沙盒", "Switch to Sandbox Demo")}</button>
       </div>
-    `, { type: "toggle_mode", nextMode });
+    `, { type: "toggle_mode", nextMode }, opts);
   }
 
   document.getElementById("btn-toggle-mode").addEventListener("click", async () => {
@@ -2556,26 +3225,105 @@
   });
 
   function connectEventsWs() {
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = null;
+    }
+    if (wsDebounceTimer) {
+      clearTimeout(wsDebounceTimer);
+      wsDebounceTimer = null;
+    }
+    if (wsSocket) {
+      const prev = wsSocket;
+      wsSocket = null;
+      prev.onopen = null;
+      prev.onmessage = null;
+      prev.onerror = null;
+      prev.onclose = null;
+      try {
+        if (typeof prev.close === "function") prev.close();
+      } catch (_) {}
+    }
+
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/ws/events`);
-    let debounceTimer = null;
+    const tok = getApiToken();
+    const qs = tok ? `?token=${encodeURIComponent(tok)}` : "";
+    const ws = new WebSocket(`${proto}//${location.host}/ws/events${qs}`);
+    wsSocket = ws;
 
     ws.onopen = () => {
+      if (ws !== wsSocket) return;
+      wsReconnectDelay = WS_BACKOFF_BASE_MS;
       state.wsState = "connected";
       renderWsIndicator();
     };
     ws.onmessage = () => {
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => refreshBootstrap().catch(() => {}), 180);
+      if (ws !== wsSocket) return;
+      clearTimeout(wsDebounceTimer);
+      wsDebounceTimer = setTimeout(() => {
+        wsDebounceTimer = null;
+        refreshBootstrap().catch(() => {});
+      }, 180);
     };
-    ws.onclose = () => {
+    ws.onerror = () => {
+      if (ws !== wsSocket) return;
+      clearTimeout(wsDebounceTimer);
+      wsDebounceTimer = null;
       state.wsState = "reconnecting";
       renderWsIndicator();
-      setTimeout(connectEventsWs, 2500);
+    };
+    ws.onclose = () => {
+      if (ws !== wsSocket) return;
+      clearTimeout(wsDebounceTimer);
+      wsDebounceTimer = null;
+      state.wsState = "reconnecting";
+      renderWsIndicator();
+      const delay = wsReconnectDelay;
+      wsReconnectDelay = Math.min(WS_BACKOFF_MAX_MS, wsReconnectDelay * 2);
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = setTimeout(() => {
+        wsReconnectTimer = null;
+        connectEventsWs();
+      }, delay);
     };
   }
 
-  refreshBootstrap().then(() => connectEventsWs()).catch((err) => {
-    document.getElementById("main-view").innerHTML = `<div class="card">${tr("初始化失败", "Initialization failed")}: ${esc(err.message)}</div>`;
-  });
+  window._app.connectEventsWs = connectEventsWs;
+
+  function renderBootstrapErrorCard(err) {
+    const view = document.getElementById("main-view");
+    if (!view) return;
+    const isAuth = err && err.status === 401;
+    view.innerHTML = `
+      <div class="card init-error-card">
+        <div class="card-head" style="margin-bottom:0;">
+          <span class="card-title">${tr("控制台初始化失败", "Console Initialization Failed")}</span>
+          <span class="dot dot-danger"></span>
+        </div>
+        <div class="init-error-msg mono">${esc(err?.message || tr("无法连接到后端服务", "Unable to reach backend service"))}</div>
+        <div class="row-actions" style="justify-content:flex-end;">
+          ${isAuth ? `<button type="button" class="btn" data-action="open-api-token">${tr("输入 API Token", "Enter API Token")}</button>` : ""}
+          <button type="button" class="btn btn-primary" data-action="retry-bootstrap">${IC.refresh} <span>${tr("重试连接", "Retry")}</span></button>
+        </div>
+      </div>
+    `;
+  }
+
+  async function initConsole() {
+    try {
+      await refreshBootstrap();
+      connectEventsWs();
+    } catch (err) {
+      state.bootstrapError = err;
+      renderBootstrapErrorCard(err);
+    }
+  }
+
+  if (typeof setInterval === "function") {
+    const wdTimer = setInterval(refreshWatchdogCountdowns, 30000);
+    if (wdTimer && typeof wdTimer.unref === "function") wdTimer.unref();
+  }
+
+  initApiTokenFromUrl();
+  initConsole();
 })();

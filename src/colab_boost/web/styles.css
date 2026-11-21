@@ -1269,6 +1269,18 @@ th {
   color: var(--text-primary);
 }
 
+.chat-msg.error {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.chat-msg-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 /* Modal & Command Palette */
 .modal-backdrop {
   position: fixed;
@@ -1330,9 +1342,28 @@ th {
   text-align: left;
 }
 
-.cmd-item:hover {
+.cmd-item:hover,
+.cmd-item.active {
   background: var(--bg-elevated);
-  border-color: var(--border-subtle);
+  border-color: var(--border-selected);
+}
+
+.init-error-card {
+  max-width: 560px;
+  margin: 40px auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.init-error-msg {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  background: var(--bg-input);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
 }
 
 .cmd-item span.cmd-sub {
