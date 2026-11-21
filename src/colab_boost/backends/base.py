@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import abc
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from colab_boost.models import Accelerator, MachineShape, UsageSnapshot
+
+logger = logging.getLogger(__name__)
 
 
 class ColabBackendError(RuntimeError):
@@ -45,6 +48,8 @@ class HardwareProbe:
     gpu_util_percent: float = 0.0
     runtime_addr: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
+    probe_ok: bool = True
+    probe_error: Optional[str] = None
 
 
 RESULT_MARKER = "__CBOOST_JSON__ "
@@ -101,6 +106,10 @@ class ColabBackend(abc.ABC):
     ) -> ExecResult:
         """Runs Python inside the Colab VM's Jupyter kernel (with store_history=False)."""
 
+    def close(self) -> None:
+        """Releases any pooled HTTP sessions or backend resources."""
+        return None
+
     def probe_hardware(self, assignment: RawAssignment) -> HardwareProbe:
         snippet = (
             "import json, os, subprocess\n"
@@ -120,11 +129,44 @@ class ColabBackend(abc.ABC):
             f"print({RESULT_MARKER!r} + json.dumps(info), flush=True)\n"
         )
         res = self.execute_python(assignment, snippet, timeout_s=30.0)
-        data = res.marker_json or {}
+        if not res.ok:
+            err_parts = [p for p in (res.error_name, res.error_value) if p]
+            err_detail = ": ".join(err_parts) if err_parts else (
+                res.stderr.strip()[:300] or "Hardware probe execution failed"
+            )
+            logger.warning("Hardware probe failed on %s: %s", assignment.endpoint, err_detail)
+            return HardwareProbe(
+                extra={
+                    "probe_status": "error",
+                    "probe_error": err_detail,
+                    "error_name": res.error_name,
+                    "error_value": res.error_value,
+                    "stderr": (res.stderr or "")[:500],
+                },
+                probe_ok=False,
+                probe_error=err_detail,
+            )
+        if not isinstance(res.marker_json, dict):
+            err_detail = "Hardware probe returned no structured marker output"
+            logger.warning("Hardware probe missing marker output on %s", assignment.endpoint)
+            return HardwareProbe(
+                extra={
+                    "probe_status": "missing_marker",
+                    "probe_error": err_detail,
+                    "stdout": (res.stdout or "")[:500],
+                    "stderr": (res.stderr or "")[:500],
+                },
+                probe_ok=False,
+                probe_error=err_detail,
+            )
+        data = res.marker_json
         return HardwareProbe(
             gpu_name=data.get("gpu_name"),
             vram_total_mib=int(data.get("vram_total_mib") or 0),
             vram_used_mib=int(data.get("vram_used_mib") or 0),
             gpu_util_percent=float(data.get("gpu_util_percent") or 0.0),
             runtime_addr=data.get("runtime_addr"),
+            extra={"probe_status": "ok"},
+            probe_ok=True,
+            probe_error=None,
         )

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from typing import Any
 import pytest
 import requests
 
@@ -605,5 +606,382 @@ def test_assign_runtime_recheck_xsrf_refresh_transient_recheck_and_final_timeout
         be_half.assign_runtime("acc-1", "{}", Accelerator.A100)
     assert exc_timeout.value.kind == "timeout"
     assert any("ep-leaked-half" in u for u in sess_half.unassign_posts)
+
+
+def test_session_pool_reuse_refresh_persistence_and_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proves AuthorizedSession pooling per account_id, pre/post refresh persistence, not-creds.token handling, and close()."""
+    created_sessions: list[Any] = []
+    persisted: list[tuple[str, str]] = []
+    refresh_calls = [0]
+
+    class FakeCreds:
+        def __init__(self, info: dict) -> None:
+            self.token = info.get("token")
+            self.refresh_token = info.get("refresh_token")
+            self.expired = bool(info.get("_expired", False))
+
+        def refresh(self, _req) -> None:
+            refresh_calls[0] += 1
+            self.token = f"tok-refreshed-{refresh_calls[0]}"
+            self.expired = False
+
+        def to_json(self) -> str:
+            return json.dumps({"token": self.token, "refresh_token": self.refresh_token})
+
+    class FakeAuthSession:
+        def __init__(self, creds: FakeCreds) -> None:
+            self.credentials = creds
+            self.closed = False
+            self.call_count = 0
+            created_sessions.append(self)
+
+        def request(self, _method: str, _url: str, **_kwargs):
+            self.call_count += 1
+            # Simulate AuthorizedSession auto-refreshing token mid-request on call #2
+            if self.call_count == 2:
+                self.credentials.token = "tok-mid-request-rotated"
+            resp = requests.Response()
+            resp.status_code = 200
+            resp._content = (XSSI_PREFIX + json.dumps({"assignments": []})).encode("utf-8")
+            return resp
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "colab_boost.backends.direct.Credentials.from_authorized_user_info",
+        staticmethod(lambda info: FakeCreds(info)),
+    )
+    monkeypatch.setattr("colab_boost.backends.direct.AuthorizedSession", FakeAuthSession)
+
+    backend = DirectColabBackend(on_token_refreshed=lambda aid, tj: persisted.append((aid, tj)))
+
+    # 1. Missing creds.token (even when expired=False) triggers refresh & persistence
+    initial_json = json.dumps({"token": "", "refresh_token": "rt-1"})
+    assert backend.list_assignments("acc-1", initial_json) == []
+    assert len(created_sessions) == 1
+    assert refresh_calls[0] == 1
+    assert len(persisted) == 1
+    assert json.loads(persisted[0][1])["token"] == "tok-refreshed-1"
+
+    # 2. Second request with refreshed token_json REUSES the same pooled AuthorizedSession,
+    #    and mid-request token change triggers _on_token_refreshed persistence!
+    assert backend.list_assignments("acc-1", persisted[0][1]) == []
+    assert len(created_sessions) == 1
+    assert len(persisted) == 2
+    assert persisted[1][0] == "acc-1"
+    assert json.loads(persisted[1][1])["token"] == "tok-mid-request-rotated"
+
+    # 3. Different account gets its own session
+    acc2_json = json.dumps({"token": "tok-acc2", "refresh_token": "rt-2"})
+    assert backend.list_assignments("acc-2", acc2_json) == []
+    assert len(created_sessions) == 2
+
+    # 4. close() closes all pooled sessions cleanly
+    backend.close()
+    assert all(s.closed for s in created_sessions)
+
+
+def test_inspect_token_bearer_header_refresh_error_and_pending_flow_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proves inspect_token wraps refresh errors, sends Bearer header (never access_token query param), and prunes expired flows."""
+    seen_tokeninfo_calls: list[dict] = []
+
+    class FakeCreds:
+        def __init__(self, token: str, refresh_token: str = "rt-x", fail_refresh: bool = False) -> None:
+            self.token = token
+            self.refresh_token = refresh_token
+            self.expired = not bool(token)
+            self._fail_refresh = fail_refresh
+
+        def refresh(self, _req) -> None:
+            if self._fail_refresh:
+                raise RuntimeError("oauth refresh exploded")
+            self.token = "tok-after-refresh"
+            self.expired = False
+
+        def to_json(self) -> str:
+            return json.dumps({"token": self.token, "refresh_token": self.refresh_token})
+
+    class FakeAuthSession:
+        def __init__(self, _creds) -> None:
+            self.closed = False
+
+        def get(self, _url: str, **_kwargs):
+            # Force fallback to TOKENINFO_URL
+            resp = requests.Response()
+            resp.status_code = 500
+            resp._content = b"{}"
+            return resp
+
+        def close(self) -> None:
+            self.closed = True
+
+    def fake_requests_get(url: str, **kwargs):
+        seen_tokeninfo_calls.append({"url": url, "params": kwargs.get("params"), "headers": kwargs.get("headers")})
+        resp = requests.Response()
+        resp.status_code = 200
+        resp._content = json.dumps({"email": "user@example.com"}).encode("utf-8")
+        return resp
+
+    monkeypatch.setattr("colab_boost.backends.direct.AuthorizedSession", FakeAuthSession)
+    monkeypatch.setattr("colab_boost.backends.direct.requests.get", fake_requests_get)
+
+    backend = DirectColabBackend(pending_flow_ttl_s=1.0)
+
+    # 1. Refresh failure wrapped as ColabBackendError("token_refresh_failed")
+    monkeypatch.setattr(
+        "colab_boost.backends.direct.Credentials.from_authorized_user_info",
+        staticmethod(lambda _info: FakeCreds("", fail_refresh=True)),
+    )
+    with pytest.raises(ColabBackendError) as err_ref:
+        backend.inspect_token("{}")
+    assert err_ref.value.kind == "token_refresh_failed"
+
+    # 2. Fallback to TOKENINFO_URL uses Authorization: Bearer header, NOT query params
+    monkeypatch.setattr(
+        "colab_boost.backends.direct.Credentials.from_authorized_user_info",
+        staticmethod(lambda _info: FakeCreds("tok-secret-bearer")),
+    )
+    info = backend.inspect_token("{}")
+    assert info["email"] == "user@example.com"
+    assert len(seen_tokeninfo_calls) == 1
+    assert seen_tokeninfo_calls[0]["params"] is None
+    assert seen_tokeninfo_calls[0]["headers"] == {"Authorization": "Bearer tok-secret-bearer"}
+
+    # 3. _pending_flows TTL cleanup expires stale flows
+    with backend._lock:
+        backend._pending_flows["oauth-stale"] = (0.0, object())  # type: ignore[assignment]
+    with pytest.raises(ColabBackendError) as err_flow:
+        backend.complete_oauth_login("oauth-stale", "some-code")
+    assert err_flow.value.kind == "flow_expired"
+    assert "oauth-stale" not in backend._pending_flows
+
+
+def test_ensure_jupyter_kernel_403_and_post_errors_and_wrapping() -> None:
+    """Proves _ensure_jupyter_kernel maps GET 403 / POST 401,403,404 to runtime_lost and wraps HTTPError/ValueError."""
+    from colab_boost.backends.base import RawAssignment
+
+    scenario = ["get_403"]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if scenario[0] == "get_403":
+                self.send_response(403)
+                self.end_headers()
+            elif scenario[0] == "get_bad_json":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"not-valid-json")
+            elif scenario[0] == "get_500":
+                self.send_response(500)
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"[]")
+
+        def do_POST(self):  # noqa: N802
+            if scenario[0] == "post_401":
+                self.send_response(401)
+                self.end_headers()
+            elif scenario[0] == "post_403":
+                self.send_response(403)
+                self.end_headers()
+            elif scenario[0] == "post_404":
+                self.send_response(404)
+                self.end_headers()
+            elif scenario[0] == "post_500":
+                self.send_response(500)
+                self.end_headers()
+            elif scenario[0] == "post_bad_json":
+                self.send_response(201)
+                self.end_headers()
+                self.wfile.write(b"{broken")
+
+        def log_message(self, *_args):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        host, port = srv.server_address
+        backend = DirectColabBackend()
+        raw = RawAssignment("ep-k-err", Accelerator.T4, MachineShape.STANDARD, f"http://{host}:{port}", "tok-k")
+
+        for name, expected_kind, expected_code in [
+            ("get_403", "runtime_lost", 403),
+            ("post_401", "runtime_lost", 401),
+            ("post_403", "runtime_lost", 403),
+            ("post_404", "runtime_lost", 404),
+            ("get_500", "kernel_http_error", 500),
+            ("post_500", "kernel_http_error", 500),
+            ("get_bad_json", "protocol_error", None),
+            ("post_bad_json", "protocol_error", None),
+        ]:
+            scenario[0] = name
+            with pytest.raises(ColabBackendError) as exc_info:
+                backend._ensure_jupyter_kernel(raw)
+            assert exc_info.value.kind == expected_kind, f"scenario={name}"
+            if expected_code is not None:
+                assert exc_info.value.status_code == expected_code
+    finally:
+        srv.shutdown()
+
+
+def test_execute_python_hard_timeout_interrupt_env_isolation_and_ws_error_wrapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proves continuous output cannot bypass hard wall-clock timeout, interrupt is posted, env does not pollute globals(), and WS errors wrap."""
+    import asyncio
+    import os
+    import time
+    from websockets.asyncio.server import serve as ws_serve
+    from colab_boost.backends.base import RawAssignment
+
+    ws_port_box: list[int] = []
+    ws_ready = threading.Event()
+    stop_holder: list[asyncio.Event] = []
+    loop_holder: list[asyncio.AbstractEventLoop] = []
+    sent_code_box: list[str] = []
+    ws_mode = ["endless_stream"]
+
+    def run_ws() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop_holder.append(loop)
+        stop_ev = asyncio.Event()
+        stop_holder.append(stop_ev)
+
+        async def handler(ws):
+            raw = await ws.recv()
+            msg = json.loads(raw)
+            sent_code_box.append(msg["content"]["code"])
+            msg_id = msg["header"]["msg_id"]
+            sess_id = msg["header"]["session"]
+            if ws_mode[0] == "endless_stream":
+                try:
+                    for i in range(200):
+                        await ws.send(json.dumps({
+                            "header": {"msg_type": "stream", "session": sess_id},
+                            "parent_header": {"msg_id": msg_id},
+                            "content": {"name": "stdout", "text": f"tick {i}\n"},
+                        }))
+                        await asyncio.sleep(0.04)
+                except Exception:
+                    pass
+            elif ws_mode[0] == "bad_json":
+                await ws.send("{not-valid-json")
+
+        async def main_ws():
+            async with ws_serve(handler, "127.0.0.1", 0) as server:
+                ws_port_box.append(server.sockets[0].getsockname()[1])
+                ws_ready.set()
+                await stop_ev.wait()
+
+        loop.run_until_complete(main_ws())
+
+    threading.Thread(target=run_ws, daemon=True).start()
+    assert ws_ready.wait(timeout=5.0)
+
+    interrupt_calls: list[dict] = []
+
+    def fake_requests_post(url: str, **kwargs):
+        interrupt_calls.append({"url": url, "headers": kwargs.get("headers")})
+        resp = requests.Response()
+        resp.status_code = 204
+        resp._content = b""
+        return resp
+
+    monkeypatch.setattr("colab_boost.backends.direct.requests.post", fake_requests_post)
+
+    backend = DirectColabBackend()
+    backend._ensure_jupyter_kernel = lambda _a: "kern-timeout-42"  # type: ignore[method-assign]
+    raw_assign = RawAssignment(
+        endpoint="ep-ws-hard",
+        accelerator=Accelerator.L4,
+        machine_shape=MachineShape.STANDARD,
+        proxy_url=f"http://127.0.0.1:{ws_port_box[0]}",
+        proxy_token="tok-ws-hard",
+    )
+
+    try:
+        # 1. Continuous stream output MUST hit hard wall-clock timeout and POST /interrupt
+        t0 = time.monotonic()
+        with pytest.raises(ColabBackendError) as exc_to:
+            backend.execute_python(
+                raw_assign,
+                "from __future__ import annotations\nseen_keys = sorted(k for k in globals() if k.startswith('_cb_'))\nseen_val = __import__('os').environ.get('CBOOST_TEST_SECRET')\n",
+                env={"CBOOST_TEST_SECRET": "secret-123"},
+                timeout_s=0.35,
+            )
+        elapsed = time.monotonic() - t0
+        assert exc_to.value.kind == "exec_timeout"
+        assert elapsed < 2.0
+        assert len(interrupt_calls) == 1
+        assert interrupt_calls[0]["url"].endswith("/api/kernels/kern-timeout-42/interrupt")
+        assert interrupt_calls[0]["headers"]["Authorization"] == "Bearer tok-ws-hard"
+
+        # 2. Execute the generated env-wrapper code locally and verify zero _cb_* pollution in globals()
+        assert len(sent_code_box) == 1
+        ns: dict = {}
+        os.environ.pop("CBOOST_TEST_SECRET", None)
+        exec(compile(sent_code_box[0], "<test-env-wrapper>", "exec"), ns)
+        assert ns["seen_keys"] == []  # Zero _cb_* symbols existed in globals() DURING user code execution!
+        assert ns["seen_val"] == "secret-123"
+        assert "CBOOST_TEST_SECRET" not in os.environ  # Cleanly restored after execution
+        assert not any(k.startswith("_cb_") for k in ns)
+
+        # 3. Malformed WS frame wraps as ColabBackendError("protocol_error")
+        ws_mode[0] = "bad_json"
+        with pytest.raises(ColabBackendError) as exc_proto:
+            backend.execute_python(raw_assign, "print(1)", timeout_s=3.0)
+        assert exc_proto.value.kind == "protocol_error"
+
+        # 4. Unreachable WS connect wraps as ColabBackendError("ws_connect_failed")
+        dead_assign = RawAssignment(
+            endpoint="ep-ws-dead",
+            accelerator=Accelerator.T4,
+            machine_shape=MachineShape.STANDARD,
+            proxy_url="http://127.0.0.1:1",
+            proxy_token="tok-dead",
+        )
+        with pytest.raises(ColabBackendError) as exc_conn:
+            backend.execute_python(dead_assign, "print(1)", timeout_s=2.0)
+        assert exc_conn.value.kind in ("ws_connect_failed", "exec_timeout")
+    finally:
+        loop_holder[0].call_soon_threadsafe(stop_holder[0].set)
+
+
+def test_base_probe_hardware_reports_error_when_execute_python_fails() -> None:
+    """Proves ColabBackend.probe_hardware checks res.ok and records error status rather than silent all-zeros."""
+    from colab_boost.backends.base import ExecResult, RawAssignment
+
+    backend = DirectColabBackend()
+    raw = RawAssignment("ep-probe", Accelerator.L4, MachineShape.STANDARD, "https://probe.test", "tok")
+
+    # 1. Execution failure (res.ok=False)
+    backend.execute_python = lambda *_a, **_kw: ExecResult(  # type: ignore[method-assign]
+        ok=False,
+        stderr="traceback...",
+        error_name="RuntimeError",
+        error_value="kernel busy",
+    )
+    hp_err = backend.probe_hardware(raw)
+    assert hp_err.probe_ok is False
+    assert hp_err.probe_error and "RuntimeError: kernel busy" in hp_err.probe_error
+    assert hp_err.extra["probe_status"] == "error"
+
+    # 2. Missing marker JSON
+    backend.execute_python = lambda *_a, **_kw: ExecResult(  # type: ignore[method-assign]
+        ok=True,
+        stdout="no marker here",
+        marker_json=None,
+    )
+    hp_missing = backend.probe_hardware(raw)
+    assert hp_missing.probe_ok is False
+    assert hp_missing.extra["probe_status"] == "missing_marker"
+    assert hp_missing.probe_error
+
 
 

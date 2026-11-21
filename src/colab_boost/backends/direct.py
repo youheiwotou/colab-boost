@@ -18,12 +18,14 @@ import math
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import requests
 import websocket
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -36,7 +38,7 @@ from colab_boost.backends.base import (
     RawAssignment,
 )
 from colab_boost.models import (
-     GPU_ACCELERATORS,
+    GPU_ACCELERATORS,
     HIGH_MEM_ONLY_ACCELERATORS,
     TPU_ACCELERATORS,
     Accelerator,
@@ -77,6 +79,15 @@ CLIENT_AGENT_HEADERS = {
     "X-Colab-Client-Agent": "colab-cli",
 }
 XSRF_HEADER = "X-Goog-Colab-Token"
+PENDING_FLOW_TTL_S = 900.0
+
+
+@dataclass
+class _AccountSessionEntry:
+    session: Any
+    last_input_json: str
+    last_persisted_json: str
+    refresh_token: Optional[str] = None
 
 
 def strip_xssi(body: str) -> str:
@@ -197,6 +208,7 @@ class DirectColabBackend(ColabBackend):
         unassign_backoff_s: float = 1.0,
         unassign_verify_polls: int = 3,
         unassign_verify_interval_s: float = 1.0,
+        pending_flow_ttl_s: float = PENDING_FLOW_TTL_S,
     ) -> None:
         self.colab_domain = colab_domain.rstrip("/")
         self._http_session_factory = http_session_factory
@@ -207,12 +219,46 @@ class DirectColabBackend(ColabBackend):
         self.unassign_backoff_s = unassign_backoff_s
         self.unassign_verify_polls = unassign_verify_polls
         self.unassign_verify_interval_s = unassign_verify_interval_s
-        self._pending_flows: dict[str, InstalledAppFlow] = {}
+        self._pending_flow_ttl_s = max(1.0, float(pending_flow_ttl_s))
+        self._pending_flows: dict[str, tuple[float, InstalledAppFlow]] = {}
+        self._sessions: dict[str, _AccountSessionEntry] = {}
+        self._account_locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
 
     @property
     def is_mock(self) -> bool:
         return False
+
+    @staticmethod
+    def _close_session_quietly(sess: Any) -> None:
+        close_fn = getattr(sess, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            entries = list(self._sessions.values())
+            self._sessions.clear()
+            self._pending_flows.clear()
+        for entry in entries:
+            self._close_session_quietly(entry.session)
+
+    def _get_account_lock(self, account_id: str) -> threading.Lock:
+        with self._lock:
+            return self._account_locks.setdefault(account_id, threading.Lock())
+
+    def _prune_pending_flows_locked(self, now: Optional[float] = None) -> None:
+        ts = time.monotonic() if now is None else now
+        expired = [
+            fid
+            for fid, (created_at, _flow) in self._pending_flows.items()
+            if (ts - created_at) > self._pending_flow_ttl_s
+        ]
+        for fid in expired:
+            self._pending_flows.pop(fid, None)
 
     # -------------------- OAuth2 Multi-Account Login --------------------
 
@@ -221,8 +267,10 @@ class DirectColabBackend(ColabBackend):
         flow.redirect_uri = REMOTE_REDIRECT_URI
         auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline", token_usage="remote")
         flow_id = f"oauth-{uuid.uuid4().hex[:10]}"
+        now = time.monotonic()
         with self._lock:
-            self._pending_flows[flow_id] = flow
+            self._prune_pending_flows_locked(now)
+            self._pending_flows[flow_id] = (now, flow)
         return {"flow_id": flow_id, "auth_url": auth_url}
 
     def complete_oauth_login(self, flow_id: str, auth_code: str) -> dict[str, str]:
@@ -230,7 +278,9 @@ class DirectColabBackend(ColabBackend):
         if not code:
             raise ColabBackendError("invalid_code", "Authorization code cannot be empty.")
         with self._lock:
-            flow = self._pending_flows.pop(flow_id, None)
+            self._prune_pending_flows_locked()
+            item = self._pending_flows.pop(flow_id, None)
+        flow = item[1] if item is not None else None
         if flow is None:
             raise ColabBackendError("flow_expired", "Login flow expired or not found; start login again.")
         try:
@@ -243,52 +293,165 @@ class DirectColabBackend(ColabBackend):
 
         return self.inspect_token(creds.to_json())
 
+    def _notify_token_refreshed(
+        self,
+        account_id: Optional[str],
+        creds: Any,
+        entry: Optional[_AccountSessionEntry] = None,
+    ) -> None:
+        if not account_id or self._on_token_refreshed is None:
+            return
+        to_json = getattr(creds, "to_json", None)
+        if not callable(to_json):
+            return
+        try:
+            new_json = str(to_json())
+        except Exception:
+            return
+        if entry is not None:
+            if new_json == entry.last_persisted_json:
+                return
+            entry.last_persisted_json = new_json
+            rt = getattr(creds, "refresh_token", None)
+            if rt:
+                entry.refresh_token = str(rt)
+        try:
+            self._on_token_refreshed(account_id, new_json)
+        except Exception:
+            pass
+
     def _credentials_from_json(self, token_json: str, account_id: Optional[str] = None) -> Credentials:
         try:
             info = json.loads(token_json)
             creds = Credentials.from_authorized_user_info(info)
         except Exception as exc:
             raise ColabBackendError("invalid_credential", f"Corrupt credential JSON ({type(exc).__name__}).") from exc
-        if creds.expired and creds.refresh_token:
+        if (creds.expired or not creds.token) and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                if account_id and self._on_token_refreshed is not None:
-                    try:
-                        self._on_token_refreshed(account_id, creds.to_json())
-                    except Exception:
-                        pass
             except Exception as exc:
                 raise ColabBackendError("token_refresh_failed", f"Token refresh failed ({type(exc).__name__}).") from exc
+            self._notify_token_refreshed(account_id, creds)
         return creds
 
+    def _get_or_create_account_session_locked(
+        self,
+        account_id: str,
+        token_json: str,
+    ) -> _AccountSessionEntry:
+        """Returns a pooled session for ``account_id``. Caller must hold ``_get_account_lock(account_id)``."""
+        with self._lock:
+            existing = self._sessions.get(account_id)
+
+        if existing is not None:
+            if token_json == existing.last_input_json or token_json == existing.last_persisted_json:
+                return existing
+            if self._http_session_factory is None:
+                try:
+                    incoming_info = json.loads(token_json)
+                except Exception as exc:
+                    raise ColabBackendError(
+                        "invalid_credential",
+                        f"Corrupt credential JSON ({type(exc).__name__}).",
+                    ) from exc
+                if not isinstance(incoming_info, dict):
+                    raise ColabBackendError("invalid_credential", "Corrupt credential JSON (expected object).")
+                incoming_rt = incoming_info.get("refresh_token")
+                existing_creds = getattr(existing.session, "credentials", None)
+                existing_tok = getattr(existing_creds, "token", None)
+                incoming_tok = incoming_info.get("token")
+                same_identity = (
+                    bool(existing.refresh_token)
+                    and incoming_rt == existing.refresh_token
+                ) or (
+                    not existing.refresh_token
+                    and not incoming_rt
+                    and bool(existing_tok)
+                    and incoming_tok == existing_tok
+                )
+                if same_identity:
+                    existing.last_input_json = token_json
+                    return existing
+
+        if self._http_session_factory is not None:
+            sess = self._http_session_factory(token_json)
+            creds = getattr(sess, "credentials", None)
+            persisted = ""
+            if creds is not None and callable(getattr(creds, "to_json", None)):
+                try:
+                    persisted = str(creds.to_json())
+                except Exception:
+                    persisted = ""
+            entry = _AccountSessionEntry(
+                session=sess,
+                last_input_json=token_json,
+                last_persisted_json=persisted,
+                refresh_token=getattr(creds, "refresh_token", None),
+            )
+        else:
+            creds = self._credentials_from_json(token_json, account_id=account_id)
+            sess = AuthorizedSession(creds)
+            entry = _AccountSessionEntry(
+                session=sess,
+                last_input_json=token_json,
+                last_persisted_json=creds.to_json(),
+                refresh_token=creds.refresh_token,
+            )
+
+        old_session: Any = None
+        with self._lock:
+            prev = self._sessions.get(account_id)
+            if prev is not None and prev.session is not entry.session:
+                old_session = prev.session
+            self._sessions[account_id] = entry
+        if old_session is not None:
+            self._close_session_quietly(old_session)
+        return entry
+
     def _authorized_session(self, token_json: str, account_id: Optional[str] = None):
+        if account_id:
+            with self._get_account_lock(account_id):
+                return self._get_or_create_account_session_locked(account_id, token_json).session
         if self._http_session_factory is not None:
             return self._http_session_factory(token_json)
-        creds = self._credentials_from_json(token_json, account_id=account_id)
+        creds = self._credentials_from_json(token_json, account_id=None)
         return AuthorizedSession(creds)
 
     def inspect_token(self, token_json: str) -> dict[str, str]:
         creds = self._credentials_from_json(token_json)
         if not creds.token and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as exc:
+                raise ColabBackendError(
+                    "token_refresh_failed",
+                    f"Token refresh failed ({type(exc).__name__}).",
+                ) from exc
         email = ""
         display_name = ""
         sess = AuthorizedSession(creds)
         try:
-            r = sess.get(USERINFO_URL, timeout=15)
-            if r.ok:
-                u = r.json()
-                email = str(u.get("email") or "")
-                display_name = str(u.get("name") or "")
-        except Exception:
-            pass
-        if not email and creds.token:
             try:
-                r2 = requests.get(TOKENINFO_URL, params={"access_token": creds.token}, timeout=15)
-                if r2.ok:
-                    email = str(r2.json().get("email") or "")
+                r = sess.get(USERINFO_URL, timeout=15)
+                if r.ok:
+                    u = r.json()
+                    email = str(u.get("email") or "")
+                    display_name = str(u.get("name") or "")
             except Exception:
                 pass
+            if not email and creds.token:
+                try:
+                    r2 = requests.get(
+                        TOKENINFO_URL,
+                        headers={"Authorization": f"Bearer {creds.token}"},
+                        timeout=15,
+                    )
+                    if r2.ok:
+                        email = str(r2.json().get("email") or "")
+                except Exception:
+                    pass
+        finally:
+            self._close_session_quietly(sess)
         if not email:
             raise ColabBackendError("unverified_account", "Could not verify Google account email for token.")
         return {
@@ -313,13 +476,57 @@ class DirectColabBackend(ColabBackend):
         url = urljoin(self.colab_domain + "/", path.lstrip("/"))
         q = {"authuser": "0", **(params or {})}
         req_headers = {**CLIENT_AGENT_HEADERS, **(headers or {})}
-        sess = self._authorized_session(token_json, account_id=account_id)
+
+        acct_lock: Optional[threading.Lock] = None
+        entry: Optional[_AccountSessionEntry] = None
+        one_off_sess = False
+        token_before: Optional[str] = None
+
+        if account_id:
+            acct_lock = self._get_account_lock(account_id)
+            with acct_lock:
+                entry = self._get_or_create_account_session_locked(account_id, token_json)
+                sess = entry.session
+                creds = getattr(sess, "credentials", None)
+                if creds is not None:
+                    if (getattr(creds, "expired", False) or not getattr(creds, "token", None)) and getattr(
+                        creds, "refresh_token", None
+                    ):
+                        try:
+                            creds.refresh(Request())
+                        except Exception as exc:
+                            raise ColabBackendError(
+                                "token_refresh_failed",
+                                f"Token refresh failed ({type(exc).__name__}).",
+                            ) from exc
+                        self._notify_token_refreshed(account_id, creds, entry)
+                    token_before = getattr(creds, "token", None)
+        else:
+            sess = self._authorized_session(token_json, account_id=None)
+            one_off_sess = self._http_session_factory is None
+            creds = getattr(sess, "credentials", None)
+            token_before = getattr(creds, "token", None) if creds is not None else None
+
         try:
-            resp = sess.request(method, url, params=q, headers=req_headers, timeout=timeout)
-        except requests.exceptions.Timeout as exc:
-            raise ColabBackendError("timeout", f"Colab request timed out: {method} {path}") from exc
-        except Exception as exc:
-            raise ColabBackendError("network", f"Colab network error ({type(exc).__name__})") from exc
+            try:
+                resp = sess.request(method, url, params=q, headers=req_headers, timeout=timeout)
+            except RefreshError as exc:
+                raise ColabBackendError(
+                    "token_refresh_failed",
+                    f"Token refresh failed ({type(exc).__name__}).",
+                ) from exc
+            except requests.exceptions.Timeout as exc:
+                raise ColabBackendError("timeout", f"Colab request timed out: {method} {path}") from exc
+            except Exception as exc:
+                raise ColabBackendError("network", f"Colab network error ({type(exc).__name__})") from exc
+        finally:
+            if account_id and acct_lock is not None and creds is not None:
+                with acct_lock:
+                    token_after = getattr(creds, "token", None)
+                    if token_after and token_after != token_before:
+                        self._notify_token_refreshed(account_id, creds, entry)
+            if one_off_sess:
+                self._close_session_quietly(sess)
 
         if not resp.ok:
             code = resp.status_code
@@ -395,7 +602,8 @@ class DirectColabBackend(ColabBackend):
             accel = default_accel
         raw_shape = item.get("machineShape", 0)
         shape = MachineShape.HIGH_RAM if raw_shape in (1, "HIGH_RAM", "SHAPE_HIGHMEM", "hm") else MachineShape.STANDARD
-        proxy = item.get("runtimeProxyInfo") if isinstance(item.get("runtimeProxyInfo"), dict) else {}
+        raw_proxy = item.get("runtimeProxyInfo")
+        proxy: dict[str, Any] = raw_proxy if isinstance(raw_proxy, dict) else {}
         raw_exp = _parse_int_field(proxy, "tokenExpiresInSeconds")
         return RawAssignment(
             endpoint=str(item.get("endpoint") or "").strip(),
@@ -668,7 +876,7 @@ class DirectColabBackend(ColabBackend):
         for attempt in range(3):
             try:
                 r = requests.get(f"{assignment.proxy_url}/api/kernels", headers=headers, timeout=20)
-                if r.status_code in (401, 404):
+                if r.status_code in (401, 403, 404):
                     raise ColabBackendError(
                         "runtime_lost",
                         f"Runtime {assignment.endpoint} is no longer reachable (HTTP {r.status_code}).",
@@ -680,9 +888,11 @@ class DirectColabBackend(ColabBackend):
                 r.raise_for_status()
                 kernels = r.json()
                 if isinstance(kernels, list) and kernels:
-                    kid = kernels[0].get("id")
-                    if kid:
-                        return str(kid)
+                    first_kernel = kernels[0]
+                    if isinstance(first_kernel, dict):
+                        kid = first_kernel.get("id")
+                        if kid:
+                            return str(kid)
 
                 r_create = requests.post(
                     f"{assignment.proxy_url}/api/kernels",
@@ -690,11 +900,23 @@ class DirectColabBackend(ColabBackend):
                     json={"name": "python3"},
                     timeout=25,
                 )
+                if r_create.status_code in (401, 403, 404):
+                    raise ColabBackendError(
+                        "runtime_lost",
+                        f"Runtime {assignment.endpoint} is no longer reachable (HTTP {r_create.status_code}).",
+                        status_code=r_create.status_code,
+                    )
                 if r_create.status_code in (502, 503, 504) and attempt < 2:
                     time.sleep(2 ** (attempt + 1))
                     continue
                 r_create.raise_for_status()
-                return str(r_create.json()["id"])
+                created = r_create.json()
+                if not isinstance(created, dict) or not created.get("id"):
+                    raise ColabBackendError(
+                        "protocol_error",
+                        f"Jupyter /api/kernels create response missing kernel id on {assignment.endpoint}.",
+                    )
+                return str(created["id"])
             except ColabBackendError:
                 raise
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
@@ -702,8 +924,45 @@ class DirectColabBackend(ColabBackend):
                 if attempt < 2:
                     time.sleep(2 ** (attempt + 1))
                     continue
-                raise ColabBackendError("kernel_unreachable", f"Failed to reach Jupyter kernel on {assignment.endpoint}: {exc}") from exc
+                raise ColabBackendError(
+                    "kernel_unreachable",
+                    f"Failed to reach Jupyter kernel on {assignment.endpoint}: {exc}",
+                ) from exc
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                raise ColabBackendError(
+                    "kernel_http_error",
+                    f"Jupyter kernel API failed on {assignment.endpoint} (HTTP {status or 'unknown'}): {exc}",
+                    status_code=status,
+                ) from exc
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ColabBackendError(
+                    "protocol_error",
+                    f"Invalid Jupyter kernel response on {assignment.endpoint} ({type(exc).__name__}): {exc}",
+                ) from exc
+            except requests.exceptions.RequestException as exc:
+                raise ColabBackendError(
+                    "kernel_unreachable",
+                    f"Failed to reach Jupyter kernel on {assignment.endpoint}: {exc}",
+                ) from exc
         raise ColabBackendError("kernel_unreachable", f"Failed to start Jupyter kernel on {assignment.endpoint}: {last_err}")
+
+    def _best_effort_interrupt_kernel(self, assignment: RawAssignment, kernel_id: str) -> None:
+        if not assignment.proxy_url or not assignment.proxy_token or not kernel_id:
+            return
+        headers = {
+            **CLIENT_AGENT_HEADERS,
+            "Authorization": f"Bearer {assignment.proxy_token}",
+            "X-Colab-Runtime-Proxy-Token": assignment.proxy_token,
+        }
+        try:
+            requests.post(
+                f"{assignment.proxy_url}/api/kernels/{quote(kernel_id, safe='')}/interrupt",
+                headers=headers,
+                timeout=5,
+            )
+        except Exception:
+            pass
 
     def execute_python(
         self,
@@ -729,27 +988,27 @@ class DirectColabBackend(ColabBackend):
             f"X-Colab-Runtime-Proxy-Token: {assignment.proxy_token}",
         ]
 
-        # Inject env safely in memory via compile+exec so __future__ imports,
-        # multiline strings, and empty snippets are never corrupted by indentation.
+        # Inject env inside a function local scope and pop the runner before executing user code
+        # so __future__ imports work and zero temporary helper symbols ever pollute user globals().
         full_code = code
         if env:
             env_json = json.dumps({str(k): str(v) for k, v in env.items()})
             full_code = (
-                "import json as _cb_json, os as _cb_os\n"
-                f"_cb_injected = _cb_json.loads({env_json!r})\n"
-                "_cb_prev_env = {k: _cb_os.environ.get(k) for k in _cb_injected}\n"
-                "_cb_os.environ.update(_cb_injected)\n"
-                f"_cb_code = {code!r}\n"
-                "try:\n"
-                "    exec(compile(_cb_code, '<colab-boost>', 'exec'), globals())\n"
-                "finally:\n"
-                "    for _cb_k, _cb_old in _cb_prev_env.items():\n"
-                "        if _cb_old is None:\n"
-                "            _cb_os.environ.pop(_cb_k, None)\n"
-                "        else:\n"
-                "            _cb_os.environ[_cb_k] = _cb_old\n"
-                "    for _cb_sym in ('_cb_json', '_cb_os', '_cb_injected', '_cb_prev_env', '_cb_code', '_cb_k', '_cb_old'):\n"
-                "        globals().pop(_cb_sym, None)\n"
+                "def _cb_run_with_env(_cb_g):\n"
+                "    import json as _cb_json, os as _cb_os\n"
+                f"    _cb_injected = _cb_json.loads({env_json!r})\n"
+                "    _cb_prev_env = {k: _cb_os.environ.get(k) for k in _cb_injected}\n"
+                "    _cb_os.environ.update(_cb_injected)\n"
+                f"    _cb_code = {code!r}\n"
+                "    try:\n"
+                "        exec(compile(_cb_code, '<colab-boost>', 'exec'), _cb_g)\n"
+                "    finally:\n"
+                "        for _cb_k, _cb_old in _cb_prev_env.items():\n"
+                "            if _cb_old is None:\n"
+                "                _cb_os.environ.pop(_cb_k, None)\n"
+                "            else:\n"
+                "                _cb_os.environ[_cb_k] = _cb_old\n"
+                "globals().pop('_cb_run_with_env')(globals())\n"
             )
 
         msg_id = uuid.uuid4().hex
@@ -777,10 +1036,35 @@ class DirectColabBackend(ColabBackend):
         }
 
         ws = websocket.WebSocket()
+        timed_out = False
         try:
-            ws.connect(ws_url, header=ws_headers, timeout=20)
-            ws.settimeout(1.0)
-            ws.send(json.dumps(req_frame))
+            try:
+                ws.connect(ws_url, header=ws_headers, timeout=20)
+                ws.settimeout(1.0)
+                ws.send(json.dumps(req_frame))
+            except websocket.WebSocketBadStatusException as exc:
+                status = getattr(exc, "status_code", None)
+                if status in (401, 403, 404):
+                    raise ColabBackendError(
+                        "runtime_lost",
+                        f"Kernel WebSocket rejected on {assignment.endpoint} (HTTP {status}).",
+                        status_code=status,
+                    ) from exc
+                raise ColabBackendError(
+                    "ws_connect_failed",
+                    f"Kernel WebSocket handshake failed on {assignment.endpoint} (HTTP {status}): {exc}",
+                    status_code=status,
+                ) from exc
+            except (websocket.WebSocketTimeoutException, TimeoutError) as exc:
+                raise ColabBackendError(
+                    "exec_timeout",
+                    f"Kernel WebSocket connect/send timed out on {assignment.endpoint}: {exc}",
+                ) from exc
+            except (websocket.WebSocketException, OSError) as exc:
+                raise ColabBackendError(
+                    "ws_connect_failed",
+                    f"Kernel WebSocket connection/send error on {assignment.endpoint} ({type(exc).__name__}): {exc}",
+                ) from exc
 
             stdout_chunks: list[str] = []
             stderr_chunks: list[str] = []
@@ -788,21 +1072,45 @@ class DirectColabBackend(ColabBackend):
             err_val: Optional[str] = None
             got_reply = False
             got_idle = False
-            idle_deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+            hard_deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
 
             while not (got_reply and got_idle):
-                if idle_deadline is not None and time.monotonic() > idle_deadline:
-                    raise ColabBackendError("exec_timeout", f"Kernel execution timed out after {timeout_s:.0f}s")
+                if hard_deadline is not None:
+                    remaining = hard_deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        raise ColabBackendError(
+                            "exec_timeout",
+                            f"Kernel execution timed out after {timeout_s:.1f}s",
+                        )
+                    ws.settimeout(min(1.0, max(0.05, remaining)))
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
                     continue
                 except websocket.WebSocketConnectionClosedException:
                     break
+                except (websocket.WebSocketException, OSError) as exc:
+                    raise ColabBackendError(
+                        "exec_ws_error",
+                        f"Kernel WebSocket receive failed on {assignment.endpoint} ({type(exc).__name__}): {exc}",
+                    ) from exc
                 if not raw:
                     break
 
-                msg = deserialize_jupyter_ws_message(raw)
+                try:
+                    msg = deserialize_jupyter_ws_message(raw)
+                except (ValueError, UnicodeDecodeError, TypeError) as exc:
+                    raise ColabBackendError(
+                        "protocol_error",
+                        f"Failed to deserialize Jupyter WebSocket frame ({type(exc).__name__}): {exc}",
+                    ) from exc
+                if not isinstance(msg, dict):
+                    raise ColabBackendError(
+                        "protocol_error",
+                        f"Unexpected Jupyter WebSocket frame type: {type(msg).__name__}",
+                    )
+
                 mtype = (msg.get("header") or {}).get("msg_type")
                 content = msg.get("content") or {}
 
@@ -814,9 +1122,6 @@ class DirectColabBackend(ColabBackend):
                 parent_id = (msg.get("parent_header") or {}).get("msg_id")
                 if parent_id != msg_id:
                     continue
-
-                if idle_deadline is not None:
-                    idle_deadline = time.monotonic() + timeout_s
 
                 if mtype == "stream":
                     text = str(content.get("text") or "")
@@ -873,3 +1178,5 @@ class DirectColabBackend(ColabBackend):
                 ws.close()
             except Exception:
                 pass
+            if timed_out:
+                self._best_effort_interrupt_kernel(assignment, kernel_id)

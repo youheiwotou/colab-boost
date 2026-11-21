@@ -13,9 +13,13 @@ without WSL and without ever modifying ``~/.ssh/config``:
 
 from __future__ import annotations
 
+from collections import deque
+import ctypes
 import json
+import logging
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -26,28 +30,33 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
-from urllib.parse import urlparse
+from typing import Any, Callable, Optional
+from urllib.parse import urlencode, urlparse
 
 import websocket
 
 from colab_boost.config import WorkspacePaths
 from colab_boost.models import TunnelInfo
 
+logger = logging.getLogger(__name__)
+
 PUBKEY_HEADER = "X-Colab-Ssh-Pubkey"
 CLIENT_AGENT_HEADER = "X-Colab-Client-Agent"
 CLIENT_AGENT_VALUE = "colab-cli"
+STDERR_MAX_LINES = 200
 
 
 def build_colab_ssh_ws_url(runtime_url: str, proxy_token: str, mode: str = "proxy") -> str:
     parsed = urlparse(runtime_url)
     scheme = "wss" if parsed.scheme == "https" else "ws"
-    return (
-        f"{scheme}://{parsed.netloc}/colab/ssh"
-        f"?colab-runtime-proxy-token={proxy_token}"
-        f"&colab-client-agent={CLIENT_AGENT_VALUE}"
-        f"&colab-client-agent=ssh-mode-{mode}"
+    query = urlencode(
+        [
+            ("colab-runtime-proxy-token", proxy_token),
+            ("colab-client-agent", CLIENT_AGENT_VALUE),
+            ("colab-client-agent", f"ssh-mode-{mode}"),
+        ]
     )
+    return f"{scheme}://{parsed.netloc}/colab/ssh?{query}"
 
 
 def find_free_local_port(preferred: int = 0) -> int:
@@ -127,7 +136,7 @@ def ensure_isolated_ed25519_keypair(ssh_dir: Path) -> tuple[Path, str]:
                 text=True,
                 timeout=20,
             )
-            _lock_private_key_permissions(priv)
+        _lock_private_key_permissions(priv)
         return priv, pub.read_text(encoding="utf-8").strip()
 
 
@@ -166,26 +175,40 @@ def run_websocket_stdio_bridge(ws_url: str, pubkey: str) -> int:
 
     stdin_fd = sys.stdin.buffer.fileno()
     stdout_buf = sys.stdout.buffer
+    ws_lock = threading.Lock()
+    closed = threading.Event()
 
-    def pump_stdin() -> None:
-        try:
-            while True:
-                chunk = os.read(stdin_fd, 16384)
-                if not chunk:
-                    break
-                ws.send_binary(chunk)
-        except Exception:
-            pass
-        finally:
+    def safe_close() -> None:
+        if closed.is_set():
+            return
+        with ws_lock:
+            if closed.is_set():
+                return
+            closed.set()
             try:
                 ws.close()
             except Exception:
                 pass
 
+    def pump_stdin() -> None:
+        try:
+            while not closed.is_set():
+                chunk = os.read(stdin_fd, 16384)
+                if not chunk:
+                    break
+                with ws_lock:
+                    if closed.is_set():
+                        break
+                    ws.send_binary(chunk)
+        except Exception:
+            pass
+        finally:
+            safe_close()
+
     threading.Thread(target=pump_stdin, daemon=True).start()
 
     try:
-        while True:
+        while not closed.is_set():
             opcode, payload = ws.recv_data(control_frame=True)
             if opcode == websocket.ABNF.OPCODE_CLOSE:
                 break
@@ -197,10 +220,7 @@ def run_websocket_stdio_bridge(ws_url: str, pubkey: str) -> int:
     except Exception:
         pass
     finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+        safe_close()
     return 0
 
 
@@ -229,29 +249,250 @@ def _unlink_quietly(*paths: Optional[str | Path]) -> None:
                 pass
 
 
-def _terminate_process(proc: Optional[subprocess.Popen]) -> None:
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+class _WindowsProcessJob:
+    """Wraps a Windows Job Object configured with KILL_ON_JOB_CLOSE to manage a process tree."""
+
+    def __init__(self, handle: int, kernel32: Any) -> None:
+        self._handle: Optional[int] = handle
+        self._kernel32 = kernel32
+        self._lock = threading.Lock()
+
+    @classmethod
+    def create_and_assign(cls, proc: subprocess.Popen) -> Optional["_WindowsProcessJob"]:
+        if sys.platform != "win32":
+            return None
+        proc_handle = getattr(proc, "_handle", None)
+        if not proc_handle:
+            return None
         try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            import ctypes.wintypes as wt
+
+            class _IoCounters(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_uint64),
+                    ("WriteOperationCount", ctypes.c_uint64),
+                    ("OtherOperationCount", ctypes.c_uint64),
+                    ("ReadTransferCount", ctypes.c_uint64),
+                    ("WriteTransferCount", ctypes.c_uint64),
+                    ("OtherTransferCount", ctypes.c_uint64),
+                ]
+
+            class _JobObjectBasicLimitInformation(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", wt.LARGE_INTEGER),
+                    ("PerJobUserTimeLimit", wt.LARGE_INTEGER),
+                    ("LimitFlags", wt.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wt.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wt.DWORD),
+                    ("SchedulingClass", wt.DWORD),
+                ]
+
+            class _JobObjectExtendedLimitInformation(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+                    ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
+            k32.CreateJobObjectW.restype = wt.HANDLE
+            k32.SetInformationJobObject.argtypes = [wt.HANDLE, wt.INT, ctypes.c_void_p, wt.DWORD]
+            k32.SetInformationJobObject.restype = wt.BOOL
+            k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+            k32.AssignProcessToJobObject.restype = wt.BOOL
+            k32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+            k32.TerminateJobObject.restype = wt.BOOL
+            k32.CloseHandle.argtypes = [wt.HANDLE]
+            k32.CloseHandle.restype = wt.BOOL
+
+            job_handle = int(k32.CreateJobObjectW(None, None) or 0)
+            if not job_handle:
+                return None
+
+            info = _JobObjectExtendedLimitInformation()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(
+                job_handle,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ):
+                k32.CloseHandle(job_handle)
+                return None
+
+            if not k32.AssignProcessToJobObject(job_handle, int(proc_handle)):
+                k32.CloseHandle(job_handle)
+                return None
+
+            return cls(job_handle, k32)
+        except Exception:
+            return None
+
+    def terminate_and_close(self) -> None:
+        with self._lock:
+            handle = self._handle
+            self._handle = None
+        if handle:
             try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
+                self._kernel32.TerminateJobObject(handle, 1)
+            except Exception:
                 pass
+            try:
+                self._kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            handle = self._handle
+            self._handle = None
+        if handle:
+            try:
+                self._kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
+_PROC_JOBS_LOCK = threading.Lock()
+_PROC_JOBS: dict[int, _WindowsProcessJob] = {}
+
+
+def _attach_process_job(proc: subprocess.Popen) -> Optional[_WindowsProcessJob]:
+    if sys.platform != "win32":
+        return None
+    job = _WindowsProcessJob.create_and_assign(proc)
+    if job is not None:
+        with _PROC_JOBS_LOCK:
+            _PROC_JOBS[id(proc)] = job
+    return job
+
+
+def _release_process_job(proc: subprocess.Popen) -> None:
+    with _PROC_JOBS_LOCK:
+        job = _PROC_JOBS.pop(id(proc), None)
+    if job is not None:
+        job.close()
+
+
+def _close_process_pipes(proc: subprocess.Popen, *, close_stderr: bool = True) -> None:
+    streams: list[Any] = [getattr(proc, "stdin", None), getattr(proc, "stdout", None)]
+    if close_stderr:
+        streams.append(getattr(proc, "stderr", None))
+    for stream in streams:
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def _terminate_process(proc: Optional[subprocess.Popen], *, close_stderr: bool = True) -> None:
+    if proc is None:
+        return
+    with _PROC_JOBS_LOCK:
+        job = _PROC_JOBS.pop(id(proc), None)
+    try:
+        if sys.platform == "win32":
+            if job is not None:
+                job.terminate_and_close()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.poll() is None:
+                pid = getattr(proc, "pid", None)
+                if pid:
+                    try:
+                        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                        subprocess.run(
+                            ["taskkill", "/T", "/F", "/PID", str(pid)],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5,
+                            creationflags=creationflags,
+                        )
+                    except Exception:
+                        pass
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=1)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+        else:
+            if proc.poll() is None:
+                pgid: Optional[int] = None
+                getpgid_fn = getattr(os, "getpgid", None)
+                killpg_fn = getattr(os, "killpg", None)
+                pid = getattr(proc, "pid", None)
+                if callable(getpgid_fn) and callable(killpg_fn) and pid:
+                    try:
+                        pgid = int(getpgid_fn(pid))
+                    except OSError:
+                        pgid = None
+                if pgid is not None and callable(killpg_fn):
+                    try:
+                        killpg_fn(pgid, signal.SIGTERM)
+                    except OSError:
+                        proc.terminate()
+                else:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    if pgid is not None and callable(killpg_fn):
+                        try:
+                            killpg_fn(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                        except OSError:
+                            proc.kill()
+                    else:
+                        proc.kill()
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+    finally:
+        if job is not None:
+            job.close()
+        _close_process_pipes(proc, close_stderr=close_stderr)
 
 
 @dataclass
 class _SessionSshRuntime:
     process: subprocess.Popen
-    stderr_lines: list[str]
+    stderr_lines: deque[str]
     runtime_url: str
     proxy_token: str
     forwarded_ports: frozenset[tuple[int, int]] = field(default_factory=frozenset)
     on_429_kill_stale_sshd: Optional[Callable[[], None]] = None
     refresh_credentials: Optional[Callable[[], tuple[str, str]]] = None
     replacing: bool = False
+    reconnect_failures: int = 0
+    next_reconnect_at: float = 0.0
+    reconnect_exhausted: bool = False
 
 
 @dataclass
@@ -267,10 +508,21 @@ class SshTunnelManager:
     ``ssh -N -L ... -L ...`` connection so multi-port workflows never hit Colab's
     single-concurrent-SSH-slot HTTP 429 limit. Serializes per-session lifecycle
     mutations so concurrent ``start_real_tunnel`` / ``stop_tunnel`` / ``stop_all``
-    calls never race, and keeps ``proxy_token`` fresh across token rotations.
+    calls never race, keeps ``proxy_token`` fresh across token rotations, and
+    monitors managed tunnels in the background to automatically reconnect with
+    exponential backoff after unexpected SSH drops.
     """
 
-    def __init__(self, paths: WorkspacePaths) -> None:
+    def __init__(
+        self,
+        paths: WorkspacePaths,
+        *,
+        auto_reconnect: bool = True,
+        health_check_interval_s: float = 5.0,
+        reconnect_base_backoff_s: float = 1.0,
+        reconnect_max_backoff_s: float = 30.0,
+        reconnect_max_attempts: int = 5,
+    ) -> None:
         self.paths = paths
         self._lock = threading.RLock()
         self._language: str = "zh-CN"
@@ -281,6 +533,14 @@ class SshTunnelManager:
         self._reserved_local_ports: set[int] = set()
         self._tunnels: dict[str, ActiveTunnelEntry] = {}
         self._session_ssh: dict[str, _SessionSshRuntime] = {}
+        self._auto_reconnect = auto_reconnect
+        self._health_check_interval_s = max(0.02, float(health_check_interval_s))
+        self._reconnect_base_backoff_s = max(0.01, float(reconnect_base_backoff_s))
+        self._reconnect_max_backoff_s = max(self._reconnect_base_backoff_s, float(reconnect_max_backoff_s))
+        self._reconnect_max_attempts = max(1, int(reconnect_max_attempts))
+        self._monitor_stop = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._closed = False
 
     def _localized_tunnel_label(self, labels: Optional[dict[str, str]], fallback: str) -> str:
         if not labels:
@@ -302,12 +562,12 @@ class SshTunnelManager:
         with self._lock:
             return (self._global_stop_gen, self._session_stop_gen.get(session_name, 0))
 
-    def _reserve_local_port(self, preferred: int = 0) -> int:
+    def _reserve_local_port(self, preferred: int = 0, *, ignore_tunnel_id: Optional[str] = None) -> int:
         with self._lock:
             taken = set(self._reserved_local_ports) | {
                 e.info.local_port
-                for e in self._tunnels.values()
-                if e.info.status in ("starting", "open")
+                for tid, e in self._tunnels.items()
+                if tid != ignore_tunnel_id and e.info.status in ("starting", "open")
             }
             if preferred and 1024 <= preferred <= 65535 and preferred not in taken:
                 cand = find_free_local_port(preferred)
@@ -369,7 +629,7 @@ class SshTunnelManager:
                     elif not rt.replacing:
                         if rt.process.poll() is not None:
                             if entry.info.status in ("starting", "open"):
-                                tail = " | ".join(rt.stderr_lines[-3:]).strip()
+                                tail = " | ".join(list(rt.stderr_lines)[-3:]).strip()
                                 entry.info.status = "error"
                                 entry.info.error = tail or f"ssh exited ({rt.process.returncode})"
                         elif (entry.info.local_port, entry.info.remote_port) not in rt.forwarded_ports:
@@ -394,12 +654,13 @@ class SshTunnelManager:
         allow_429_kill: bool,
         on_429_kill_stale_sshd: Optional[Callable[[], None]],
         refresh_credentials: Optional[Callable[[], tuple[str, str]]] = None,
-    ) -> tuple[subprocess.Popen, list[str], str, str]:
+    ) -> tuple[subprocess.Popen, deque[str], str, str]:
         last_err = ""
         cur_url = runtime_url
         cur_token = proxy_token
+        did_kill_429 = False
 
-        for attempt in range(2):
+        for attempt in range(3):
             if self._get_fence_token(session_name) != fence:
                 raise RuntimeError(f"SSH tunnel cancelled because session '{session_name}' was stopped.")
 
@@ -417,14 +678,15 @@ class SshTunnelManager:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     json.dump({"ws_url": ws_url, "pubkey": pubkey}, fh)
 
-                # 2. Copy private key to ASCII temp path if workspace path has non-ASCII chars on Windows
+                # 2. Copy private key to ASCII temp path if workspace path has non-ASCII chars on Windows.
+                # Create empty file -> lock ACL -> write plaintext key to avoid any open-ACL window.
                 key_for_ssh = priv_key
                 if sys.platform == "win32" and not str(priv_key).isascii():
                     kfd, tmp_k = tempfile.mkstemp(prefix=f"cboost_key_tun-{tag}_")
                     os.close(kfd)
                     temp_key_path = Path(tmp_k)
-                    temp_key_path.write_bytes(priv_key.read_bytes())
                     _lock_private_key_permissions(temp_key_path)
+                    temp_key_path.write_bytes(priv_key.read_bytes())
                     key_for_ssh = temp_key_path
 
                 # 3. Tiny ASCII bootstrap script so ProxyCommand has zero non-ASCII path issues
@@ -467,23 +729,27 @@ class SshTunnelManager:
                     cmd.extend(["-L", f"127.0.0.1:{lport}:127.0.0.1:{rport}"])
                 cmd.append("root@colab-runtime")
 
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    creationflags=creationflags,
-                )
+                popen_kwargs: dict[str, Any] = {
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.PIPE,
+                    "text": True,
+                }
+                if sys.platform == "win32":
+                    popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                else:
+                    popen_kwargs["start_new_session"] = True
+
+                proc = subprocess.Popen(cmd, **popen_kwargs)
+                _attach_process_job(proc)
                 with self._lock:
                     self._spawning_procs.setdefault(session_name, set()).add(proc)
 
-                stderr_lines: list[str] = []
+                stderr_lines: deque[str] = deque(maxlen=STDERR_MAX_LINES)
 
                 def collect_stderr(
                     p: subprocess.Popen = proc,
-                    buf: list[str] = stderr_lines,
+                    buf: deque[str] = stderr_lines,
                     bpath: Optional[str] = bootstrap_str,
                     tkpath: Optional[Path] = temp_key_path,
                     tpath: Optional[str] = ticket_str,
@@ -492,7 +758,16 @@ class SshTunnelManager:
                         if p.stderr:
                             for line in p.stderr:
                                 buf.append(line.rstrip())
+                    except (OSError, ValueError):
+                        pass
                     finally:
+                        if p.stderr is not None:
+                            try:
+                                p.stderr.close()
+                            except Exception:
+                                pass
+                        if p.poll() is not None:
+                            _release_process_job(p)
                         _unlink_quietly(bpath, tpath, tkpath)
 
                 collector_thread = threading.Thread(target=collect_stderr, daemon=True)
@@ -503,12 +778,12 @@ class SshTunnelManager:
                         s_set = self._spawning_procs.get(session_name)
                         if s_set is not None:
                             s_set.discard(proc)
-                if collector_thread is None:
-                    _unlink_quietly(bootstrap_str, ticket_str, temp_key_path)
-                if proc is not None:
-                    _terminate_process(proc)
+                    _terminate_process(proc, close_stderr=False)
                 if collector_thread is not None:
                     collector_thread.join(timeout=1.5)
+                if proc is not None:
+                    _close_process_pipes(proc, close_stderr=True)
+                _unlink_quietly(bootstrap_str, ticket_str, temp_key_path)
                 raise
 
             try:
@@ -530,24 +805,27 @@ class SshTunnelManager:
                         s_set.discard(proc)
 
             if self._get_fence_token(session_name) != fence:
-                _terminate_process(proc)
+                _terminate_process(proc, close_stderr=False)
                 if collector_thread is not None:
                     collector_thread.join(timeout=1.5)
+                _close_process_pipes(proc, close_stderr=True)
                 _unlink_quietly(bootstrap_str, ticket_str, temp_key_path)
                 raise RuntimeError(f"SSH tunnel cancelled because session '{session_name}' was stopped.")
 
             if opened and proc.poll() is None:
-                # ProxyCommand has already consumed the ticket & bootstrap script
-                _unlink_quietly(bootstrap_str, ticket_str)
+                # OpenSSH has authenticated and ProxyCommand consumed the ticket & bootstrap script;
+                # delete the temporary private key copy immediately so plaintext never lingers in %TEMP%.
+                _unlink_quietly(bootstrap_str, ticket_str, temp_key_path)
                 return proc, stderr_lines, cur_url, cur_token
 
-            _terminate_process(proc)
+            _terminate_process(proc, close_stderr=False)
             if collector_thread is not None:
                 collector_thread.join(timeout=2.0)
+            _close_process_pipes(proc, close_stderr=True)
             _unlink_quietly(bootstrap_str, ticket_str, temp_key_path)
             joined_err = " | ".join(stderr_lines)
             last_err = joined_err or "SSH tunnel failed to establish local listener"
-            if attempt == 0:
+            if attempt < 2:
                 retried = False
                 if ("HTTP 401" in joined_err or "HTTP 403" in joined_err) and refresh_credentials is not None:
                     try:
@@ -557,7 +835,13 @@ class SshTunnelManager:
                             retried = True
                     except Exception:
                         pass
-                if allow_429_kill and "429" in joined_err and on_429_kill_stale_sshd is not None:
+                if (
+                    allow_429_kill
+                    and "429" in joined_err
+                    and on_429_kill_stale_sshd is not None
+                    and not did_kill_429
+                ):
+                    did_kill_429 = True
                     on_429_kill_stale_sshd()
                     if refresh_credentials is not None:
                         try:
@@ -591,6 +875,8 @@ class SshTunnelManager:
         on_429_kill_stale_sshd: Optional[Callable[[], None]] = None,
         refresh_credentials: Optional[Callable[[], tuple[str, str]]] = None,
     ) -> TunnelInfo:
+        if self._closed:
+            raise RuntimeError("SshTunnelManager has been closed.")
         if remote_port == 8080:
             raise ValueError("VM port 8080 is reserved by Colab's internal proxy; use another port (e.g. 8000).")
         ssh_bin = shutil.which("ssh")
@@ -604,7 +890,7 @@ class SshTunnelManager:
         sess_lock = self._get_session_lock(session_name)
         with sess_lock:
             fence = self._get_fence_token(session_name)
-            if fence[0] != entry_global_gen:
+            if fence[0] != entry_global_gen or self._closed:
                 raise RuntimeError(f"SSH tunnel cancelled because session '{session_name}' was stopped.")
 
             with self._lock:
@@ -637,18 +923,18 @@ class SshTunnelManager:
                         entry.info.label = self._localized_tunnel_label(entry.info.labels, eff_label)
                         return entry.info.model_copy(deep=True)
 
-                # Heal an existing dead tunnel entry for the same (session, remote_port) in place instead of duplicating
+                # Heal an existing dead/errored tunnel entry for the same (session, remote_port) in place
+                # even when sibling ports on the same session are still alive.
                 reused_dead_entry: Optional[ActiveTunnelEntry] = None
-                if live_rt is None:
-                    for entry in self._tunnels.values():
-                        if (
-                            not entry.is_mock
-                            and entry.info.session_name == session_name
-                            and entry.info.remote_port == remote_port
-                            and (local_port == 0 or entry.info.local_port == local_port)
-                        ):
-                            reused_dead_entry = entry
-                            break
+                for entry in self._tunnels.values():
+                    if (
+                        not entry.is_mock
+                        and entry.info.session_name == session_name
+                        and entry.info.remote_port == remote_port
+                        and (local_port == 0 or entry.info.local_port == local_port)
+                    ):
+                        reused_dead_entry = entry
+                        break
 
                 sibling_entries = [
                     e.info.model_copy(deep=True)
@@ -666,13 +952,16 @@ class SshTunnelManager:
 
             # Reserve local port BEFORE stopping sibling ssh so we never collide with sibling or parallel sessions
             preferred_local = local_port or (reused_dead_entry.info.local_port if reused_dead_entry else remote_port)
-            chosen_local = self._reserve_local_port(preferred_local)
+            chosen_local = self._reserve_local_port(
+                preferred_local,
+                ignore_tunnel_id=reused_dead_entry.info.id if reused_dead_entry else None,
+            )
             try:
                 if reused_dead_entry is not None:
                     tid = reused_dead_entry.info.id
-                    info = reused_dead_entry.info
+                    info = reused_dead_entry.info.model_copy(deep=True)
                     info.local_port = chosen_local
-                    info.labels = dict(labels) if labels else info.labels
+                    info.labels = dict(labels) if labels else dict(info.labels)
                     info.label = self._localized_tunnel_label(info.labels, eff_label)
                     info.path = norm_path
                     info.kind = kind
@@ -721,20 +1010,27 @@ class SshTunnelManager:
                     )
                 except Exception as spawn_exc:
                     if sibling_entries and not had_live_sibling and self._get_fence_token(session_name) == fence:
-                        combined_forwards = [(chosen_local, remote_port)]
-                        proc, stderr_lines, used_url, used_tok = self._spawn_multiplexed_ssh(
-                            session_name=session_name,
-                            fence=fence,
-                            ssh_bin=ssh_bin,
-                            priv_key=priv_key,
-                            pubkey=pubkey,
-                            runtime_url=runtime_url,
-                            proxy_token=proxy_token,
-                            forwards=combined_forwards,
-                            allow_429_kill=True,
-                            on_429_kill_stale_sshd=eff_on_429,
-                            refresh_credentials=eff_refresh,
-                        )
+                        try:
+                            combined_forwards = [(chosen_local, remote_port)]
+                            proc, stderr_lines, used_url, used_tok = self._spawn_multiplexed_ssh(
+                                session_name=session_name,
+                                fence=fence,
+                                ssh_bin=ssh_bin,
+                                priv_key=priv_key,
+                                pubkey=pubkey,
+                                runtime_url=runtime_url,
+                                proxy_token=proxy_token,
+                                forwards=combined_forwards,
+                                allow_429_kill=True,
+                                on_429_kill_stale_sshd=eff_on_429,
+                                refresh_credentials=eff_refresh,
+                            )
+                        except Exception as retry_exc:
+                            if reused_dead_entry is not None:
+                                with self._lock:
+                                    reused_dead_entry.info.status = "error"
+                                    reused_dead_entry.info.error = str(retry_exc)
+                            raise
                     elif sibling_entries and had_live_sibling and self._get_fence_token(session_name) == fence:
                         restored = False
                         sib_forwards = [(s.local_port, s.remote_port) for s in sibling_entries]
@@ -782,19 +1078,26 @@ class SshTunnelManager:
                                 break
                             except Exception:
                                 continue
-                        if not restored:
-                            with self._lock:
+                        with self._lock:
+                            if reused_dead_entry is not None:
+                                reused_dead_entry.info.status = "error"
+                                reused_dead_entry.info.error = str(spawn_exc)
+                            if not restored:
                                 for e in self._tunnels.values():
                                     if not e.is_mock and e.info.session_name == session_name:
                                         e.info.status = "error"
                                         e.info.error = str(spawn_exc)
                         raise
                     else:
+                        if reused_dead_entry is not None:
+                            with self._lock:
+                                reused_dead_entry.info.status = "error"
+                                reused_dead_entry.info.error = str(spawn_exc)
                         raise
 
                 active_set = frozenset(combined_forwards)
                 with self._lock:
-                    if self._get_fence_token(session_name) != fence:
+                    if self._get_fence_token(session_name) != fence or self._closed:
                         proc_to_kill = proc
                     else:
                         proc_to_kill = None
@@ -818,6 +1121,7 @@ class SshTunnelManager:
                             on_429_kill_stale_sshd=eff_on_429,
                             refresh_credentials=eff_refresh,
                         )
+                        self._ensure_monitor_started_locked()
                 if proc_to_kill is not None:
                     _terminate_process(proc_to_kill)
                     raise RuntimeError(f"SSH tunnel cancelled because session '{session_name}' was stopped.")
@@ -962,8 +1266,159 @@ class SshTunnelManager:
                 _terminate_process(rt.process)
             return len(matching)
 
+    def _ensure_monitor_started_locked(self) -> None:
+        """Starts the lightweight background health-check & auto-reconnect thread if enabled. Caller holds ``_lock``."""
+        if not self._auto_reconnect or self._closed:
+            return
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            return
+        self._monitor_stop.clear()
+        th = threading.Thread(target=self._monitor_loop, name="colab-boost-ssh-monitor", daemon=True)
+        self._monitor_thread = th
+        th.start()
+
+    def _monitor_loop(self) -> None:
+        while not self._monitor_stop.wait(self._health_check_interval_s):
+            now = time.monotonic()
+            candidates: list[tuple[str, tuple[int, int]]] = []
+            with self._lock:
+                if self._monitor_stop.is_set() or self._closed:
+                    break
+                for sess_name, rt in list(self._session_ssh.items()):
+                    if rt.replacing or rt.reconnect_exhausted:
+                        continue
+                    if rt.process.poll() is None:
+                        continue
+                    if now < rt.next_reconnect_at:
+                        continue
+                    has_managed = any(
+                        (not e.is_mock)
+                        and e.info.session_name == sess_name
+                        and (e.info.local_port, e.info.remote_port) in rt.forwarded_ports
+                        for e in self._tunnels.values()
+                    )
+                    if not has_managed:
+                        continue
+                    candidates.append((sess_name, self._get_fence_token(sess_name)))
+
+            for sess_name, fence in candidates:
+                if self._monitor_stop.is_set() or self._closed:
+                    break
+                self._attempt_reconnect_session(sess_name, fence)
+
+    def _attempt_reconnect_session(self, session_name: str, expected_fence: tuple[int, int]) -> None:
+        if self._monitor_stop.is_set() or self._closed:
+            return
+        sess_lock = self._get_session_lock(session_name)
+        if not sess_lock.acquire(blocking=False):
+            return
+        prev_failures = 0
+        try:
+            with self._lock:
+                if self._monitor_stop.is_set() or self._closed:
+                    return
+                if self._get_fence_token(session_name) != expected_fence:
+                    return
+                rt = self._session_ssh.get(session_name)
+                if rt is None or rt.replacing or rt.reconnect_exhausted or rt.process.poll() is None:
+                    return
+                forwards = sorted(rt.forwarded_ports)
+                if not forwards:
+                    return
+                rt.replacing = True
+                cur_url = rt.runtime_url
+                cur_token = rt.proxy_token
+                on_429 = rt.on_429_kill_stale_sshd
+                refresh_cb = rt.refresh_credentials
+                prev_failures = rt.reconnect_failures
+
+            _terminate_process(rt.process)
+
+            ssh_bin = shutil.which("ssh")
+            if not ssh_bin:
+                raise RuntimeError("OpenSSH client ('ssh') not found on PATH.")
+            priv_key, pubkey = ensure_isolated_ed25519_keypair(self.paths.ssh_dir)
+
+            if refresh_cb is not None:
+                try:
+                    fresh_url, fresh_tok = refresh_cb()
+                    if fresh_url and fresh_tok:
+                        cur_url, cur_token = fresh_url, fresh_tok
+                except Exception as exc:
+                    logger.warning("SSH auto-reconnect credential refresh failed for '%s': %s", session_name, exc)
+
+            proc, stderr_lines, used_url, used_tok = self._spawn_multiplexed_ssh(
+                session_name=session_name,
+                fence=expected_fence,
+                ssh_bin=ssh_bin,
+                priv_key=priv_key,
+                pubkey=pubkey,
+                runtime_url=cur_url,
+                proxy_token=cur_token,
+                forwards=forwards,
+                allow_429_kill=True,
+                on_429_kill_stale_sshd=on_429,
+                refresh_credentials=refresh_cb,
+            )
+
+            active_set = frozenset(forwards)
+            proc_to_kill: Optional[subprocess.Popen] = None
+            with self._lock:
+                if self._monitor_stop.is_set() or self._closed or self._get_fence_token(session_name) != expected_fence:
+                    proc_to_kill = proc
+                else:
+                    self._session_ssh[session_name] = _SessionSshRuntime(
+                        process=proc,
+                        stderr_lines=stderr_lines,
+                        runtime_url=used_url,
+                        proxy_token=used_tok,
+                        forwarded_ports=active_set,
+                        on_429_kill_stale_sshd=on_429,
+                        refresh_credentials=refresh_cb,
+                        reconnect_failures=0,
+                        next_reconnect_at=0.0,
+                        reconnect_exhausted=False,
+                    )
+                    for e in self._tunnels.values():
+                        if (
+                            not e.is_mock
+                            and e.info.session_name == session_name
+                            and (e.info.local_port, e.info.remote_port) in active_set
+                        ):
+                            e.info.status = "open"
+                            e.info.error = None
+            if proc_to_kill is not None:
+                _terminate_process(proc_to_kill)
+        except Exception as exc:
+            logger.warning("SSH auto-reconnect attempt failed for '%s': %s", session_name, exc)
+            with self._lock:
+                cur_rt = self._session_ssh.get(session_name)
+                if cur_rt is not None and self._get_fence_token(session_name) == expected_fence:
+                    cur_rt.replacing = False
+                    cur_rt.reconnect_failures = prev_failures + 1
+                    if cur_rt.reconnect_failures >= self._reconnect_max_attempts:
+                        cur_rt.reconnect_exhausted = True
+                    else:
+                        delay = min(
+                            self._reconnect_max_backoff_s,
+                            self._reconnect_base_backoff_s * (2 ** (cur_rt.reconnect_failures - 1)),
+                        )
+                        cur_rt.next_reconnect_at = time.monotonic() + delay
+                    for e in self._tunnels.values():
+                        if not e.is_mock and e.info.session_name == session_name:
+                            e.info.status = "error"
+                            e.info.error = (
+                                f"SSH auto-reconnect failed "
+                                f"({cur_rt.reconnect_failures}/{self._reconnect_max_attempts}): {exc}"
+                            )
+        finally:
+            sess_lock.release()
+
     def stop_all(self) -> int:
         with self._lock:
+            self._monitor_stop.set()
+            monitor_thread = self._monitor_thread
+            self._monitor_thread = None
             self._global_stop_gen += 1
             sessions = (
                 set(self._session_locks.keys())
@@ -985,7 +1440,14 @@ class SshTunnelManager:
         for s in sorted(sessions):
             with self._get_session_lock(s):
                 pass
+        if monitor_thread is not None and monitor_thread is not threading.current_thread():
+            monitor_thread.join(timeout=5.0)
         return count
+
+    def close(self) -> int:
+        with self._lock:
+            self._closed = True
+        return self.stop_all()
 
 
 if __name__ == "__main__":
