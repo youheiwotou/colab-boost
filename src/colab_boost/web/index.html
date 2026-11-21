@@ -11,36 +11,39 @@
   <!-- Minimalist Top Telemetry Bar -->
   <header class="topbar">
     <div class="topbar-left">
+      <button class="btn btn-icon btn-sm sidebar-toggle-btn" id="btn-sidebar-toggle" type="button" aria-label="切换导航菜单" aria-controls="app-sidebar" aria-expanded="false">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         </div>
         <span class="brand-name" data-i18n="brand_title">Colab Boost</span>
       </div>
-      <span class="crumb-sep">/</span>
+      <span class="crumb-sep" aria-hidden="true">/</span>
       <span class="crumb-current" id="crumb-current">总览看板</span>
-      <button class="mode-badge mock" id="btn-toggle-mode" type="button" title="点击切换演示沙盒与真实 Colab 模式">
+      <button class="mode-badge mock" id="btn-toggle-mode" type="button" title="点击切换演示沙盒与真实 Colab 模式" aria-label="切换演示沙盒与真实 Colab 模式">
         演示沙盒模式 · 0 计费
       </button>
     </div>
 
     <div class="topbar-hud" id="topbar-hud">
-      <button class="cmd-trigger" id="btn-cmd-palette" type="button">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <button class="cmd-trigger" id="btn-cmd-palette" type="button" aria-label="打开命令面板">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
         <span data-i18n="cmd_label">命令面板</span>
         <kbd>Ctrl K</kbd>
       </button>
 
       <div class="telemetry-strip">
         <div class="hud-pill" id="hud-account">账号 <strong>加载中...</strong></div>
-        <span class="tele-div"></span>
+        <span class="tele-div" aria-hidden="true"></span>
         <div class="hud-pill" id="hud-balance">余额 <strong>--</strong></div>
-        <span class="tele-div"></span>
+        <span class="tele-div" aria-hidden="true"></span>
         <div class="hud-pill" id="hud-burn">消耗 <strong>--</strong></div>
       </div>
 
       <div class="topbar-danger-zone" id="stop-all-group" style="display:none;">
-        <button class="btn btn-danger btn-sm" id="btn-stop-all" type="button" style="display:none;">
+        <button class="btn btn-danger btn-sm" id="btn-stop-all" type="button" style="display:none;" aria-label="停止全部活跃实例">
           停止全部
         </button>
         <span class="topbar-sep" aria-hidden="true"></span>
@@ -56,33 +59,36 @@
   <div class="global-alert-host hidden" id="global-alert-banner" role="alert" aria-live="assertive"></div>
 
   <div class="workspace">
+    <!-- Mobile Drawer Backdrop -->
+    <div class="sidebar-backdrop hidden" id="sidebar-backdrop" aria-hidden="true"></div>
+
     <!-- Left Navigation Rail -->
-    <aside class="sidebar">
-      <nav class="nav-list" id="sidebar-nav">
+    <aside class="sidebar" id="app-sidebar" aria-label="主导航">
+      <nav class="nav-list" id="sidebar-nav" aria-label="控制台导航">
         <div class="nav-section-label" data-i18n="nav_group_work">工作台</div>
-        <button class="nav-btn active" data-route="overview" type="button">
+        <button class="nav-btn active" data-route="overview" type="button" aria-current="page">
           <span class="nav-btn-left">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
             <span data-i18n="nav_overview">总览看板</span>
           </span>
         </button>
         <button class="nav-btn" data-route="deploy" type="button">
           <span class="nav-btn-left">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
             <span data-i18n="nav_deploy">极速部署模型</span>
           </span>
           <span class="nav-count mono" id="badge-runs">0</span>
         </button>
         <button class="nav-btn" data-route="sessions" type="button">
           <span class="nav-btn-left">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M2 15h2M2 9h2M20 15h2M20 9h2"/></svg>
             <span data-i18n="nav_sessions">算力实例管理</span>
           </span>
           <span class="nav-count mono" id="badge-sessions">0</span>
         </button>
         <button class="nav-btn" data-route="tunnels" type="button">
           <span class="nav-btn-left">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
             <span data-i18n="nav_tunnels">端口映射与对话</span>
           </span>
           <span class="nav-count mono" id="badge-tunnels">0</span>
@@ -91,21 +97,21 @@
         <div class="nav-section-label nav-section-spaced" data-i18n="nav_group_audit">控制与审计</div>
         <button class="nav-btn" data-route="accounts" type="button">
           <span class="nav-btn-left">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
             <span data-i18n="nav_accounts">多账号与关闭回执</span>
           </span>
           <span class="nav-count mono" id="badge-receipts">0</span>
         </button>
         <button class="nav-btn" data-route="settings" type="button">
           <span class="nav-btn-left">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
             <span data-i18n="nav_settings">成本护栏与密钥</span>
           </span>
         </button>
       </nav>
 
       <div class="sidebar-footer">
-        <div class="ws-status-row" role="status">
+        <div class="ws-status-row" role="status" aria-live="polite">
           <span class="dot dot-muted" id="ws-dot"></span>
           <span id="ws-indicator">正在连接状态流...</span>
         </div>
@@ -115,18 +121,18 @@
     </aside>
 
     <!-- Main Dynamic View -->
-    <main class="content-area" id="main-view">
+    <main class="content-area" id="main-view" tabindex="-1">
       <div class="card">正在初始化控制台...</div>
     </main>
   </div>
 
   <!-- Reusable Modal -->
   <div class="modal-backdrop hidden" id="modal-backdrop">
-    <div class="modal" id="modal-body" role="dialog" aria-modal="true"></div>
+    <div class="modal" id="modal-body" role="dialog" aria-modal="true" tabindex="-1"></div>
   </div>
 
   <!-- Toast Notifications -->
-  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
 
   <script src="/static/app.js"></script>
 </body>

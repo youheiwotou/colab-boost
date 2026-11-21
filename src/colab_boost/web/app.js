@@ -1,20 +1,20 @@
 /* Colab Boost Console — Minimalist Design-Engineered SPA (Scheme A) */
 (() => {
   const IC = {
-    arrowRight: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>',
-    refresh: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
-    plus: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
-    stop: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>',
-    clock: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>',
-    link: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
-    copy: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
-    download: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
-    search: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
-    sun: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2m-7.07-15.07 1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>',
-    moon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
-    send: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
-    chevronDown: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
-    chevronUp: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>',
+    arrowRight: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>',
+    refresh: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
+    plus: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+    stop: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>',
+    clock: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>',
+    link: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
+    copy: '<svg aria-hidden="true" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    download: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+    search: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
+    sun: '<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2m-7.07-15.07 1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>',
+    moon: '<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+    send: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
+    chevronDown: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
+    chevronUp: '<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>',
   };
 
   const DEFAULT_APPROX_BURN = {
@@ -40,6 +40,9 @@
   ];
 
   const DEFAULT_HIGH_MEM_ONLY = new Set(["L4", "V5E1", "V6E1"]);
+  const VALID_ROUTES = new Set(["overview", "deploy", "sessions", "tunnels", "accounts", "settings"]);
+  const ROUTE_ALIASES = { playground: "tunnels" };
+  const RECEIPTS_PAGE_SIZE = 25;
   const API_TOKEN_STORAGE_KEY = "colab_boost_api_token";
   const DEFAULT_API_TIMEOUT_MS = 30000;
   const WS_BACKOFF_BASE_MS = 1000;
@@ -74,9 +77,12 @@
   let wsDebounceTimer = null;
   let wsReconnectDelay = WS_BACKOFF_BASE_MS;
   let pendingScrollChatToBottom = false;
+  let modalTriggerEl = null;
 
   const state = {
     route: "overview",
+    sidebarOpen: false,
+    receiptsVisibleLimit: RECEIPTS_PAGE_SIZE,
     settings: { backend_mode: "mock", language: "zh-CN", theme: "dark", guards: {} },
     accounts: [],
     activeAccount: null,
@@ -170,6 +176,76 @@
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
     if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
     return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  }
+
+  function formatCcu(val) {
+    if (val === null || val === undefined || val === "") return "--";
+    const n = Number(val);
+    return Number.isFinite(n) ? n.toFixed(2) : "--";
+  }
+
+  function normalizeRoute(raw) {
+    const cleaned = String(raw ?? "")
+      .trim()
+      .replace(/^#/, "")
+      .replace(/^\/+/, "")
+      .split(/[/?#]/)[0]
+      .toLowerCase();
+    if (!cleaned) return null;
+    const mapped = ROUTE_ALIASES[cleaned] || cleaned;
+    return VALID_ROUTES.has(mapped) ? mapped : null;
+  }
+
+  function parseRouteFromHash(fallbackWhenEmpty = null) {
+    try {
+      if (typeof location === "undefined" || !location || typeof location.hash !== "string") {
+        return null;
+      }
+      const raw = location.hash.trim();
+      if (!raw || raw === "#" || raw === "#/") return fallbackWhenEmpty;
+      return normalizeRoute(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function syncRouteHash(route) {
+    try {
+      if (typeof location === "undefined" || !location) return;
+      const target = `#/${route}`;
+      if (location.hash !== target) {
+        location.hash = target;
+      }
+    } catch (_) {}
+  }
+
+  function initRouteFromHash() {
+    const parsed = parseRouteFromHash();
+    if (parsed) state.route = parsed;
+  }
+
+  function syncSidebarDom() {
+    const sidebar = document.getElementById("app-sidebar");
+    const backdrop = document.getElementById("sidebar-backdrop");
+    const toggleBtn = document.getElementById("btn-sidebar-toggle");
+    if (sidebar && sidebar.classList && typeof sidebar.classList.toggle === "function") {
+      sidebar.classList.toggle("open", !!state.sidebarOpen);
+    }
+    if (backdrop && backdrop.classList && typeof backdrop.classList.toggle === "function") {
+      backdrop.classList.toggle("hidden", !state.sidebarOpen);
+    }
+    if (toggleBtn && typeof toggleBtn.setAttribute === "function") {
+      toggleBtn.setAttribute("aria-expanded", state.sidebarOpen ? "true" : "false");
+    }
+  }
+
+  function setSidebarOpen(open) {
+    state.sidebarOpen = !!open;
+    syncSidebarDom();
+  }
+
+  function toggleSidebar() {
+    setSidebarOpen(!state.sidebarOpen);
   }
 
   function getApiToken() {
@@ -391,6 +467,9 @@
     const stack = document.getElementById("toast-stack");
     const el = document.createElement("div");
     el.className = `toast ${kind}`;
+    if (typeof el.setAttribute === "function") {
+      el.setAttribute("role", kind === "err" ? "alert" : "status");
+    }
     el.textContent = msg;
     stack.appendChild(el);
     setTimeout(() => el.remove(), 4200);
@@ -466,6 +545,10 @@
 
   function openModal(html, modalMeta = null, opts = {}) {
     const preserveEdits = !!opts.preserveEdits;
+    const wasOpen = !!state.activeModal;
+    if (!wasOpen && !preserveEdits) {
+      modalTriggerEl = (typeof document !== "undefined" && document.activeElement) ? document.activeElement : null;
+    }
     if (!preserveEdits) {
       state.modalEdits = {};
       state.modalInitialValues = {};
@@ -473,14 +556,42 @@
     state.activeModal = modalMeta;
     const bd = document.getElementById("modal-backdrop");
     const body = document.getElementById("modal-body");
-    if (body) body.innerHTML = html;
+    if (body) {
+      body.innerHTML = html;
+      if (typeof body.setAttribute === "function") {
+        body.setAttribute("role", "dialog");
+        body.setAttribute("aria-modal", "true");
+        if (String(html).includes('id="modal-title"')) {
+          body.setAttribute("aria-labelledby", "modal-title");
+          if (typeof body.removeAttribute === "function") body.removeAttribute("aria-label");
+        } else {
+          if (typeof body.removeAttribute === "function") body.removeAttribute("aria-labelledby");
+          body.setAttribute("aria-label", opts.ariaLabel || tr("对话框", "Dialog"));
+        }
+      }
+    }
     if (bd) bd.classList.remove("hidden");
     if (!preserveEdits) {
       snapshotModalInitialValues();
+      if (body) {
+        let firstFocusable = null;
+        if (typeof body.querySelector === "function") {
+          firstFocusable = body.querySelector(
+            'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+          );
+        }
+        if (firstFocusable && typeof firstFocusable.focus === "function") {
+          firstFocusable.focus();
+        } else if (typeof body.focus === "function") {
+          body.focus();
+        }
+      }
     }
   }
 
   function closeModal() {
+    const prevTrigger = modalTriggerEl;
+    modalTriggerEl = null;
     state.activeModal = null;
     state.pendingConfirm = null;
     state.modalEdits = {};
@@ -490,22 +601,27 @@
     const body = document.getElementById("modal-body");
     if (bd) bd.classList.add("hidden");
     if (body) body.innerHTML = "";
+    if (prevTrigger && typeof prevTrigger.focus === "function" && prevTrigger.isConnected !== false) {
+      try {
+        prevTrigger.focus();
+      } catch (_) {}
+    }
   }
 
   function openApiTokenModal(reason = "", opts = {}) {
     const hasExisting = !!getApiToken();
     openModal(`
-      <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("需要控制台 API 访问令牌", "Console API Token Required")}</h3>
+      <h3 id="modal-title" style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("需要控制台 API 访问令牌", "Console API Token Required")}</h3>
       <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;">
         ${tr(
           "当前后端已启用 <code>COLAB_BOOST_API_TOKEN</code> 访问鉴权。请输入正确的 Bearer Token 后自动重试。",
           "This backend requires a <code>COLAB_BOOST_API_TOKEN</code> bearer token. Enter your token below to authenticate and retry."
         )}
       </p>
-      ${reason ? `<div class="banner danger" style="margin-bottom:12px;font-size:12px;">${esc(reason)}</div>` : ""}
+      ${reason ? `<div class="banner danger" role="alert" style="margin-bottom:12px;font-size:12px;">${esc(reason)}</div>` : ""}
       <form data-submit="api-token" class="form-grid">
         <div class="field full">
-          <label>${tr("API Bearer Token", "API Bearer Token")}</label>
+          <label for="api-token-input">${tr("API Bearer Token", "API Bearer Token")}</label>
           <input type="password" id="api-token-input" autocomplete="off" required placeholder="${hasExisting ? tr("已保存令牌（重新输入以替换）", "Token set in session (type to replace)") : tr("输入 COLAB_BOOST_API_TOKEN", "Enter COLAB_BOOST_API_TOKEN")}" />
         </div>
         <div class="field full row-actions" style="justify-content:flex-end;">
@@ -525,7 +641,7 @@
     const bodyHtml = typeof meta.bodyHtml === "function" ? meta.bodyHtml() : meta.bodyHtml;
     const confirmLabel = typeof meta.confirmLabel === "function" ? meta.confirmLabel() : meta.confirmLabel;
     openModal(`
-      <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${esc(title)}</h3>
+      <h3 id="modal-title" style="font-size:15px;font-weight:600;margin-bottom:10px;">${esc(title)}</h3>
       <div class="confirm-body">${bodyHtml}</div>
       <div class="row-actions" style="justify-content:flex-end;margin-top:16px;">
         <button class="btn" type="button" data-action="close-modal">${tr("取消", "Cancel")}</button>
@@ -761,9 +877,31 @@
     const modeBtn = document.getElementById("btn-toggle-mode");
     modeBtn.className = `mode-badge ${isMock ? "mock" : "real"}`;
     modeBtn.title = tr("点击切换演示沙盒与真实 Colab 模式", "Click to switch between Sandbox Demo and Real Colab Mode");
+    if (typeof modeBtn.setAttribute === "function") {
+      modeBtn.setAttribute("aria-label", modeBtn.title);
+    }
     modeBtn.textContent = isMock
       ? tr("演示沙盒 · 0 计费", "Sandbox · 0 Billed")
       : tr("真实 Colab · 实时计费", "Real Colab · Live");
+
+    const sidebarToggleBtn = document.getElementById("btn-sidebar-toggle");
+    if (sidebarToggleBtn && typeof sidebarToggleBtn.setAttribute === "function") {
+      const toggleLabel = tr("切换导航菜单", "Toggle navigation menu");
+      sidebarToggleBtn.setAttribute("aria-label", toggleLabel);
+      sidebarToggleBtn.title = toggleLabel;
+    }
+    const sidebarEl = document.getElementById("app-sidebar");
+    if (sidebarEl && typeof sidebarEl.setAttribute === "function") {
+      sidebarEl.setAttribute("aria-label", tr("主导航", "Primary navigation"));
+    }
+    const sidebarNavEl = document.getElementById("sidebar-nav");
+    if (sidebarNavEl && typeof sidebarNavEl.setAttribute === "function") {
+      sidebarNavEl.setAttribute("aria-label", tr("控制台导航", "Console navigation"));
+    }
+    const cmdPaletteBtn = document.getElementById("btn-cmd-palette");
+    if (cmdPaletteBtn && typeof cmdPaletteBtn.setAttribute === "function") {
+      cmdPaletteBtn.setAttribute("aria-label", tr("打开命令面板", "Open command palette"));
+    }
 
     const acc = state.activeAccount;
     const accEl = document.getElementById("hud-account");
@@ -799,18 +937,28 @@
       stopAllBtn.textContent = stopAllBusy
         ? tr("正在停止全部...", "Stopping All...")
         : tr(`停止全部 (${state.sessions.length})`, `Stop All (${state.sessions.length})`);
+      if (typeof stopAllBtn.setAttribute === "function") {
+        stopAllBtn.setAttribute("aria-label", tr("停止全部活跃实例", "Stop all active runtimes"));
+      }
     } else {
       if (stopAllGroup) stopAllGroup.style.display = "none";
       stopAllBtn.style.display = "none";
       stopAllBtn.disabled = false;
     }
 
-    document.getElementById("btn-lang").textContent = state.settings.language === "en" ? "中文" : "EN";
+    const langBtn = document.getElementById("btn-lang");
+    langBtn.textContent = state.settings.language === "en" ? "中文" : "EN";
+    if (typeof langBtn.setAttribute === "function") {
+      langBtn.setAttribute("aria-label", state.settings.language === "en" ? "Switch to Chinese" : "切换至英文");
+    }
     const themeBtn = document.getElementById("btn-theme");
     themeBtn.innerHTML = state.settings.theme === "light" ? IC.moon : IC.sun;
     themeBtn.title = state.settings.theme === "light"
       ? tr("切换至炭黑暗色主题", "Switch to Dark Theme")
       : tr("切换至极简瓷白主题", "Switch to Light Theme");
+    if (typeof themeBtn.setAttribute === "function") {
+      themeBtn.setAttribute("aria-label", themeBtn.title);
+    }
 
     document.querySelectorAll("[data-i18n]").forEach((node) => {
       const k = node.getAttribute("data-i18n");
@@ -818,12 +966,23 @@
     });
 
     document.querySelectorAll(".nav-btn").forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.route === state.route);
+      const isCurrent = btn.dataset.route === state.route;
+      btn.classList.toggle("active", isCurrent);
+      if (typeof btn.setAttribute === "function") {
+        if (isCurrent) {
+          btn.setAttribute("aria-current", "page");
+        } else if (typeof btn.removeAttribute === "function") {
+          btn.removeAttribute("aria-current");
+        } else {
+          btn.setAttribute("aria-current", "false");
+        }
+      }
     });
     document.getElementById("badge-runs").textContent = state.runs.filter((r) => ["provisioning", "starting", "running", "ready"].includes(r.state)).length;
     document.getElementById("badge-sessions").textContent = state.sessions.length;
     document.getElementById("badge-tunnels").textContent = state.tunnels.length;
     document.getElementById("badge-receipts").textContent = state.receipts.length;
+    syncSidebarDom();
     renderWsIndicator();
     renderGlobalAlert();
   }
@@ -1214,7 +1373,7 @@
 
           ${recipe.id === "llama-cpp-gguf" ? `<div id="gguf-planner-host">${renderGgufPlannerBox(draft)}</div>` : ""}
 
-          <button type="button" class="disclosure-btn" data-action="toggle-advanced" data-recipe-id="${esc(recipe.id)}">
+          <button type="button" class="disclosure-btn" data-action="toggle-advanced" data-recipe-id="${esc(recipe.id)}" aria-expanded="${advOpen ? "true" : "false"}" aria-controls="advanced-drawer-${esc(recipe.id)}">
             <span>${tr("高级参数与精细显存保底设置", "Advanced Recipe Inputs & Hardware Fine-Tuning")}</span>
             <span class="mono row-actions" style="gap:5px;">
               <span>${advOpen ? tr("收起", "Hide") : tr(`展开 ${advItemCount} 项`, `Show ${advItemCount}`)}</span>
@@ -1223,12 +1382,12 @@
           </button>
 
           ${advOpen ? `
-            <div class="advanced-drawer">
+            <div class="advanced-drawer" id="advanced-drawer-${esc(recipe.id)}">
               <div class="form-grid">
                 ${advancedInputs.map((inp) => renderRecipeInputField(recipe.id, inp, draft[inp.id])).join("")}
                 <div class="field">
-                  <label>${tr("运行位置", "Target Session")}</label>
-                  <select name="_sessionMode" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_sessionMode" data-rerender="1">
+                  <label for="deploy-session-mode">${tr("运行位置", "Target Session")}</label>
+                  <select id="deploy-session-mode" name="_sessionMode" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_sessionMode" data-rerender="1">
                     <option value="new" ${draft._sessionMode === "new" ? "selected" : ""}>${tr("新建专属 GPU 实例（失败自动释放）", "Create Fresh GPU Session")}</option>
                     ${reusableSessions.map((s) => `
                       <option value="${esc(s.name)}" ${draft._sessionMode === s.name ? "selected" : ""}>
@@ -1239,21 +1398,21 @@
                 </div>
                 ${draft._sessionMode === "new" ? `
                   <div class="field">
-                    <label>${tr("加速器型号", "Accelerator")}</label>
-                    <select name="_accelerator" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_accelerator" data-rerender="1">
+                    <label for="deploy-accelerator">${tr("加速器型号", "Accelerator")}</label>
+                    <select id="deploy-accelerator" name="_accelerator" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_accelerator" data-rerender="1">
                       ${getAcceleratorSpecs().map((sp) => `
                         <option value="${esc(sp.id)}" ${draft._accelerator === sp.id ? "selected" : ""}>${esc(formatAcceleratorOptionLabel(sp))}</option>
                       `).join("")}
                     </select>
                   </div>
                   <div class="field">
-                    <label>${tr("最低显存保底 (MiB，不达标自动重抽)", "Min VRAM MiB (Auto-Retry)")}</label>
-                    <input type="number" min="0" max="163840" step="1024" value="${draft._minVram !== null && draft._minVram !== undefined ? esc(draft._minVram) : ""}"
+                    <label for="deploy-min-vram">${tr("最低显存保底 (MiB，不达标自动重抽)", "Min VRAM MiB (Auto-Retry)")}</label>
+                    <input type="number" id="deploy-min-vram" min="0" max="163840" step="1024" value="${draft._minVram !== null && draft._minVram !== undefined ? esc(draft._minVram) : ""}"
                       data-input="draft" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_minVram" data-val-type="number-optional" />
                   </div>
                   <div class="field">
-                    <label>${tr("高内存机型 (High-RAM)", "High-RAM Shape")}</label>
-                    <select data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_highMem" data-val-type="bool">
+                    <label for="deploy-high-mem">${tr("高内存机型 (High-RAM)", "High-RAM Shape")}</label>
+                    <select id="deploy-high-mem" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_highMem" data-val-type="bool">
                       <option value="0" ${!draft._highMem ? "selected" : ""} ${isHighMemOnlyAccelerator(draft._accelerator) ? "disabled" : ""}>Standard RAM</option>
                       <option value="1" ${draft._highMem ? "selected" : ""}>High-RAM</option>
                     </select>
@@ -1376,17 +1535,18 @@
     const label = locObj(inp.label);
     const help = locObj(inp.help);
     const fkey = `${recipeId}:${inp.id}`;
+    const fieldId = `rf-${String(`${recipeId}-${inp.id}`).replace(/[^A-Za-z0-9_-]/g, "_")}`;
     let control = "";
     if (inp.type === "select") {
       control = `
-        <select data-field-key="${esc(fkey)}" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}">
+        <select id="${esc(fieldId)}" data-field-key="${esc(fkey)}" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}">
           ${(inp.options || []).map((opt) => `<option value="${esc(opt)}" ${String(val) === String(opt) ? "selected" : ""}>${esc(opt)}</option>`).join("")}
         </select>
       `;
     } else if (inp.type === "bool") {
       const checked = val === true || val === "1" || val === "true";
       control = `
-        <select data-field-key="${esc(fkey)}" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" data-val-type="bool">
+        <select id="${esc(fieldId)}" data-field-key="${esc(fkey)}" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" data-val-type="bool">
           <option value="1" ${checked ? "selected" : ""}>${tr("是 (Enabled)", "Enabled")}</option>
           <option value="0" ${!checked ? "selected" : ""}>${tr("否 (Disabled)", "Disabled")}</option>
         </select>
@@ -1396,7 +1556,7 @@
       const hasMax = inp.max !== null && inp.max !== undefined;
       const numVal = val !== null && val !== undefined ? esc(val) : "";
       control = `
-        <input type="number" data-field-key="${esc(fkey)}" value="${numVal}" ${hasMin ? `min="${inp.min}"` : ""} ${hasMax ? `max="${inp.max}"` : ""}
+        <input type="number" id="${esc(fieldId)}" data-field-key="${esc(fkey)}" value="${numVal}" ${hasMin ? `min="${inp.min}"` : ""} ${hasMax ? `max="${inp.max}"` : ""}
           data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" data-val-type="number-optional" />
       `;
     } else if (inp.type === "secret") {
@@ -1405,13 +1565,13 @@
         ? tr("已在内存中暂存密钥（输入新值覆盖，或清空）", "Secret entered in memory (type to replace)")
         : tr("留空表示不启用密钥验证", "Leave blank if no API key required");
       control = `
-        <input type="password" autocomplete="off" data-field-key="${esc(fkey)}" data-secret-field="1" placeholder="${esc(secretPlaceholder)}"
+        <input type="password" id="${esc(fieldId)}" autocomplete="off" data-field-key="${esc(fkey)}" data-secret-field="1" placeholder="${esc(secretPlaceholder)}"
           data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
       `;
     } else if (inp.type === "hf-gguf") {
       control = `
         <div class="row-actions" style="width:100%;">
-          <input type="text" data-field-key="${esc(fkey)}" style="flex:1;" value="${esc(val)}" placeholder="owner/repo-GGUF"
+          <input type="text" id="${esc(fieldId)}" data-field-key="${esc(fkey)}" style="flex:1;" value="${esc(val)}" placeholder="owner/repo-GGUF"
             data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
           <button type="button" class="btn btn-sm" data-action="analyze-gguf">${IC.search} <span>${tr("测算显存适配", "Analyze VRAM Fit")}</span></button>
         </div>
@@ -1423,7 +1583,7 @@
       const discovered = (state.ggufPlan?.variants || []).map((v) => v.quant);
       const suggestions = Array.from(new Set(["auto", ...discovered, "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "UD-Q4_K_XL", "IQ4_XS", "Q3_K_M", "BF16"]));
       control = `
-        <input type="text" list="quant-datalist" data-field-key="${esc(fkey)}" value="${esc(val)}"
+        <input type="text" id="${esc(fieldId)}" list="quant-datalist" data-field-key="${esc(fkey)}" value="${esc(val)}"
           data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
         <datalist id="quant-datalist">
           ${suggestions.map((q) => `<option value="${esc(q)}"></option>`).join("")}
@@ -1431,32 +1591,83 @@
       `;
     } else {
       control = `
-        <input type="text" data-field-key="${esc(fkey)}" value="${esc(val)}"
+        <input type="text" id="${esc(fieldId)}" data-field-key="${esc(fkey)}" value="${esc(val)}"
           data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
       `;
     }
 
     return `
       <div class="field ${inp.type === "hf-gguf" ? "full" : ""}">
-        <label>${esc(label)}${inp.required ? " *" : ""}</label>
+        <label for="${esc(fieldId)}">${esc(label)}${inp.required ? " *" : ""}</label>
         ${control}
         ${help ? `<span class="field-help">${esc(help)}</span>` : ""}
       </div>
     `;
   }
 
+  function extractGgufWarnings(plan) {
+    if (!plan || typeof plan !== "object") return [];
+    const seen = new Set();
+    const warnings = [];
+    const pushMsg = (msg) => {
+      const cleaned = String(msg ?? "").trim();
+      if (cleaned && !seen.has(cleaned)) {
+        seen.add(cleaned);
+        warnings.push(cleaned);
+      }
+    };
+    if (typeof plan.header_warning === "string") pushMsg(plan.header_warning);
+    if (Array.isArray(plan.warnings)) {
+      for (const item of plan.warnings) {
+        if (typeof item === "string") pushMsg(item);
+        else if (item && typeof item === "object") pushMsg(item.message || item.msg || item.warning || "");
+      }
+    } else if (typeof plan.warnings === "string") {
+      pushMsg(plan.warnings);
+    }
+    if (Array.isArray(plan.hardware_matrix)) {
+      for (const row of plan.hardware_matrix) {
+        if (row && typeof row.header_warning === "string") pushMsg(row.header_warning);
+      }
+    }
+    const truncated =
+      plan.header_truncated === true ||
+      (Array.isArray(plan.hardware_matrix) && plan.hardware_matrix.some((row) => row && row.header_truncated === true));
+    if (warnings.length === 0 && truncated) {
+      pushMsg(
+        tr(
+          "GGUF 文件头元数据在探测上限处被截断，缺失的架构/KV 字段已按保守默认值估算。",
+          "GGUF metadata header was truncated at the probe limit; missing architecture/KV fields fall back to conservative defaults."
+        )
+      );
+    }
+    return warnings;
+  }
+
   function renderGgufPlannerBox() {
     if (state.ggufPlanLoading) {
-      return `<div class="banner info" style="margin-top:14px;">${tr("正在读取 Hugging Face GGUF 仓库与二进制文件头 KV 元数据...", "Inspecting Hugging Face GGUF repository & binary header KV metadata...")}</div>`;
+      return `<div class="banner info" role="status" style="margin-top:14px;">${tr("正在读取 Hugging Face GGUF 仓库与二进制文件头 KV 元数据...", "Inspecting Hugging Face GGUF repository & binary header KV metadata...")}</div>`;
     }
     const p = state.ggufPlan;
     if (!p) return "";
+    const ggufWarnings = extractGgufWarnings(p);
     return `
       <div class="card" style="margin-top:14px;background:var(--bg-input);">
         <div class="card-head">
           <span class="card-title">${tr("GGUF 多卡显存自动适配矩阵", "GGUF Multi-GPU VRAM Fit Matrix")} — <code>${esc(p.repo)}</code></span>
           <span class="tag accent mono">${tr("架构", "Arch")}: ${esc(p.architecture || "general")} | Max Ctx: ${esc(p.model_ctx || 32768)}</span>
         </div>
+        ${ggufWarnings.length > 0 ? `
+          <div class="banner warning gguf-warning-banner" role="status" style="margin-bottom:12px;font-size:12px;">
+            <div style="display:flex;flex-direction:column;gap:4px;">
+              <div class="row-actions" style="gap:7px;">
+                <span class="dot dot-amber" aria-hidden="true"></span>
+                <strong>${tr("GGUF 元数据降级提示", "GGUF Metadata Fallback Notice")}</strong>
+              </div>
+              ${ggufWarnings.map((w) => `<div style="color:var(--text-secondary);">${esc(w)}</div>`).join("")}
+            </div>
+          </div>
+        ` : ""}
         <div class="table-wrap">
           <table>
             <thead>
@@ -1558,7 +1769,7 @@
                 ` : ""}
 
                 <div class="kv-row mono" style="font-size:12px;background:var(--bg-input);border:1px solid var(--border-subtle);padding:9px 11px;border-radius:var(--radius-sm);">
-                  <span>${tr("预估速率", "Est. Burn")}: <strong>~${s.estimated_burn_hourly} CCU/h</strong> (${tr("累计", "Spent")} ~${s.estimated_spent_ccu})</span>
+                  <span>${tr("预估速率", "Est. Burn")}: <strong>~${formatCcu(s.estimated_burn_hourly)} CCU/h</strong> (${tr("累计", "Spent")} ~${formatCcu(s.estimated_spent_ccu)} CCU)</span>
                   <span>${tr("看门狗倒计时", "Watchdog")}: <strong data-watchdog-deadline="${s.watchdog?.deadline_epoch ?? ""}">${formatRemainingDeadline(s.watchdog?.deadline_epoch)}</strong></span>
                 </div>
 
@@ -1650,27 +1861,27 @@
         <div class="card-head" style="flex-wrap:wrap;">
           <span class="card-title">${tr("OpenAI 兼容推理对话测速 (Chat Playground)", "OpenAI-Compatible Chat & Speed Playground")}</span>
           <div class="row-actions" style="flex-wrap:wrap;">
-            <select id="chat-tunnel-select" data-change="chat-tunnel" style="padding:6px 10px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;">
+            <select id="chat-tunnel-select" aria-label="${tr("选择本地推理隧道", "Select local inference tunnel")}" data-change="chat-tunnel" style="padding:6px 10px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;">
               ${openTunnels.length > 0
                 ? openTunnels.map((t) => `<option value="${esc(t.id)}" ${t.id === activeTunnelId ? "selected" : ""}>${esc(t.session_name)} — ${esc(t.local_url)}</option>`).join("")
                 : (isReal
                   ? `<option value="">${tr("请先开启/绑定本地隧道", "Please open or bind a local tunnel first")}</option>`
                   : `<option value="">${tr("默认沙盒端点 (127.0.0.1:8000/v1)", "Default Sandbox (127.0.0.1:8000/v1)")}</option>`)}
             </select>
-            <input type="text" id="chat-model-input" value="${esc(state.chatModel)}" data-input="chat-meta" data-meta-field="chatModel"
+            <input type="text" id="chat-model-input" aria-label="${tr("模型 ID", "Model ID")}" value="${esc(state.chatModel)}" data-input="chat-meta" data-meta-field="chatModel"
               placeholder="model (auto)" title="${tr("模型名，auto 自动识别已部署模型", "Model ID; 'auto' detects active model")}"
               style="width:130px;padding:6px 9px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;" />
-            <input type="password" autocomplete="off" id="chat-apikey-input" data-input="chat-meta" data-meta-field="chatApiKey"
+            <input type="password" autocomplete="off" id="chat-apikey-input" aria-label="${tr("推理服务 API Key", "Inference API Key")}" data-input="chat-meta" data-meta-field="chatApiKey"
               placeholder="${esc(apiKeyPlaceholder)}"
               style="width:135px;padding:6px 9px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;" />
           </div>
         </div>
         ${noRealTunnel ? `
-          <div class="banner info" style="margin-bottom:12px;font-size:12px;">
+          <div class="banner info" role="status" style="margin-bottom:12px;font-size:12px;">
             <span>${tr("真实 Colab 模式下暂无可用本地隧道：请先完成模型部署或点击上方「新建端口映射」绑定本地端口后再发起推理对话。", "No open local tunnel in Real Colab Mode: deploy a model or open a local port forward above before sending prompts.")}</span>
           </div>
         ` : ""}
-        <div class="chat-box" id="chat-box">
+        <div class="chat-box" id="chat-box" role="log" aria-live="polite" aria-label="${tr("推理对话记录", "Chat transcript")}">
           ${state.chatMessages.map((m) => {
             const cls = `chat-msg ${esc(m.role)}${m._error ? " error" : ""}`;
             const text = esc(m._welcome ? welcomeText : m.content);
@@ -1681,7 +1892,7 @@
           }).join("")}
         </div>
         <form class="row-actions" data-submit="chat">
-          <input type="text" id="chat-input" value="${esc(state.chatDraft)}" data-input="chat-meta" data-meta-field="chatDraft"
+          <input type="text" id="chat-input" aria-label="${tr("测试提示词输入", "Test prompt input")}" value="${esc(state.chatDraft)}" data-input="chat-meta" data-meta-field="chatDraft"
             style="flex:1;padding:9px 11px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);background:var(--bg-input);color:var(--text-primary);font-size:13px;"
             placeholder="${noRealTunnel ? tr("请先开启/绑定本地隧道...", "Open or bind a local tunnel first...") : tr("输入测试提示词以实测延迟与 tok/s...", "Enter a test prompt to measure latency & tok/s...")}" ${state.chatBusy || noRealTunnel ? "disabled" : ""} />
           <button type="submit" class="btn btn-primary" ${state.chatBusy || noRealTunnel ? "disabled" : ""}>${IC.send} <span>${state.chatBusy ? tr("生成中...", "Generating...") : tr("发送测试", "Send")}</span></button>
@@ -1746,36 +1957,70 @@
       <div class="card table-wrap">
         <div class="card-head">
           <span class="card-title">${tr("即用即关释放回执库", "Verified Unassign Receipts")}</span>
-          <code>data/receipts/</code>
+          <div class="row-actions" style="gap:8px;">
+            ${state.receipts.length > 0 ? `<span class="mono card-hint" id="receipts-count-summary">${tr(
+              `已显示 ${Math.min(state.receipts.length, Math.max(RECEIPTS_PAGE_SIZE, Number(state.receiptsVisibleLimit || RECEIPTS_PAGE_SIZE)))} / 共 ${state.receipts.length} 条`,
+              `Showing ${Math.min(state.receipts.length, Math.max(RECEIPTS_PAGE_SIZE, Number(state.receiptsVisibleLimit || RECEIPTS_PAGE_SIZE)))} of ${state.receipts.length}`
+            )}</span>` : ""}
+            <code>data/receipts/</code>
+          </div>
         </div>
-        ${state.receipts.length === 0 ? `<div class="kpi-foot">${tr("暂无释放回执记录。每次手动关机、显存重抽或护栏触发释放实例均会在此生成可核验回执。", "No unassign receipts yet. Every manual stop, VRAM retry release, and cost-guard stop writes a verifiable receipt here.")}</div>` : `
-          <table>
-            <thead>
-              <tr>
-                <th>${tr("时间 (UTC)", "Timestamp (UTC)")}</th>
-                <th>${tr("会话 / Endpoint", "Session / Endpoint")}</th>
-                <th>GPU</th>
-                <th>${tr("账号", "Account")}</th>
-                <th>${tr("释放原因", "Reason")}</th>
-                <th>${tr("释放后余额", "Balance After")}</th>
-                <th>${tr("核验状态", "Verified")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${state.receipts.slice(0, 25).map((rc) => `
+        ${(() => {
+          const totalReceipts = state.receipts.length;
+          if (totalReceipts === 0) {
+            return `<div class="kpi-foot">${tr("暂无释放回执记录。每次手动关机、显存重抽或护栏触发释放实例均会在此生成可核验回执。", "No unassign receipts yet. Every manual stop, VRAM retry release, and cost-guard stop writes a verifiable receipt here.")}</div>`;
+          }
+          const visibleLimit = Math.max(RECEIPTS_PAGE_SIZE, Number(state.receiptsVisibleLimit || RECEIPTS_PAGE_SIZE));
+          const visibleReceipts = state.receipts.slice(0, visibleLimit);
+          const shownCount = visibleReceipts.length;
+          const remainingCount = Math.max(0, totalReceipts - shownCount);
+          const nextStep = Math.min(RECEIPTS_PAGE_SIZE, remainingCount);
+          return `
+            <table>
+              <thead>
                 <tr>
-                  <td class="mono" style="font-size:11.5px;">${esc(rc.timestamp.replace("T", " ").slice(0, 19))}</td>
-                  <td><strong>${esc(rc.session_name)}</strong><br/><code style="font-size:11px;">${esc(rc.endpoint)}</code></td>
-                  <td><span class="tag mono">${esc(rc.accelerator)}</span></td>
-                  <td>${esc(rc.account_email)}</td>
-                  <td>${esc(rc.reason)}</td>
-                  <td class="mono">${rc.balance_after_ccu !== null && rc.balance_after_ccu !== undefined ? `${rc.balance_after_ccu.toFixed(2)} CCU` : "--"}</td>
-                  <td><span class="tag ${rc.verified_unassigned ? "ok" : "warn"}">${rc.verified_unassigned ? tr("已确认释放", "Verified") : tr("待确认", "Pending")}</span></td>
+                  <th>${tr("时间 (UTC)", "Timestamp (UTC)")}</th>
+                  <th>${tr("会话 / Endpoint", "Session / Endpoint")}</th>
+                  <th>GPU</th>
+                  <th>${tr("账号", "Account")}</th>
+                  <th>${tr("释放原因", "Reason")}</th>
+                  <th>${tr("释放后余额", "Balance After")}</th>
+                  <th>${tr("核验状态", "Verified")}</th>
                 </tr>
-              `).join("")}
-            </tbody>
-          </table>
-        `}
+              </thead>
+              <tbody>
+                ${visibleReceipts.map((rc) => `
+                  <tr>
+                    <td class="mono" style="font-size:11.5px;">${esc((rc.timestamp || "").replace("T", " ").slice(0, 19))}</td>
+                    <td><strong>${esc(rc.session_name)}</strong><br/><code style="font-size:11px;">${esc(rc.endpoint)}</code></td>
+                    <td><span class="tag mono">${esc(rc.accelerator)}</span></td>
+                    <td>${esc(rc.account_email)}</td>
+                    <td>${esc(rc.reason)}</td>
+                    <td class="mono">${rc.balance_after_ccu !== null && rc.balance_after_ccu !== undefined ? `${rc.balance_after_ccu.toFixed(2)} CCU` : "--"}</td>
+                    <td><span class="tag ${rc.verified_unassigned ? "ok" : "warn"}">${rc.verified_unassigned ? tr("已确认释放", "Verified") : tr("待确认", "Pending")}</span></td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+            ${totalReceipts > RECEIPTS_PAGE_SIZE ? `
+              <div class="receipts-pager">
+                <span class="card-hint mono">
+                  ${remainingCount > 0
+                    ? tr(`当前显示 ${shownCount} / ${totalReceipts} 条回执（还有 ${remainingCount} 条）`, `Showing ${shownCount} of ${totalReceipts} receipts (${remainingCount} more)`)
+                    : tr(`已展开全部 ${totalReceipts} 条回执`, `Showing all ${totalReceipts} receipts`)}
+                </span>
+                <div class="row-actions">
+                  ${remainingCount > 0 ? `
+                    <button type="button" class="btn btn-sm" data-action="receipts-more">${tr(`显示更多 (+${nextStep})`, `Show More (+${nextStep})`)}</button>
+                    <button type="button" class="btn btn-sm btn-primary" data-action="receipts-all">${tr(`展开全部 (${totalReceipts})`, `Show All (${totalReceipts})`)}</button>
+                  ` : `
+                    <button type="button" class="btn btn-sm" data-action="receipts-collapse">${tr(`收起至前 ${RECEIPTS_PAGE_SIZE} 条`, `Collapse to ${RECEIPTS_PAGE_SIZE}`)}</button>
+                  `}
+                </div>
+              </div>
+            ` : ""}
+          `;
+        })()}
       </div>
     `;
   }
@@ -1808,35 +2053,35 @@
           </div>
           <form data-submit="guard-settings" class="form-grid">
             <div class="field">
-              <label>${tr("默认 VM 自动关机限时 (分钟，0=不限时)", "Default VM Auto-Stop (minutes, 0=unlimited)")}</label>
+              <label for="set-autostop">${tr("默认 VM 自动关机限时 (分钟，0=不限时)", "Default VM Auto-Stop (minutes, 0=unlimited)")}</label>
               <input type="number" id="set-autostop" min="0" max="1440" value="${esc(getGuardDraftVal("auto_stop_minutes", 120))}"
                 data-input="settings-guard" data-change="settings-guard" data-guard-key="auto_stop_minutes" />
               <span class="field-help">${tr("运行在 Colab VM 内部，关闭本地电脑也会准时 unassign", "Runs detached inside Colab VM; unassigns even if console is closed")}</span>
             </div>
             <div class="field">
-              <label>${tr("GPU 空闲自动关机 (分钟，0=禁用)", "GPU Idle Auto-Stop (minutes, 0=disabled)")}</label>
+              <label for="set-idlestop">${tr("GPU 空闲自动关机 (分钟，0=禁用)", "GPU Idle Auto-Stop (minutes, 0=disabled)")}</label>
               <input type="number" id="set-idlestop" min="0" max="720" value="${esc(getGuardDraftVal("idle_stop_minutes", 30))}"
                 data-input="settings-guard" data-change="settings-guard" data-guard-key="idle_stop_minutes" />
               <span class="field-help">${tr("同时检测任务心跳与 nvidia-smi 利用率 <5%", "Checks both worker heartbeat and nvidia-smi <5%")}</span>
             </div>
             <div class="field">
-              <label>${tr("账号算力余额保护红线 (CCU)", "Account Balance Floor (CCU)")}</label>
+              <label for="set-floor">${tr("账号算力余额保护红线 (CCU)", "Account Balance Floor (CCU)")}</label>
               <input type="number" step="0.5" min="0" id="set-floor" value="${esc(getGuardDraftVal("balance_floor_ccu", 5))}"
                 data-input="settings-guard" data-change="settings-guard" data-guard-key="balance_floor_ccu" />
               <span class="field-help">${tr("低于此余额自动释放该账号下所有实例", "Stops all runtimes on the account when live balance drops to floor")}</span>
             </div>
             <div class="field">
-              <label>${tr("单实例累计消耗上限 (CCU)", "Per-Session Spend Cap (CCU)")}</label>
+              <label for="set-cap">${tr("单实例累计消耗上限 (CCU)", "Per-Session Spend Cap (CCU)")}</label>
               <input type="number" step="1" min="0" id="set-cap" value="${esc(getGuardDraftVal("session_spend_cap_ccu", 20))}"
                 data-input="settings-guard" data-change="settings-guard" data-guard-key="session_spend_cap_ccu" />
             </div>
             <div class="field">
-              <label>${tr("显存不达标最大重抽次数", "Max VRAM Provisioning Retries")}</label>
+              <label for="set-retries">${tr("显存不达标最大重抽次数", "Max VRAM Provisioning Retries")}</label>
               <input type="number" min="1" max="8" id="set-retries" value="${esc(getGuardDraftVal("max_vram_retries", 4))}"
                 data-input="settings-guard" data-change="settings-guard" data-guard-key="max_vram_retries" />
             </div>
             <div class="field">
-              <label>${tr("最大受管实例并发上限", "Max Managed Sessions")}</label>
+              <label for="set-maxsess">${tr("最大受管实例并发上限", "Max Managed Sessions")}</label>
               <input type="number" min="1" max="5" id="set-maxsess" value="${esc(getGuardDraftVal("max_managed_sessions", 3))}"
                 data-input="settings-guard" data-change="settings-guard" data-guard-key="max_managed_sessions" />
             </div>
@@ -1855,7 +2100,7 @@
             ${tr("密钥保存在操作系统凭据管理器中，仅在部署声明需要时通过内存注入，日志自动脱敏为 <code>***</code>。", "Stored in OS Credential Manager and injected in memory only when declared by a recipe; scrubbed to <code>***</code> in logs.")}
           </p>
           <div class="field" style="margin-bottom:14px;">
-            <label>Hugging Face Token — ${state.secrets.hf_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
+            <label for="inp-hf-token">Hugging Face Token — ${state.secrets.hf_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
             <div class="row-actions">
               <input type="password" autocomplete="off" id="inp-hf-token" style="flex:1;"
                 data-input="secret-draft" data-slot="hf_token"
@@ -1866,7 +2111,7 @@
           </div>
 
           <div class="field" style="margin-bottom:18px;">
-            <label>Civitai API Token — ${state.secrets.civitai_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
+            <label for="inp-civ-token">Civitai API Token — ${state.secrets.civitai_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
             <div class="row-actions">
               <input type="password" autocomplete="off" id="inp-civ-token" style="flex:1;"
                 data-input="secret-draft" data-slot="civitai_token"
@@ -1878,8 +2123,8 @@
 
           ${state.settings.backend_mode === "mock" ? `
             <div class="divider"></div>
-            <label style="font-size:12px;font-weight:500;color:var(--text-secondary);">${tr("演示沙盒预设场景", "Sandbox Demo Scenario")}</label>
-            <div class="row-actions" style="margin-top:8px;">
+            <div class="field-group-label" id="mock-scenario-label">${tr("演示沙盒预设场景", "Sandbox Demo Scenario")}</div>
+            <div class="row-actions" role="group" aria-labelledby="mock-scenario-label" style="margin-top:8px;">
               ${["demo", "single", "signed_out"].map((sc) => `
                 <button class="btn btn-sm ${state.settings.mock_scenario === sc ? "btn-primary" : ""}" type="button"
                   data-action="set-mock-scenario" data-scenario="${esc(sc)}">${esc(sc)}</button>
@@ -2028,7 +2273,7 @@
       state.cmdActiveIndex = 0;
     }
     return actions.map((a, idx) => `
-      <button type="button" class="cmd-item${idx === state.cmdActiveIndex ? " active" : ""}" data-action="cmd-exec" data-cmd-idx="${idx}" data-cmd-kind="${esc(a.kind)}" data-cmd-arg="${esc(a.arg)}" aria-selected="${idx === state.cmdActiveIndex ? "true" : "false"}">
+      <button type="button" role="option" class="cmd-item${idx === state.cmdActiveIndex ? " active" : ""}" data-action="cmd-exec" data-cmd-idx="${idx}" data-cmd-kind="${esc(a.kind)}" data-cmd-arg="${esc(a.arg)}" aria-selected="${idx === state.cmdActiveIndex ? "true" : "false"}">
         <span>${esc(a.label)}</span>
         <span class="cmd-sub mono">${esc(a.sub)}</span>
       </button>
@@ -2077,12 +2322,12 @@
     openModal(`
       <div class="field">
         <input type="text" id="cmd-search" autocomplete="off" value="${esc(state.cmdQuery)}" placeholder="${esc(placeholder)}"
-          data-input="cmd-filter" />
+          aria-label="${tr("命令面板搜索", "Search commands")}" data-input="cmd-filter" />
       </div>
-      <div class="cmd-list" id="cmd-list">
+      <div class="cmd-list" id="cmd-list" role="listbox" aria-label="${tr("快捷命令列表", "Quick commands")}">
         ${renderCommandPaletteItems()}
       </div>
-    `, { type: "cmd_palette" });
+    `, { type: "cmd_palette" }, { ariaLabel: tr("命令面板", "Command Palette") });
     const inp = document.getElementById("cmd-search");
     if (inp && typeof inp.focus === "function") inp.focus();
   }
@@ -2203,15 +2448,35 @@
         toast(tr("复制失败，请手动复制", "Failed to copy; please copy manually"), "err");
       }
     },
-    go(route) {
-      state.route = route;
+    go(route, opts = {}) {
+      const target = normalizeRoute(route) || "overview";
+      state.route = target;
+      if (state.sidebarOpen) setSidebarOpen(false);
+      if (!opts.fromHash) syncRouteHash(target);
       renderChrome();
       renderMain();
     },
     pickRecipe(id) {
       state.selectedRecipeId = id;
       state.route = "deploy";
+      if (state.sidebarOpen) setSidebarOpen(false);
+      syncRouteHash("deploy");
       renderChrome();
+      renderMain();
+    },
+    setSidebarOpen,
+    toggleSidebar,
+    showMoreReceipts() {
+      const cur = Math.max(RECEIPTS_PAGE_SIZE, Number(state.receiptsVisibleLimit || RECEIPTS_PAGE_SIZE));
+      state.receiptsVisibleLimit = Math.min(Math.max(RECEIPTS_PAGE_SIZE, state.receipts.length), cur + RECEIPTS_PAGE_SIZE);
+      renderMain();
+    },
+    showAllReceipts() {
+      state.receiptsVisibleLimit = Math.max(RECEIPTS_PAGE_SIZE, state.receipts.length);
+      renderMain();
+    },
+    collapseReceipts() {
+      state.receiptsVisibleLimit = RECEIPTS_PAGE_SIZE;
       renderMain();
     },
     toggleAdvanced(recipeId) {
@@ -2482,25 +2747,25 @@
     },
     openNewSessionModal(opts = {}) {
       openModal(`
-        <h3 style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("新建 Colab 算力实例", "New Colab GPU Session")}</h3>
+        <h3 id="modal-title" style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("新建 Colab 算力实例", "New Colab GPU Session")}</h3>
         <form data-submit="new-session" class="form-grid">
           <div class="field">
-            <label>${tr("加速器型号", "Accelerator")}</label>
+            <label for="m-accel">${tr("加速器型号", "Accelerator")}</label>
             <select id="m-accel">
               ${getAcceleratorSpecs().map((sp) => `<option value="${esc(sp.id)}">${esc(formatAcceleratorOptionLabel(sp))}</option>`).join("")}
             </select>
           </div>
           <div class="field">
-            <label>${tr("最低显存要求 (MiB，0=不限)", "Min VRAM (MiB, 0 = any)")}</label>
+            <label for="m-vram">${tr("最低显存要求 (MiB，0=不限)", "Min VRAM (MiB, 0 = any)")}</label>
             <input type="number" id="m-vram" min="0" step="1024" value="0" />
             <span class="field-help">${tr("填 70000 可自动退回 40G A100 直至抽中 80G", "Set 70000 to auto-release 40 GB A100s until an 80 GB VM is assigned")}</span>
           </div>
           <div class="field">
-            <label>${tr("自动关机限时 (分钟)", "Auto-Stop Limit (minutes)")}</label>
+            <label for="m-autostop">${tr("自动关机限时 (分钟)", "Auto-Stop Limit (minutes)")}</label>
             <input type="number" id="m-autostop" min="0" max="1440" value="${state.settings.guards?.auto_stop_minutes ?? 120}" />
           </div>
           <div class="field">
-            <label>${tr("高内存 (High-RAM)", "High-RAM Shape")}</label>
+            <label for="m-highmem">${tr("高内存 (High-RAM)", "High-RAM Shape")}</label>
             <select id="m-highmem">
               <option value="0">${tr("标准内存 (Standard)", "Standard")}</option>
               <option value="1">${tr("高内存 (High-RAM)", "High-RAM")}</option>
@@ -2583,18 +2848,18 @@
     },
     openForwardModal(sessionName, opts = {}) {
       openModal(`
-        <h3 style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("映射云端端口至本机 127.0.0.1", "Forward Colab VM Port to 127.0.0.1")}</h3>
+        <h3 id="modal-title" style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("映射云端端口至本机 127.0.0.1", "Forward Colab VM Port to 127.0.0.1")}</h3>
         <form data-submit="forward" data-session-name="${esc(sessionName)}" class="form-grid">
           <div class="field">
-            <label>${tr("云端 VM 端口 (禁填 8080)", "Colab VM Port (avoid 8080)")}</label>
+            <label for="f-rport">${tr("云端 VM 端口 (禁填 8080)", "Colab VM Port (avoid 8080)")}</label>
             <input type="number" id="f-rport" min="1024" max="65535" value="8000" required />
           </div>
           <div class="field">
-            <label>${tr("本地监听端口 (0=同云端或自动分配)", "Local Port (0 = match VM or auto-pick)")}</label>
+            <label for="f-lport">${tr("本地监听端口 (0=同云端或自动分配)", "Local Port (0 = match VM or auto-pick)")}</label>
             <input type="number" id="f-lport" min="0" max="65535" value="8000" />
           </div>
           <div class="field full">
-            <label>${tr("备注名称", "Label")}</label>
+            <label for="f-label">${tr("备注名称", "Label")}</label>
             <input type="text" id="f-label" value="Custom Service" />
           </div>
           <div class="field full row-actions" style="justify-content:flex-end;margin-top:8px;">
@@ -2701,7 +2966,7 @@
     renderLoginModalWithFlow(flow, opts = {}) {
       const isMock = state.settings.backend_mode === "mock";
       openModal(`
-        <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("添加 Google Colab 账号", "Add Google Colab Account")}</h3>
+        <h3 id="modal-title" style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("添加 Google Colab 账号", "Add Google Colab Account")}</h3>
         <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;">
           ${isMock
             ? tr(
@@ -2716,7 +2981,7 @@
         ${!isMock ? `<div style="margin-bottom:12px;"><a href="${esc(safeHttpUrl(flow.auth_url))}" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-primary">${tr("打开 Google 官方授权页面", "Open Google Authorization Page")}</a></div>` : ""}
         <form data-submit="complete-login" data-flow-id="${esc(flow.flow_id)}" class="form-grid">
           <div class="field full">
-            <label>${isMock ? tr("模拟邮箱或任意授权码", "Simulated Email or Auth Code") : tr("Google 授权码 (Authorization Code)", "Google Authorization Code")}</label>
+            <label for="oauth-code">${isMock ? tr("模拟邮箱或任意授权码", "Simulated Email or Auth Code") : tr("Google 授权码 (Authorization Code)", "Google Authorization Code")}</label>
             <input type="text" id="oauth-code" autocomplete="off" required placeholder="${isMock ? "researcher@gmail.com" : "4/0AeanS0..."}" />
           </div>
           <div class="field full row-actions" style="justify-content:flex-end;">
@@ -3024,6 +3289,12 @@
       await window._app.deleteSecret(el.dataset.slot || "", el);
     } else if (action === "set-mock-scenario") {
       await window._app.setMockScenario(el.dataset.scenario || "demo");
+    } else if (action === "receipts-more") {
+      window._app.showMoreReceipts();
+    } else if (action === "receipts-all") {
+      window._app.showAllReceipts();
+    } else if (action === "receipts-collapse") {
+      window._app.collapseReceipts();
     } else if (action === "cmd-exec") {
       await executeCommandAction(el.dataset.cmdKind || "", el.dataset.cmdArg || "");
     }
@@ -3113,9 +3384,23 @@
   /* ========================== Topbar Bindings, Hotkeys & WebSocket ========================== */
 
   document.getElementById("sidebar-nav").addEventListener("click", (ev) => {
-    const btn = ev.target.closest(".nav-btn");
+    const btn = ev.target && typeof ev.target.closest === "function" ? ev.target.closest(".nav-btn") : null;
     if (btn && btn.dataset.route) window._app.go(btn.dataset.route);
   });
+
+  const sidebarToggleBtn = document.getElementById("btn-sidebar-toggle");
+  if (sidebarToggleBtn && typeof sidebarToggleBtn.addEventListener === "function") {
+    sidebarToggleBtn.addEventListener("click", () => {
+      toggleSidebar();
+    });
+  }
+
+  const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+  if (sidebarBackdrop && typeof sidebarBackdrop.addEventListener === "function") {
+    sidebarBackdrop.addEventListener("click", () => {
+      setSidebarOpen(false);
+    });
+  }
 
   const cmdBtn = document.getElementById("btn-cmd-palette");
   if (cmdBtn) {
@@ -3137,6 +3422,12 @@
     }
     if (ev.key === "Escape" && state.activeModal) {
       closeModal();
+      return;
+    }
+    if (ev.key === "Escape" && state.sidebarOpen) {
+      setSidebarOpen(false);
+      const toggleEl = document.getElementById("btn-sidebar-toggle");
+      if (toggleEl && typeof toggleEl.focus === "function") toggleEl.focus();
       return;
     }
     if (state.activeModal && state.activeModal.type === "cmd_palette") {
@@ -3167,7 +3458,7 @@
 
   function openToggleModeModal(nextMode, opts = {}) {
     openModal(`
-      <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("切换控制台后端模式", "Switch Console Backend Mode")}</h3>
+      <h3 id="modal-title" style="font-size:15px;font-weight:600;margin-bottom:10px;">${tr("切换控制台后端模式", "Switch Console Backend Mode")}</h3>
       <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:16px;">
         ${nextMode === "real"
           ? tr(
@@ -3319,11 +3610,24 @@
     }
   }
 
+  function handleHashChange() {
+    const nextRoute = parseRouteFromHash("overview");
+    if (!nextRoute) return;
+    if (nextRoute !== state.route) {
+      window._app.go(nextRoute, { fromHash: true });
+    }
+  }
+
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("hashchange", handleHashChange);
+  }
+
   if (typeof setInterval === "function") {
     const wdTimer = setInterval(refreshWatchdogCountdowns, 30000);
     if (wdTimer && typeof wdTimer.unref === "function") wdTimer.unref();
   }
 
+  initRouteFromHash();
   initApiTokenFromUrl();
   initConsole();
 })();

@@ -1383,3 +1383,544 @@ vm.runInContext(fs.readFileSync(input.appJs, 'utf8'), ctx);
         assert not leaked, f"Leaked CJK in Phase 2 {scope} under language='en': {leaked}"
 
 
+def test_frontend_phase3_responsive_a11y_hash_routing_and_ux_regressions(
+    orchestrator: ConsoleOrchestrator,
+) -> None:
+    """Regressions for Phase 3 responsive layout, WCAG a11y, hash routing, receipts pagination, CCU formatting & GGUF warnings."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import pytest
+
+    from colab_boost.config import project_root
+
+    web_dir = project_root() / "src" / "colab_boost" / "web"
+    html_src = (web_dir / "index.html").read_text(encoding="utf-8")
+    css_src = (web_dir / "styles.css").read_text(encoding="utf-8")
+    js_src = (web_dir / "app.js").read_text(encoding="utf-8")
+
+    # 1. Static HTML/CSS/JS a11y & responsive contract assertions
+    assert 'id="btn-sidebar-toggle"' in html_src
+    assert 'aria-controls="app-sidebar"' in html_src
+    assert 'aria-expanded="false"' in html_src
+    assert 'id="sidebar-backdrop"' in html_src
+    assert 'role="dialog" aria-modal="true"' in html_src
+    assert 'id="toast-stack" aria-live="polite"' in html_src
+    assert 'id="global-alert-banner" role="alert"' in html_src
+    assert 'aria-current="page"' in html_src
+
+    assert "@media (max-width: 960px)" in css_src
+    assert "@media (max-width: 640px)" in css_src
+    assert "minmax(min(340px, 100%), 1fr)" in css_src
+    assert "max-height: 90vh" in css_src
+    assert "overflow-y: auto" in css_src
+    assert ":focus-visible" in css_src
+    assert "@media (prefers-reduced-motion: reduce)" in css_src
+    assert not re.search(r"outline\s*:\s*none", css_src, re.I), "Unconditional outline: none found in styles.css"
+
+    # Verify dark theme --text-faint and --text-muted meet WCAG AA (>= 4.5:1) against --bg-elevated (#18181b)
+    def _rel_lum(hex_color: str) -> float:
+        h = hex_color.lstrip("#")
+        channels = [int(h[i : i + 2], 16) / 255.0 for i in (0, 2, 4)]
+        lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+    def _contrast(c1: str, c2: str) -> float:
+        l1, l2 = _rel_lum(c1), _rel_lum(c2)
+        hi, lo = max(l1, l2), min(l1, l2)
+        return (hi + 0.05) / (lo + 0.05)
+
+    dark_block = css_src.split('[data-theme="light"]')[0]
+    m_faint = re.search(r"--text-faint\s*:\s*(#[0-9a-fA-F]{6})", dark_block)
+    m_muted = re.search(r"--text-muted\s*:\s*(#[0-9a-fA-F]{6})", dark_block)
+    assert m_faint and _contrast(m_faint.group(1), "#18181b") >= 4.5
+    assert m_muted and _contrast(m_muted.group(1), "#18181b") >= 4.5
+
+    # Zero inline on*= handlers, zero buttons without explicit type=, zero non-button data-action, zero unassociated <label>
+    inline_re = re.compile(r"""\bon(?:click|input|change|submit|keydown|keyup|focus|blur|load|error)\s*=\s*["']""", re.I)
+    for fname, src in (("index.html", html_src), ("app.js", js_src)):
+        assert not inline_re.search(src), f"Inline event handler found in {fname}"
+        for bm in re.finditer(r"<button\b[^>]*>", src):
+            assert "type=" in bm.group(0), f"Button missing type= in {fname}: {bm.group(0)}"
+        for dm in re.finditer(r"<(\w+)\b[^>]*data-action=[^>]*>", src):
+            assert dm.group(1).lower() == "button", f"Non-button data-action in {fname}: {dm.group(0)}"
+        for lm in re.finditer(r"<label\b[^>]*>", src):
+            assert "for=" in lm.group(0), f"Label missing for= in {fname}: {lm.group(0)}"
+
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node binary not available")
+
+    app = create_app(orchestrator)
+    with TestClient(app) as client:
+        boot_payload = client.get("/api/bootstrap").json()
+
+    app_js_path = web_dir / "app.js"
+    harness = r"""
+const fs = require('fs');
+const vm = require('vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+
+function createHarness(opts = {}) {
+  const els = {};
+  const docListeners = {};
+  const winListeners = {};
+
+  function makeEl(id = '', attrs = {}) {
+    const listeners = {};
+    const classes = new Set();
+    const el = {
+      id,
+      tagName: (attrs.tagName || 'DIV').toUpperCase(),
+      className: '',
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      title: '',
+      disabled: false,
+      isConnected: true,
+      style: {},
+      dataset: { ...(attrs.dataset || {}) },
+      classList: {
+        add(...cs) { cs.forEach((c) => classes.add(c)); },
+        remove(...cs) { cs.forEach((c) => classes.delete(c)); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (classes.has(c)) classes.delete(c); else classes.add(c);
+          } else if (force) classes.add(c);
+          else classes.delete(c);
+        },
+        contains(c) { return classes.has(c); },
+      },
+      setAttribute(k, v) { attrs[k] = String(v); },
+      getAttribute(k) { return k in attrs ? attrs[k] : null; },
+      removeAttribute(k) { delete attrs[k]; },
+      appendChild(ch) { this.lastChild = ch; },
+      remove() {},
+      contains() { return false; },
+      focus() { doc.activeElement = this; this._focusCount = (this._focusCount || 0) + 1; },
+      closest(sel) {
+        if (sel === '[data-action]' && this.dataset && this.dataset.action) return this;
+        if (sel === '.nav-btn' && this.dataset && this.dataset.route) return this;
+        return null;
+      },
+      querySelector(sel) {
+        if (opts.querySelector) return opts.querySelector(sel, this);
+        if (this.id === 'modal-body' && sel.includes('input')) return modalFirstFocusable;
+        return null;
+      },
+      querySelectorAll() { return []; },
+      addEventListener(ev, fn) {
+        listeners[ev] = listeners[ev] || [];
+        listeners[ev].push(fn);
+      },
+      dispatch(ev, eventObj = {}) {
+        let out;
+        for (const fn of (listeners[ev] || [])) {
+          out = fn({ target: this, currentTarget: this, preventDefault() {}, ...eventObj });
+        }
+        return out;
+      },
+      click() { return this.dispatch('click'); },
+    };
+    return el;
+  }
+
+  const modalFirstFocusable = makeEl('modal-first-control', { tagName: 'INPUT' });
+  const getEl = (id) => (els[id] = els[id] || makeEl(id));
+  [
+    'modal-backdrop', 'modal-body', 'toast-stack', 'btn-toggle-mode', 'btn-cmd-palette',
+    'btn-sidebar-toggle', 'app-sidebar', 'sidebar-backdrop',
+    'hud-account', 'hud-balance', 'hud-burn', 'btn-stop-all', 'stop-all-group',
+    'btn-lang', 'btn-theme', 'badge-runs', 'badge-sessions', 'badge-tunnels',
+    'badge-receipts', 'ws-indicator', 'ws-dot', 'main-view', 'sidebar-nav',
+    'global-alert-banner', 'crumb-current',
+  ].forEach(getEl);
+
+  const navBtns = ['overview', 'deploy', 'sessions', 'tunnels', 'accounts', 'settings']
+    .map((r) => makeEl(`nav-${r}`, { tagName: 'BUTTON', dataset: { route: r } }));
+
+  const doc = {
+    title: '',
+    lang: 'zh-CN',
+    activeElement: null,
+    documentElement: { lang: 'zh-CN', setAttribute() {} },
+    getElementById: getEl,
+    createElement: () => makeEl(),
+    querySelectorAll: (sel) => (sel === '.nav-btn' ? navBtns : []),
+    addEventListener(ev, fn) {
+      docListeners[ev] = docListeners[ev] || [];
+      docListeners[ev].push(fn);
+    },
+    dispatch(ev, eventObj = {}) {
+      for (const fn of (docListeners[ev] || [])) {
+        fn({ preventDefault() {}, ...eventObj });
+      }
+    },
+  };
+
+  const windowObj = opts.minimalWindow
+    ? {}
+    : {
+        addEventListener(ev, fn) {
+          winListeners[ev] = winListeners[ev] || [];
+          winListeners[ev].push(fn);
+        },
+        dispatch(ev, eventObj = {}) {
+          for (const fn of (winListeners[ev] || [])) {
+            fn(eventObj);
+          }
+        },
+      };
+
+  const locObj = opts.noLocation
+    ? undefined
+    : {
+        protocol: 'http:',
+        host: '127.0.0.1:8765',
+        pathname: '/',
+        search: '',
+        hash: opts.initialHash || '',
+      };
+
+  const ctx = vm.createContext({
+    window: windowObj,
+    document: doc,
+    location: locObj,
+    CSS: { escape: (s) => s },
+    URLSearchParams,
+    WebSocket: class { constructor() {} },
+    navigator: { clipboard: { writeText: async () => {} } },
+    setTimeout,
+    clearTimeout,
+    fetch: async (url, init = {}) => opts.fetch(url, init),
+  });
+
+  vm.runInContext(fs.readFileSync(input.appJs, 'utf8'), ctx);
+  return { windowObj, doc, els, getEl, navBtns, location: locObj, modalFirstFocusable };
+}
+
+(async () => {
+  const out = {};
+
+  // 1. Hash routing: initial #/playground -> tunnels, go() updates location.hash, hashchange navigates back/forward
+  {
+    const h = createHarness({
+      initialHash: '#/playground',
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => input.boot };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    const initialCrumb = h.getEl('crumb-current').textContent;
+    const initialCurrentNav = h.navBtns.find((b) => b.getAttribute('aria-current') === 'page')?.dataset.route || '';
+
+    h.windowObj._app.go('sessions');
+    const hashAfterSessions = h.location.hash;
+    const navAfterSessions = h.navBtns.find((b) => b.getAttribute('aria-current') === 'page')?.dataset.route || '';
+
+    // Simulate browser back/forward via hashchange
+    h.location.hash = '#/settings';
+    h.windowObj.dispatch('hashchange');
+    const navAfterHashChange = h.navBtns.find((b) => b.getAttribute('aria-current') === 'page')?.dataset.route || '';
+    const crumbAfterHashChange = h.getEl('crumb-current').textContent;
+
+    // Minimal Node test environment without location.hash or window.addEventListener still works safely
+    const hMin = createHarness({
+      minimalWindow: true,
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => input.boot };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    hMin.windowObj._app.go('accounts');
+
+    out.hashRouting = {
+      initialCrumb,
+      initialCurrentNav,
+      hashAfterSessions,
+      navAfterSessions,
+      navAfterHashChange,
+      crumbAfterHashChange,
+      minimalEnvRouteWorked: hMin.getEl('crumb-current').textContent.includes('多账号'),
+    };
+  }
+
+  // 2. Receipts pagination (> 25 items): count summary, Show More, Show All, Collapse + matches #badge-receipts
+  {
+    const boot35 = JSON.parse(JSON.stringify(input.boot));
+    boot35.receipts = Array.from({ length: 35 }, (_, i) => ({
+      receipt_id: `rc-${i + 1}`,
+      timestamp: `2026-11-21T01:${String(i % 60).padStart(2, '0')}:00Z`,
+      session_name: `sess-${i + 1}`,
+      endpoint: `ep-${i + 1}`,
+      accelerator: 'A100',
+      account_email: 'user@example.com',
+      reason: 'manual_stop',
+      balance_after_ccu: 42.5,
+      verified_unassigned: true,
+    }));
+    const h = createHarness({
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => boot35 };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    h.windowObj._app.go('accounts');
+    const html25 = h.getEl('main-view').innerHTML;
+    const rows25 = (html25.match(/ep-\d+<\/code>/g) || []).length;
+
+    h.windowObj._app.showMoreReceipts();
+    const htmlMore = h.getEl('main-view').innerHTML;
+    const rowsMore = (htmlMore.match(/ep-\d+<\/code>/g) || []).length;
+
+    h.windowObj._app.collapseReceipts();
+    const htmlCollapsed = h.getEl('main-view').innerHTML;
+    const rowsCollapsed = (htmlCollapsed.match(/ep-\d+<\/code>/g) || []).length;
+
+    h.windowObj._app.showAllReceipts();
+    const htmlAll = h.getEl('main-view').innerHTML;
+    const rowsAll = (htmlAll.match(/ep-\d+<\/code>/g) || []).length;
+
+    out.receipts = {
+      badgeTotal: h.getEl('badge-receipts').textContent,
+      rows25,
+      hasCountSummary25: html25.includes('25 / 共 35'),
+      hasMoreBtn: html25.includes('data-action="receipts-more"'),
+      hasAllBtn: html25.includes('data-action="receipts-all"'),
+      rowsMore,
+      rowsCollapsed,
+      rowsAll,
+      hasCollapseBtn: htmlAll.includes('data-action="receipts-collapse"'),
+    };
+  }
+
+  // 3. Session estimated_burn_hourly / estimated_spent_ccu 2-decimal formatting
+  {
+    const bootFmt = JSON.parse(JSON.stringify(input.boot));
+    bootFmt.sessions[0].estimated_burn_hourly = 6.9;
+    bootFmt.sessions[0].estimated_spent_ccu = 0.123456;
+    const h = createHarness({
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => bootFmt };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    h.windowObj._app.go('sessions');
+    const sessHtml = h.getEl('main-view').innerHTML;
+    out.ccuFormatting = {
+      burnFormatted: sessHtml.includes('~6.90 CCU/h'),
+      spentFormatted: sessHtml.includes('~0.12 CCU'),
+    };
+  }
+
+  // 4. Deploy a11y (curated repos as <button type="button">, disclosure aria-expanded, modal focus & restore, sidebar drawer)
+  //    AND GGUF header_warning / warnings rendering (plus clean render without warnings)
+  {
+    let ggufResponse = {
+      repo: 'owner/clean-gguf',
+      architecture: 'qwen3',
+      model_ctx: 32768,
+      variants: [{ quant: 'Q4_K_M', size_gib: 18.2, files: ['m.gguf'] }],
+      hardware_matrix: [
+        { gpu_label: 'A100 (80 GB)', accelerator: 'A100', vram_mib: 81920, fits: true, quant: 'Q4_K_M', size_gib: 18.2, kv: 'f16', ctx: 32768, estimate_mib: 24000, budget_mib: 79000 },
+      ],
+    };
+    const h = createHarness({
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => input.boot };
+        if (url.startsWith('/api/hf/gguf-plan')) return { ok: true, status: 200, json: async () => ggufResponse };
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Sidebar toggle, backdrop close, nav auto-close
+    h.getEl('btn-sidebar-toggle').click();
+    const sidebarOpened = h.getEl('app-sidebar').classList.contains('open')
+      && !h.getEl('sidebar-backdrop').classList.contains('hidden')
+      && h.getEl('btn-sidebar-toggle').getAttribute('aria-expanded') === 'true';
+    h.getEl('sidebar-backdrop').click();
+    const sidebarClosedByBackdrop = !h.getEl('app-sidebar').classList.contains('open')
+      && h.getEl('sidebar-backdrop').classList.contains('hidden')
+      && h.getEl('btn-sidebar-toggle').getAttribute('aria-expanded') === 'false';
+    h.getEl('btn-sidebar-toggle').click();
+    h.windowObj._app.pickRecipe('llama-cpp-gguf');
+    const sidebarClosedByNav = !h.getEl('app-sidebar').classList.contains('open');
+
+    const deployCollapsedHtml = h.getEl('main-view').innerHTML;
+    const curatedBtns = deployCollapsedHtml.match(/<button\b[^>]*data-action="pick-curated-repo"[^>]*>/g) || [];
+    const curatedAllHaveTypeButton = curatedBtns.length > 0 && curatedBtns.every((b) => b.includes('type="button"'));
+    const disclosureFalse = /class="disclosure-btn"[^>]*aria-expanded="false"/.test(deployCollapsedHtml);
+    h.windowObj._app.toggleAdvanced('llama-cpp-gguf');
+    const deployExpandedHtml = h.getEl('main-view').innerHTML;
+    const disclosureTrue = /class="disclosure-btn"[^>]*aria-expanded="true"/.test(deployExpandedHtml);
+
+    // GGUF without warnings -> no warning banner
+    h.windowObj._app.updateDraft('llama-cpp-gguf', 'repo', 'owner/clean-gguf', false);
+    await h.windowObj._app.analyzeGguf();
+    const cleanGgufHtml = h.getEl('main-view').innerHTML;
+    const noWarnBannerWhenClean = !cleanGgufHtml.includes('gguf-warning-banner');
+
+    // GGUF with header_warning & warnings -> renders warning banner cleanly
+    ggufResponse = {
+      ...ggufResponse,
+      repo: 'owner/truncated-gguf',
+      header_truncated: true,
+      header_warning: 'GGUF metadata header was truncated at the 4 MiB probe limit.',
+      warnings: ['Conservative KV fallback enabled.'],
+    };
+    h.windowObj._app.updateDraft('llama-cpp-gguf', 'repo', 'owner/truncated-gguf', false);
+    await h.windowObj._app.analyzeGguf();
+    const warnGgufHtml = h.getEl('main-view').innerHTML;
+    const hasWarnBanner = warnGgufHtml.includes('gguf-warning-banner')
+      && warnGgufHtml.includes('4 MiB probe limit')
+      && warnGgufHtml.includes('Conservative KV fallback enabled.');
+
+    // Modal focus first interactive control on open + restore trigger focus on close
+    const triggerBtn = h.getEl('btn-toggle-mode');
+    triggerBtn.focus();
+    h.windowObj._app.openNewSessionModal();
+    const focusedInsideModal = h.doc.activeElement === h.modalFirstFocusable;
+    const modalHasDialogRole = h.getEl('modal-body').getAttribute('role') === 'dialog'
+      && h.getEl('modal-body').getAttribute('aria-modal') === 'true';
+    h.windowObj._app.closeModal();
+    const restoredTriggerFocus = h.doc.activeElement === triggerBtn;
+
+    out.a11yAndGguf = {
+      sidebarOpened,
+      sidebarClosedByBackdrop,
+      sidebarClosedByNav,
+      curatedAllHaveTypeButton,
+      disclosureFalse,
+      disclosureTrue,
+      noWarnBannerWhenClean,
+      hasWarnBanner,
+      focusedInsideModal,
+      modalHasDialogRole,
+      restoredTriggerFocus,
+    };
+  }
+
+  // 5. English mode zero CJK leakage for Phase 3 UI (receipts pagination, GGUF warning, sidebar labels)
+  {
+    const bootEn = JSON.parse(JSON.stringify(input.boot));
+    bootEn.settings.language = 'en';
+    bootEn.receipts = Array.from({ length: 30 }, (_, i) => ({
+      receipt_id: `rc-${i + 1}`,
+      timestamp: '2026-11-21T01:00:00Z',
+      session_name: `sess-${i + 1}`,
+      endpoint: `ep-${i + 1}`,
+      accelerator: 'G4',
+      account_email: 'user@example.com',
+      reason: 'manual_stop',
+      balance_after_ccu: 50.0,
+      verified_unassigned: true,
+    }));
+    const h = createHarness({
+      fetch: async (url) => {
+        if (url.startsWith('/api/bootstrap')) return { ok: true, status: 200, json: async () => bootEn };
+        if (url.startsWith('/api/hf/gguf-plan')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              repo: 'owner/truncated-gguf',
+              architecture: 'qwen3',
+              model_ctx: 32768,
+              header_truncated: true,
+              variants: [],
+              hardware_matrix: [],
+            }),
+          };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    h.windowObj._app.go('accounts');
+    const enAccounts25 = h.getEl('main-view').innerHTML;
+    h.windowObj._app.showAllReceipts();
+    const enAccountsAll = h.getEl('main-view').innerHTML;
+    h.windowObj._app.pickRecipe('llama-cpp-gguf');
+    h.windowObj._app.updateDraft('llama-cpp-gguf', 'repo', 'owner/truncated-gguf', false);
+    await h.windowObj._app.analyzeGguf();
+    const enGgufWarn = h.getEl('main-view').innerHTML;
+    out.enPhase3 = {
+      enAccounts25,
+      enAccountsAll,
+      enGgufWarn,
+      sidebarAria: [
+        h.getEl('btn-sidebar-toggle').getAttribute('aria-label') || '',
+        h.getEl('app-sidebar').getAttribute('aria-label') || '',
+        h.getEl('sidebar-nav').getAttribute('aria-label') || '',
+        h.getEl('btn-cmd-palette').getAttribute('aria-label') || '',
+        h.getEl('btn-stop-all').getAttribute('aria-label') || '',
+      ].join(' | '),
+    };
+  }
+
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+    proc = subprocess.run(
+        [node_bin, "-e", harness],
+        input=json.dumps({"boot": boot_payload, "appJs": str(app_js_path)}),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    res = json.loads(proc.stdout)
+
+    # 1. Hash routing assertions
+    assert res["hashRouting"]["initialCurrentNav"] == "tunnels"
+    assert res["hashRouting"]["hashAfterSessions"] == "#/sessions"
+    assert res["hashRouting"]["navAfterSessions"] == "sessions"
+    assert res["hashRouting"]["navAfterHashChange"] == "settings"
+    assert res["hashRouting"]["crumbAfterHashChange"] in ("成本护栏与密钥", "Guards & Vault")
+    assert res["hashRouting"]["minimalEnvRouteWorked"] is True
+
+    # 2. Receipts pagination assertions
+    assert str(res["receipts"]["badgeTotal"]) == "35"
+    assert res["receipts"]["rows25"] == 25
+    assert res["receipts"]["hasCountSummary25"] is True
+    assert res["receipts"]["hasMoreBtn"] is True
+    assert res["receipts"]["hasAllBtn"] is True
+    assert res["receipts"]["rowsMore"] == 35
+    assert res["receipts"]["rowsCollapsed"] == 25
+    assert res["receipts"]["rowsAll"] == 35
+    assert res["receipts"]["hasCollapseBtn"] is True
+
+    # 3. CCU 2-decimal formatting
+    assert res["ccuFormatting"]["burnFormatted"] is True
+    assert res["ccuFormatting"]["spentFormatted"] is True
+
+    # 4. A11y, responsive drawer, modal focus, GGUF header_warning
+    assert res["a11yAndGguf"]["sidebarOpened"] is True
+    assert res["a11yAndGguf"]["sidebarClosedByBackdrop"] is True
+    assert res["a11yAndGguf"]["sidebarClosedByNav"] is True
+    assert res["a11yAndGguf"]["curatedAllHaveTypeButton"] is True
+    assert res["a11yAndGguf"]["disclosureFalse"] is True
+    assert res["a11yAndGguf"]["disclosureTrue"] is True
+    assert res["a11yAndGguf"]["noWarnBannerWhenClean"] is True
+    assert res["a11yAndGguf"]["hasWarnBanner"] is True
+    assert res["a11yAndGguf"]["focusedInsideModal"] is True
+    assert res["a11yAndGguf"]["modalHasDialogRole"] is True
+    assert res["a11yAndGguf"]["restoredTriggerFocus"] is True
+
+    # 5. Zero CJK leakage in English mode
+    cjk_re = re.compile(r"[\u4e00-\u9fff]")
+    for scope, txt in res["enPhase3"].items():
+        leaked = cjk_re.findall(txt)
+        assert not leaked, f"Leaked CJK in Phase 3 {scope} under language='en': {leaked}"
+
+
+
