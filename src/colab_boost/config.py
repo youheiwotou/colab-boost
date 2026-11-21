@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 from typing import Callable, Optional
@@ -82,12 +83,54 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def user_data_dir() -> Path:
+    """Returns the platform-native user data directory for non-editable wheel installs."""
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data).resolve() / "colab-boost"
+        return Path.home() / "AppData" / "Local" / "colab-boost"
+    xdg_data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg_data_home:
+        return Path(xdg_data_home).resolve() / "colab-boost"
+    return Path.home() / ".local" / "share" / "colab-boost"
+
+
+def resolve_bundled_recipes_dir(
+    *,
+    package_dir: Optional[Path] = None,
+    repo_root: Optional[Path] = None,
+) -> Path:
+    """Prefers wheel-embedded ``colab_boost/recipes`` and falls back to ``<repo>/recipes``."""
+    pkg_dir = (package_dir if package_dir is not None else Path(__file__).resolve().parent).resolve()
+    embedded = pkg_dir / "recipes"
+    if embedded.is_dir():
+        return embedded
+    root = (repo_root if repo_root is not None else project_root()).resolve()
+    return root / "recipes"
+
+
+def resolve_default_data_dir(
+    *,
+    package_dir: Optional[Path] = None,
+    repo_root: Optional[Path] = None,
+) -> Path:
+    """Uses ``<repo>/data`` inside a source checkout, otherwise falls back to ``user_data_dir()``."""
+    pkg_dir = (package_dir if package_dir is not None else Path(__file__).resolve().parent).resolve()
+    in_site_packages = any(part in ("site-packages", "dist-packages") for part in pkg_dir.parts)
+    root = (repo_root if repo_root is not None else project_root()).resolve()
+    if not in_site_packages and (root / "pyproject.toml").is_file():
+        return root / "data"
+    return user_data_dir()
+
+
 class WorkspacePaths:
     """Resolves isolated state directories.
 
-    Defaults to ``<project_root>/data`` so all receipts, ledger, SSH keys and
-    settings stay neatly inside the project folder (never polluting ``~/.ssh/config``),
-    or honors ``COLAB_BOOST_HOME`` for isolated tests.
+    Defaults to ``<project_root>/data`` when running from a source checkout (so all
+    receipts, ledger, SSH keys and settings stay neatly inside the project folder),
+    falls back to the platform user data directory when installed as a wheel into
+    ``site-packages``, and always honors ``COLAB_BOOST_HOME`` or explicit ``base_dir``.
     """
 
     def __init__(self, base_dir: Optional[Path] = None) -> None:
@@ -97,7 +140,7 @@ class WorkspacePaths:
         elif env_home:
             self.home = Path(env_home).resolve()
         else:
-            self.home = project_root() / "data"
+            self.home = resolve_default_data_dir()
 
         self.settings_file = self.home / "settings.json"
         self.accounts_file = self.home / "accounts.json"
@@ -108,7 +151,7 @@ class WorkspacePaths:
         self.keep_dir = self.home / "keep"
         self.ssh_dir = self.home / "ssh"
         self.user_recipes_dir = self.home / "recipes"
-        self.bundled_recipes_dir = project_root() / "recipes"
+        self.bundled_recipes_dir = resolve_bundled_recipes_dir()
 
     def ensure_dirs(self) -> None:
         for d in (self.home, self.receipts_dir, self.keep_dir, self.ssh_dir, self.user_recipes_dir):

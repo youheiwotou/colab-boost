@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 import pytest
 
@@ -20,11 +21,13 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Workspace
 
 
 @pytest.fixture()
-def orchestrator(isolated_paths: WorkspacePaths) -> ConsoleOrchestrator:
+def orchestrator(isolated_paths: WorkspacePaths) -> Iterator[ConsoleOrchestrator]:
     orch = ConsoleOrchestrator(
         paths=isolated_paths,
         force_file_vault=True,
         mock_step_delay_s=0.01,
     )
-    yield orch
-    orch.tunnels.stop_all()
+    try:
+        yield orch
+    finally:
+        orch.shutdown()

@@ -61,9 +61,13 @@ def build_colab_ssh_ws_url(runtime_url: str, proxy_token: str, mode: str = "prox
 
 def find_free_local_port(preferred: int = 0) -> int:
     if preferred and 1024 <= preferred <= 65535:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if sock.connect_ex(("127.0.0.1", preferred)) != 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.1)
+            in_use = probe.connect_ex(("127.0.0.1", preferred)) == 0
+        if not in_use:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if os.name != "nt":
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     sock.bind(("127.0.0.1", preferred))
                     return preferred
@@ -1140,30 +1144,92 @@ class SshTunnelManager:
         labels: Optional[dict[str, str]] = None,
         path: str = "/",
         kind: str = "http",
+        fence: Optional[tuple[int, int]] = None,
     ) -> TunnelInfo:
+        if self._closed:
+            raise RuntimeError("SshTunnelManager has been closed.")
         if remote_port == 8080:
             raise ValueError("VM port 8080 is reserved by Colab's internal proxy; use another port (e.g. 8000).")
-        tid = f"tun-{uuid.uuid4().hex[:8]}"
-        chosen = local_port or remote_port
+        if not (1 <= remote_port <= 65535):
+            raise ValueError(f"Invalid remote_port: {remote_port}")
+        if local_port < 0 or local_port > 65535:
+            raise ValueError(f"Invalid local_port: {local_port}")
+
+        entry_fence = fence if fence is not None else self._get_fence_token(session_name)
         norm_path = path if path.startswith("/") else f"/{path}"
-        with self._lock:
-            eff_label = self._localized_tunnel_label(labels, label)
-            info = TunnelInfo(
-                id=tid,
-                session_name=session_name,
-                account_id=account_id,
-                remote_port=remote_port,
-                local_port=chosen,
-                label=eff_label,
-                labels=dict(labels) if labels else {},
-                path=norm_path,
-                kind=kind,
-                status="open",
-                local_url=f"http://127.0.0.1:{chosen}{norm_path if norm_path != '/' else ''}",
-                created_at=datetime.now(timezone.utc),
-            )
-            self._tunnels[tid] = ActiveTunnelEntry(info=info, is_mock=True)
-            return info.model_copy(deep=True)
+        sess_lock = self._get_session_lock(session_name)
+        with sess_lock:
+            with self._lock:
+                if self._closed or self._get_fence_token(session_name) != entry_fence:
+                    raise RuntimeError(f"SSH tunnel cancelled because session '{session_name}' was stopped.")
+
+                eff_label = self._localized_tunnel_label(labels, label)
+                for entry in self._tunnels.values():
+                    if (
+                        entry.is_mock
+                        and entry.info.session_name == session_name
+                        and entry.info.remote_port == remote_port
+                        and entry.info.status == "open"
+                        and (local_port == 0 or entry.info.local_port == local_port)
+                    ):
+                        if labels is not None:
+                            entry.info.labels = dict(labels)
+                        entry.info.label = self._localized_tunnel_label(entry.info.labels, eff_label)
+                        return entry.info.model_copy(deep=True)
+
+                taken = set(self._reserved_local_ports) | {
+                    e.info.local_port
+                    for e in self._tunnels.values()
+                    if e.info.status in ("starting", "open")
+                }
+
+                preferred = local_port or remote_port
+                if local_port > 0:
+                    if local_port in taken:
+                        chosen = 0
+                        for _ in range(24):
+                            cand = find_free_local_port(0)
+                            if cand not in taken:
+                                chosen = cand
+                                break
+                        if chosen == 0:
+                            raise RuntimeError(
+                                f"Local port {local_port} is already bound and no free fallback port was found."
+                            )
+                    else:
+                        chosen = local_port
+                else:
+                    chosen = 0
+                    if 1024 <= preferred <= 65535 and preferred not in taken:
+                        cand = find_free_local_port(preferred)
+                        if cand not in taken:
+                            chosen = cand
+                    if chosen == 0:
+                        for _ in range(24):
+                            cand = find_free_local_port(0)
+                            if cand not in taken:
+                                chosen = cand
+                                break
+                    if chosen == 0:
+                        raise RuntimeError("Could not allocate a non-conflicting local port for mock tunnel.")
+
+                tid = f"tun-{uuid.uuid4().hex[:8]}"
+                info = TunnelInfo(
+                    id=tid,
+                    session_name=session_name,
+                    account_id=account_id,
+                    remote_port=remote_port,
+                    local_port=chosen,
+                    label=eff_label,
+                    labels=dict(labels) if labels else {},
+                    path=norm_path,
+                    kind=kind,
+                    status="open",
+                    local_url=f"http://127.0.0.1:{chosen}{norm_path if norm_path != '/' else ''}",
+                    created_at=datetime.now(timezone.utc),
+                )
+                self._tunnels[tid] = ActiveTunnelEntry(info=info, is_mock=True)
+                return info.model_copy(deep=True)
 
     def stop_tunnel(self, tunnel_id: str) -> bool:
         with self._lock:
