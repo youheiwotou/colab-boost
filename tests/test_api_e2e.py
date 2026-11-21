@@ -36,7 +36,9 @@ def test_full_console_e2e_lifecycle(orchestrator: ConsoleOrchestrator) -> None:
         )
         assert plan.status_code == 200
         pdata = plan.json()
-        assert len(pdata["hardware_matrix"]) == 4
+        assert len(pdata["hardware_matrix"]) == 6
+        matrix_accels = {row["accelerator"] for row in pdata["hardware_matrix"]}
+        assert {"G4", "H100"}.issubset(matrix_accels)
 
         # 4. Deploy GGUF recipe synchronously -> auto-opens tunnel -> test Playground Chat
         dep = client.post(
