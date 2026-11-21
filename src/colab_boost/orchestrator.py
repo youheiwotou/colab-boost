@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
@@ -21,12 +22,13 @@ from colab_boost.backends.base import (
     RESULT_MARKER,
     ColabBackend,
     ColabBackendError,
+    ExecResult,
     HardwareProbe,
     RawAssignment,
 )
 from colab_boost.backends.direct import DirectColabBackend
 from colab_boost.backends.mock import MockColabBackend
-from colab_boost.config import SettingsStore, WorkspacePaths
+from colab_boost.config import SettingsStore, WorkspacePaths, _replace_atomic, atomic_write_text
 from colab_boost.models import (
     APPROX_CCU_PER_HOUR,
     AccountRecord,
@@ -35,6 +37,7 @@ from colab_boost.models import (
     DeployRequest,
     DeploymentRun,
     KeptArtifactInfo,
+    MachineShape,
     ProvisionOperation,
     ProvisionRequest,
     RecipeKeepSpec,
@@ -51,9 +54,28 @@ from colab_boost.recipe_loader import (
     validate_and_build_env,
 )
 from colab_boost.ssh_bridge import SshTunnelManager
-from colab_boost.vault import CredentialVault, redact_secrets
+from colab_boost.vault import CredentialVault, redact_secrets, redact_value
 
 logger = logging.getLogger(__name__)
+
+_VM_PID_ALIVE_FN = (
+    "def _pid_alive(pid):\n"
+    "    if not pid or pid <= 0:\n"
+    "        return False\n"
+    "    stat_path = f'/proc/{pid}/stat'\n"
+    "    if not os.path.exists(stat_path):\n"
+    "        return False\n"
+    "    try:\n"
+    "        raw_stat = open(stat_path, encoding='utf-8', errors='replace').read()\n"
+    "        rparen = raw_stat.rfind(')')\n"
+    "        if rparen != -1:\n"
+    "            fields = raw_stat[rparen + 1:].split()\n"
+    "            if fields and fields[0] in ('Z', 'X', 'x'):\n"
+    "                return False\n"
+    "        return True\n"
+    "    except OSError:\n"
+    "        return False\n"
+)
 
 
 def _path_is_within(candidate: Path, root: Path) -> bool:
@@ -188,7 +210,7 @@ class ConsoleOrchestrator:
         self._provision_ops: dict[str, ProvisionOperation] = {}
         self._provision_cancels: dict[str, threading.Event] = {}
         self._provision_done: dict[str, threading.Event] = {}
-        self._inflight_stops: dict[str, tuple[threading.Event, list[UnassignReceipt]]] = {}
+        self._inflight_stops: dict[str, tuple[threading.Event, list[UnassignReceipt], str, str]] = {}
         self._real_runs: dict[str, DeploymentRun] = self._load_real_runs()
         self._mock_runs: dict[str, DeploymentRun] = {}
         self._run_cancels: dict[str, threading.Event] = {}
@@ -256,9 +278,11 @@ class ConsoleOrchestrator:
             rec.model_dump(mode="json", exclude={"usage"})
             for rec in self._real_accounts.values()
         ]
-        tmp = self.paths.accounts_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.paths.accounts_file)
+        atomic_write_text(
+            self.paths.accounts_file,
+            json.dumps(items, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def _load_real_ledger(self) -> dict[str, dict[str, Any]]:
         if not self.paths.ledger_file.exists():
@@ -270,9 +294,11 @@ class ConsoleOrchestrator:
             return {}
 
     def _save_real_ledger(self) -> None:
-        tmp = self.paths.ledger_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._real_ledger, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.paths.ledger_file)
+        atomic_write_text(
+            self.paths.ledger_file,
+            json.dumps(self._real_ledger, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def _load_real_runs(self, limit: int = 50) -> dict[str, DeploymentRun]:
         if not self.paths.runs_file.exists():
@@ -291,9 +317,11 @@ class ConsoleOrchestrator:
 
     def _save_real_runs(self) -> None:
         items = [r.model_dump(mode="json") for r in list(self._real_runs.values())[-50:]]
-        tmp = self.paths.runs_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.paths.runs_file)
+        atomic_write_text(
+            self.paths.runs_file,
+            json.dumps(items, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def _load_recent_receipts(self, limit: int = 50) -> list[UnassignReceipt]:
         files = sorted(self.paths.receipts_dir.glob("receipt_*.json"), reverse=True)[:limit]
@@ -309,7 +337,8 @@ class ConsoleOrchestrator:
         self.paths.ensure_dirs()
         stamp = receipt.timestamp.strftime("%Y%m%d_%H%M%S_%f")
         fp = self.paths.receipts_dir / f"receipt_{stamp}_{receipt.receipt_id}.json"
-        fp.write_text(
+        atomic_write_text(
+            fp,
             json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
@@ -373,10 +402,9 @@ class ConsoleOrchestrator:
             prev_lang = self.settings.language
             new_settings = AppSettings.model_validate(merged)
             self.settings = self.settings_store.save(new_settings)
-            if prev_mode != new_settings.backend_mode:
-                self.tunnels.stop_all()
-            if prev_lang != new_settings.language:
-                self.tunnels.relocalize_labels(new_settings.language)
+            mode_changed = prev_mode != new_settings.backend_mode
+            lang_changed = prev_lang != new_settings.language
+            if lang_changed:
                 for run_map in (self._real_runs, self._mock_runs):
                     for r in run_map.values():
                         for ep in r.endpoints:
@@ -388,9 +416,16 @@ class ConsoleOrchestrator:
             ):
                 self._init_mock_state()
             switched_to_real = new_settings.backend_mode == BackendMode.REAL and prev_mode != BackendMode.REAL
+            settings_payload = self.settings.model_dump(mode="json")
+            new_lang = new_settings.language
+        # Never call blocking tunnel shutdown while holding self._lock
+        if mode_changed:
+            self.tunnels.stop_all()
+        if lang_changed:
+            self.tunnels.relocalize_labels(new_lang)
         if switched_to_real:
             self._reconcile_real_runs()
-        self._emit("settings_updated", self.settings.model_dump(mode="json"))
+        self._emit("settings_updated", settings_payload)
         return self.get_settings()
 
     # -------------------- Accounts & Usage --------------------
@@ -468,6 +503,18 @@ class ConsoleOrchestrator:
                 if account_id in self._accounts_dict():
                     self._accounts_dict()[account_id].usage = stale
             return stale
+
+        if fresh.status == "unknown" and prev.balance_ccu is not None:
+            fresh = UsageSnapshot(
+                status="stale",
+                balance_ccu=prev.balance_ccu,
+                burn_rate_hourly=fresh.burn_rate_hourly if fresh.burn_rate_hourly is not None else prev.burn_rate_hourly,
+                assignments_count=fresh.assignments_count if fresh.assignments_count is not None else prev.assignments_count,
+                hours_remaining=fresh.hours_remaining if fresh.hours_remaining is not None else prev.hours_remaining,
+                eligible_gpus=fresh.eligible_gpus or prev.eligible_gpus,
+                fetched_at=prev.fetched_at,
+                stale_reason=fresh.stale_reason or "Backend returned unknown usage snapshot",
+            )
 
         with self._lock:
             if account_id in self._accounts_dict():
@@ -561,6 +608,31 @@ class ConsoleOrchestrator:
 
     # -------------------- Sessions, Orphans & Cost Guards --------------------
 
+    @staticmethod
+    def _copy_ledger_entry(meta: dict[str, Any]) -> dict[str, Any]:
+        cp = dict(meta)
+        wd = cp.get("watchdog")
+        if isinstance(wd, dict):
+            wd_cp = dict(wd)
+            if isinstance(wd_cp.get("keep_paths"), list):
+                wd_cp["keep_paths"] = list(wd_cp["keep_paths"])
+            cp["watchdog"] = wd_cp
+        return cp
+
+    @staticmethod
+    def _run_matches_session(run: DeploymentRun, endpoint: str, session_name: str, account_id: str) -> bool:
+        if run.session_endpoint:
+            return run.session_endpoint == endpoint
+        return run.session_name == session_name and run.account_id == account_id
+
+    def _find_inflight_stop(
+        self, identifier: str, account_id: Optional[str] = None
+    ) -> Optional[tuple[threading.Event, list[UnassignReceipt]]]:
+        for ep, (done_ev, res_box, sname, acc_id) in self._inflight_stops.items():
+            if (ep == identifier or sname == identifier) and (account_id is None or acc_id == account_id):
+                return (done_ev, res_box)
+        return None
+
     def list_sessions(self, include_all_accounts: bool = True) -> list[SessionInfo]:
         sessions, _ = self.list_sessions_with_errors(include_all_accounts=include_all_accounts)
         return sessions
@@ -569,8 +641,12 @@ class ConsoleOrchestrator:
         self, include_all_accounts: bool = True
     ) -> tuple[list[SessionInfo], list[dict[str, str]]]:
         with self._lock:
-            accts = list(self._accounts_dict().values())
-            ledger = self._ledger_dict()
+            is_mock = self.backend.is_mock
+            be = self._mock_backend if is_mock else self._direct_backend
+            ledger = self._mock_ledger if is_mock else self._real_ledger
+            runs_map = self._mock_runs if is_mock else self._real_runs
+            accts = [a.model_copy(deep=True) for a in (self._mock_accounts if is_mock else self._real_accounts).values()]
+            lang = self.settings.language
 
         target_accounts = accts if include_all_accounts else [a for a in accts if a.is_active]
         all_tunnels = self.tunnels.list_tunnels()
@@ -580,8 +656,10 @@ class ConsoleOrchestrator:
         for acc in target_accounts:
             fetch_started = _utc_now()
             try:
-                tok = self._get_token_for_account(acc.id)
-                assignments = self.backend.list_assignments(acc.id, tok)
+                tok = self._mock_tokens.get(acc.id) if is_mock else self.vault.get_account_token(acc.id)
+                if not tok:
+                    raise ColabBackendError("missing_credential", f"No stored credential for account '{acc.id}'.")
+                assignments = be.list_assignments(acc.id, tok)
             except Exception as exc:
                 logger.warning("Failed listing assignments for account %s (%s): %s", acc.id, acc.email, exc)
                 failed_accounts.append(
@@ -597,11 +675,11 @@ class ConsoleOrchestrator:
             # Prune vanished endpoints from ledger only if created before fetch_started
             with self._lock:
                 stale_eps: list[str] = []
-                for ep, meta in ledger.items():
-                    if meta.get("account_id") != acc.id or ep in live_endpoints:
+                for ep, entry in ledger.items():
+                    if entry.get("account_id") != acc.id or ep in live_endpoints:
                         continue
                     try:
-                        created_dt = datetime.fromisoformat(str(meta.get("created_at") or ""))
+                        created_dt = datetime.fromisoformat(str(entry.get("created_at") or ""))
                         if created_dt >= fetch_started:
                             continue
                     except ValueError:
@@ -609,15 +687,15 @@ class ConsoleOrchestrator:
                     stale_eps.append(ep)
                 for ep in stale_eps:
                     ledger.pop(ep, None)
-                if stale_eps:
-                    self._persist_ledger_if_real()
-                ledger_snap = {ep: dict(meta) for ep, meta in ledger.items()}
+                if stale_eps and not is_mock:
+                    self._save_real_ledger()
+                ledger_snap = {ep: self._copy_ledger_entry(entry) for ep, entry in ledger.items()}
 
             for raw in assignments:
-                meta = ledger_snap.get(raw.endpoint)
+                meta: Optional[dict[str, Any]] = ledger_snap.get(raw.endpoint)
                 managed = meta is not None
                 name = str(meta["name"]) if meta and meta.get("name") else f"orphan-{raw.endpoint[-8:]}"
-                if not self.backend.is_mock:
+                if not is_mock:
                     self.tunnels.update_session_credentials(name, raw.proxy_url, raw.proxy_token)
                 created_at: Optional[datetime] = None
                 if meta and meta.get("created_at"):
@@ -637,7 +715,7 @@ class ConsoleOrchestrator:
                 winddown = bool(dl and (dl - 300) <= time.time() < dl)
                 untracked_msg = (
                     "Untracked runtime (not started by console — no VM watchdog)"
-                    if self.settings.language == "en"
+                    if lang == "en"
                     else "未受管实例（非本控制台创建，未挂载自动关机看门狗）"
                 )
                 wd = WatchdogState(
@@ -653,9 +731,9 @@ class ConsoleOrchestrator:
                 vram_total = (meta or {}).get("vram_total_mib")
                 vram_used = (meta or {}).get("vram_used_mib")
                 gpu_util = (meta or {}).get("gpu_util_percent")
-                if self.backend.is_mock:
+                if is_mock:
                     try:
-                        hp = self.backend.probe_hardware(raw)
+                        hp = be.probe_hardware(raw)
                         gpu_name = hp.gpu_name
                         vram_total = hp.vram_total_mib or None
                         vram_used = hp.vram_used_mib
@@ -668,8 +746,9 @@ class ConsoleOrchestrator:
                     active_run_id = next(
                         (
                             r.run_id
-                            for r in self._runs_dict().values()
-                            if r.session_name == name and r.state in ("starting", "running", "ready")
+                            for r in reversed(list(runs_map.values()))
+                            if self._run_matches_session(r, raw.endpoint, name, acc.id)
+                            and r.state in ("starting", "running", "ready")
                         ),
                         None,
                     )
@@ -710,12 +789,26 @@ class ConsoleOrchestrator:
         keep_paths: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         now_epoch = time.time()
-        deadline = (now_epoch + auto_stop_minutes * 60.0) if auto_stop_minutes > 0 else None
+        auto_stop_s: Optional[float] = (auto_stop_minutes * 60.0) if auto_stop_minutes > 0 else None
+        burn_rate = float(APPROX_CCU_PER_HOUR.get(assignment.accelerator.value, 1.0))
+        spend_cap_ccu = float(self.settings.guards.session_spend_cap_ccu)
+        budget_cap_s: Optional[float] = (
+            (spend_cap_ccu / burn_rate) * 3600.0
+            if (spend_cap_ccu > 0.0 and burn_rate > 0.0)
+            else None
+        )
+        span_candidates = [x for x in (auto_stop_s, budget_cap_s) if x is not None and x > 0]
+        effective_remaining_s: Optional[float] = min(span_candidates) if span_candidates else None
+        deadline = (now_epoch + effective_remaining_s) if effective_remaining_s is not None else None
         idle_s = (idle_stop_minutes * 60) if idle_stop_minutes > 0 else None
         hook_list = list(hooks or [])
         kept = list(keep_paths or [])
         wd_cfg = {
             "deadline_epoch": deadline,
+            "remaining_s": effective_remaining_s,
+            "budget_cap_s": budget_cap_s,
+            "budget_cap_ccu": spend_cap_ccu if spend_cap_ccu > 0.0 else None,
+            "approx_burn_rate": burn_rate,
             "idle_timeout_s": idle_s,
             "cancelled": False,
             "runtime_addr": probe.runtime_addr,
@@ -741,11 +834,26 @@ class ConsoleOrchestrator:
         cfg_json = json.dumps(wd_cfg)
         hooks_json = json.dumps(hook_list)
         launcher = (
-            "import json, os, subprocess, sys\n"
+            "import json, os, subprocess, sys, tempfile\n"
             "wd_dir = '/root/.colab-boost/watchdog'\n"
             "os.makedirs(wd_dir, exist_ok=True)\n"
-            f"open(wd_dir + '/watchdog.py', 'w', encoding='utf-8').write({src!r})\n"
-            f"open(wd_dir + '/watchdog.json', 'w', encoding='utf-8').write({cfg_json!r})\n"
+            "hb_file = '/root/.colab-boost/heartbeat'\n"
+            "os.makedirs(os.path.dirname(hb_file) or '/', exist_ok=True)\n"
+            "open(hb_file, 'a', encoding='utf-8').close()\n"
+            "os.utime(hb_file, None)\n"
+            "def _atomic_w(dst_path, txt):\n"
+            "    fd, tmp_p = tempfile.mkstemp(dir=wd_dir, prefix='.wd.', suffix='.tmp')\n"
+            "    try:\n"
+            "        with os.fdopen(fd, 'w', encoding='utf-8') as fh:\n"
+            "            fh.write(txt)\n"
+            "            fh.flush()\n"
+            "        os.replace(tmp_p, dst_path)\n"
+            "    except Exception:\n"
+            "        try: os.remove(tmp_p)\n"
+            "        except OSError: pass\n"
+            "        raise\n"
+            f"_atomic_w(wd_dir + '/watchdog.py', {src!r})\n"
+            f"_atomic_w(wd_dir + '/watchdog.json', {cfg_json!r})\n"
             "p = subprocess.Popen("
             "[sys.executable, wd_dir + '/watchdog.py', '--config', wd_dir + '/watchdog.json', '--hooks-stdin'], "
             "stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, start_new_session=True)\n"
@@ -1069,20 +1177,23 @@ class ConsoleOrchestrator:
         )
         if not target:
             with self._lock:
-                inflight = self._inflight_stops.get(identifier)
+                inflight = self._find_inflight_stop(identifier, account_id)
             if inflight is not None:
                 inflight[0].wait(timeout=30.0)
                 if inflight[1]:
                     return inflight[1][0].model_copy(deep=True)
             raise KeyError(f"Session '{identifier}' not found or already stopped.")
 
-        # Deduplicate concurrent stop calls on the same endpoint
+        # Deduplicate concurrent stop calls on the same endpoint or session_name
         with self._lock:
-            existing_stop = self._inflight_stops.get(target.endpoint)
+            existing_stop = (
+                self._find_inflight_stop(target.endpoint, target.account_id)
+                or self._find_inflight_stop(target.name, target.account_id)
+            )
             if existing_stop is None:
                 stop_done = threading.Event()
                 res_box: list[UnassignReceipt] = []
-                self._inflight_stops[target.endpoint] = (stop_done, res_box)
+                self._inflight_stops[target.endpoint] = (stop_done, res_box, target.name, target.account_id)
                 is_owner = True
             else:
                 stop_done, res_box = existing_stop
@@ -1101,7 +1212,7 @@ class ConsoleOrchestrator:
                     keep_run_ids = [
                         r.run_id
                         for r in self._runs_dict().values()
-                        if r.session_name == target.name
+                        if self._run_matches_session(r, target.endpoint, target.name, target.account_id)
                         and r.state in ("running", "ready")
                         and r.keep_paths
                     ]
@@ -1113,12 +1224,24 @@ class ConsoleOrchestrator:
 
             # Stop any local tunnels & cancel running deployments on this session
             self.tunnels.stop_session_tunnels(target.name)
+            closed_run_snaps: list[dict[str, Any]] = []
             with self._lock:
+                runs_changed = False
                 for rid, run in self._runs_dict().items():
-                    if run.session_name == target.name and run.state in ("provisioning", "starting", "running"):
+                    if not self._run_matches_session(run, target.endpoint, target.name, target.account_id):
+                        continue
+                    if run.state in ("provisioning", "starting", "running"):
                         ev = self._run_cancels.get(rid)
                         if ev:
                             ev.set()
+                    elif run.state == "ready" and any(ep.status != "closed" for ep in run.endpoints):
+                        run.endpoints = [ep.model_copy(update={"status": "closed"}) for ep in run.endpoints]
+                        runs_changed = True
+                        closed_run_snaps.append(self._localize_run_copy(run).model_dump(mode="json"))
+                if runs_changed:
+                    self._persist_runs_if_real()
+            for snap_payload in closed_run_snaps:
+                self._emit("run_updated", snap_payload)
 
             tok = self._get_token_for_account(target.account_id)
             verified = self.backend.unassign_runtime(target.account_id, tok, target.endpoint)
@@ -1264,8 +1387,10 @@ class ConsoleOrchestrator:
         if not target:
             raise KeyError(f"Session '{session_name}' not found.")
 
-        base_epoch = max(time.time(), target.watchdog.deadline_epoch or time.time())
+        now_epoch = time.time()
+        base_epoch = max(now_epoch, target.watchdog.deadline_epoch or now_epoch)
         new_deadline = base_epoch + (add_minutes * 60.0)
+        new_remaining_s = max(1.0, new_deadline - now_epoch)
         default_idle_s = (
             target.watchdog.idle_timeout_s
             if target.watchdog.idle_timeout_s is not None
@@ -1280,7 +1405,8 @@ class ConsoleOrchestrator:
                 raise KeyError(f"Runtime '{target.endpoint}' disappeared.")
             wd_src = _watchdog_source()
             patch_code = (
-                "import json, os, subprocess, sys, time\n"
+                "import json, os, subprocess, sys, tempfile, time\n"
+                f"{_VM_PID_ALIVE_FN}"
                 "wd_dir = '/root/.colab-boost/watchdog'\n"
                 "os.makedirs(wd_dir, exist_ok=True)\n"
                 "cfg_path = wd_dir + '/watchdog.json'\n"
@@ -1291,6 +1417,8 @@ class ConsoleOrchestrator:
                 "    try: cfg = json.load(open(cfg_path, encoding='utf-8'))\n"
                 "    except Exception: cfg = {}\n"
                 f"cfg['deadline_epoch'] = {new_deadline!r}\n"
+                f"cfg['remaining_s'] = {new_remaining_s!r}\n"
+                "cfg.pop('max_runtime_s', None)\n"
                 "cfg['cancelled'] = False\n"
                 f"cfg.setdefault('idle_timeout_s', {default_idle_s!r})\n"
                 "cfg.setdefault('runtime_addr', os.environ.get('TBE_RUNTIME_ADDR'))\n"
@@ -1299,21 +1427,33 @@ class ConsoleOrchestrator:
                 "cfg.setdefault('poll_s', 15)\n"
                 "cfg.setdefault('grace_s', 180)\n"
                 "cfg.setdefault('started_at', time.time())\n"
-                "tmp = cfg_path + '.tmp'\n"
-                "with open(tmp, 'w', encoding='utf-8') as fh:\n"
-                "    json.dump(cfg, fh)\n"
-                "os.replace(tmp, cfg_path)\n"
+                "hb_file = cfg.get('heartbeat_file') or '/root/.colab-boost/heartbeat'\n"
+                "os.makedirs(os.path.dirname(hb_file) or '/', exist_ok=True)\n"
+                "open(hb_file, 'a', encoding='utf-8').close()\n"
+                "os.utime(hb_file, None)\n"
+                "def _atomic_w(dst_path, txt):\n"
+                "    fd, tmp_p = tempfile.mkstemp(dir=wd_dir, prefix='.wd.', suffix='.tmp')\n"
+                "    try:\n"
+                "        with os.fdopen(fd, 'w', encoding='utf-8') as fh:\n"
+                "            fh.write(txt)\n"
+                "            fh.flush()\n"
+                "        os.replace(tmp_p, dst_path)\n"
+                "    except Exception:\n"
+                "        try: os.remove(tmp_p)\n"
+                "        except OSError: pass\n"
+                "        raise\n"
+                "_atomic_w(cfg_path, json.dumps(cfg))\n"
                 "pid = 0\n"
                 "if os.path.exists(pid_path):\n"
                 "    try: pid = int(open(pid_path).read().strip())\n"
                 "    except Exception: pid = 0\n"
-                "alive = bool(pid and os.path.exists(f'/proc/{pid}'))\n"
+                "alive = _pid_alive(pid)\n"
                 "if not alive:\n"
-                f"    open(script_path, 'w', encoding='utf-8').write({wd_src!r})\n"
+                f"    _atomic_w(script_path, {wd_src!r})\n"
                 "    p = subprocess.Popen([sys.executable, script_path, '--config', cfg_path], "
                 "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
                 "    pid = p.pid\n"
-                f"print({RESULT_MARKER!r} + json.dumps({{'pid': pid, 'deadline_epoch': cfg['deadline_epoch']}}), flush=True)\n"
+                f"print({RESULT_MARKER!r} + json.dumps({{'pid': pid, 'deadline_epoch': cfg['deadline_epoch'], 'remaining_s': cfg['remaining_s']}}), flush=True)\n"
             )
             res = self.backend.execute_python(raw, patch_code, timeout_s=25.0)
             if not res.ok or not res.marker_json or not res.marker_json.get("pid"):
@@ -1334,7 +1474,12 @@ class ConsoleOrchestrator:
                 wd["idle_timeout_s"] = default_idle_s
             self._persist_ledger_if_real()
 
-        updated = next(s for s in self.list_sessions(include_all_accounts=True) if s.endpoint == target.endpoint)
+        updated = next(
+            (s for s in self.list_sessions(include_all_accounts=True) if s.endpoint == target.endpoint),
+            None,
+        )
+        if updated is None:
+            raise KeyError(f"Runtime '{target.endpoint}' disappeared while extending deadline.")
         self._emit("sessions_changed", {"extended": target.name})
         return updated
 
@@ -1519,28 +1664,34 @@ class ConsoleOrchestrator:
         account_id: str,
         run_id: str,
         keep_specs: list[RecipeKeepSpec],
+        *,
+        is_real: Optional[bool] = None,
     ) -> None:
         if not keep_specs:
             return
+        eff_real = (not self.backend.is_mock) if is_real is None else is_real
         keep_paths = [kp.path for kp in keep_specs]
         hooks = _build_keep_winddown_hooks(run_id, session_name, keep_specs)
 
         with self._lock:
-            entry = self._ledger_dict().setdefault(
+            ledger = self._real_ledger if eff_real else self._mock_ledger
+            entry = ledger.setdefault(
                 endpoint,
                 {"name": session_name, "account_id": account_id, "created_at": _utc_now().isoformat()},
             )
             wd = entry.setdefault("watchdog", {})
             merged_paths = list(dict.fromkeys([*(wd.get("keep_paths") or []), *keep_paths]))
             wd["keep_paths"] = merged_paths
-            self._persist_ledger_if_real()
+            if eff_real:
+                self._save_real_ledger()
 
-        if self.backend.is_mock or raw is None:
+        if not eff_real or raw is None:
             return
 
         wd_src = _watchdog_source()
         patch_code = (
-            "import json, os, subprocess, sys, time\n"
+            "import json, os, subprocess, sys, tempfile, time\n"
+            f"{_VM_PID_ALIVE_FN}"
             "wd_dir = '/root/.colab-boost/watchdog'\n"
             "os.makedirs(wd_dir, exist_ok=True)\n"
             "cfg_path = wd_dir + '/watchdog.json'\n"
@@ -1555,29 +1706,39 @@ class ConsoleOrchestrator:
             "    if h not in existing_hooks:\n"
             "        existing_hooks.append(h)\n"
             "cfg['hooks'] = existing_hooks\n"
-            "tmp = cfg_path + '.tmp'\n"
-            "with open(tmp, 'w', encoding='utf-8') as fh:\n"
-            "    json.dump(cfg, fh)\n"
-            "os.replace(tmp, cfg_path)\n"
-            "has_guard = bool(cfg.get('deadline_epoch') or cfg.get('idle_timeout_s'))\n"
+            "def _atomic_w(dst_path, txt):\n"
+            "    fd, tmp_p = tempfile.mkstemp(dir=wd_dir, prefix='.wd.', suffix='.tmp')\n"
+            "    try:\n"
+            "        with os.fdopen(fd, 'w', encoding='utf-8') as fh:\n"
+            "            fh.write(txt)\n"
+            "            fh.flush()\n"
+            "        os.replace(tmp_p, dst_path)\n"
+            "    except Exception:\n"
+            "        try: os.remove(tmp_p)\n"
+            "        except OSError: pass\n"
+            "        raise\n"
+            "_atomic_w(cfg_path, json.dumps(cfg))\n"
+            "has_guard = bool(cfg.get('deadline_epoch') or cfg.get('remaining_s') or cfg.get('idle_timeout_s'))\n"
             "pid = 0\n"
             "if os.path.exists(pid_path):\n"
             "    try: pid = int(open(pid_path).read().strip())\n"
             "    except Exception: pid = 0\n"
-            "alive = bool(pid and os.path.exists(f'/proc/{pid}'))\n"
+            "alive = _pid_alive(pid)\n"
             "if has_guard and not alive:\n"
-            f"    open(script_path, 'w', encoding='utf-8').write({wd_src!r})\n"
+            f"    _atomic_w(script_path, {wd_src!r})\n"
             "    p = subprocess.Popen([sys.executable, script_path, '--config', cfg_path], "
             "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
             "    pid = p.pid\n"
             f"print({RESULT_MARKER!r} + json.dumps({{'hooks_count': len(existing_hooks), 'pid': pid}}), flush=True)\n"
         )
-        self.backend.execute_python(raw, patch_code, timeout_s=25.0)
+        be = self._direct_backend if eff_real else self.backend
+        be.execute_python(raw, patch_code, timeout_s=25.0)
 
     def sync_keep_artifacts(self, run_id: str) -> list[KeptArtifactInfo]:
         """Archives declared ``[[keep]]`` directories from the Colab VM into ``<workspace>/data/keep/<run_id>/``."""
         with self._lock:
-            runs = self._runs_dict()
+            is_mock = self.backend.is_mock
+            runs = self._mock_runs if is_mock else self._real_runs
             if run_id not in runs:
                 raise KeyError(f"Unknown deployment run: {run_id}")
             run = runs[run_id].model_copy(deep=True)
@@ -1589,7 +1750,7 @@ class ConsoleOrchestrator:
         dest_dir.mkdir(parents=True, exist_ok=True)
         now = _utc_now()
 
-        if self.backend.is_mock:
+        if is_mock:
             updated_items: list[KeptArtifactInfo] = []
             for kp in run.keep_paths:
                 slug = _sanitize_keep_slug(kp.path)
@@ -1606,16 +1767,24 @@ class ConsoleOrchestrator:
                     indent=2,
                 ).encode("utf-8")
                 sample_bytes = f"Colab Boost preserved artifact snapshot for {kp.path}\n".encode("utf-8")
-                with tarfile.open(arc_path, "w:gz") as tf:
-                    ti1 = tarfile.TarInfo(name=f"{slug}/keep_manifest.json")
-                    ti1.size = len(meta_bytes)
-                    ti1.mtime = int(now.timestamp())
-                    tf.addfile(ti1, io.BytesIO(meta_bytes))
+                fd, tmp_name = tempfile.mkstemp(dir=str(dest_dir), prefix=f".{slug}.", suffix=".tmp")
+                os.close(fd)
+                tmp_arc = Path(tmp_name)
+                try:
+                    with tarfile.open(tmp_arc, "w:gz") as tf:
+                        ti1 = tarfile.TarInfo(name=f"{slug}/keep_manifest.json")
+                        ti1.size = len(meta_bytes)
+                        ti1.mtime = int(now.timestamp())
+                        tf.addfile(ti1, io.BytesIO(meta_bytes))
 
-                    ti2 = tarfile.TarInfo(name=f"{slug}/sample_output.txt")
-                    ti2.size = len(sample_bytes)
-                    ti2.mtime = int(now.timestamp())
-                    tf.addfile(ti2, io.BytesIO(sample_bytes))
+                        ti2 = tarfile.TarInfo(name=f"{slug}/sample_output.txt")
+                        ti2.size = len(sample_bytes)
+                        ti2.mtime = int(now.timestamp())
+                        tf.addfile(ti2, io.BytesIO(sample_bytes))
+                    _replace_atomic(tmp_arc, arc_path)
+                except BaseException:
+                    tmp_arc.unlink(missing_ok=True)
+                    raise
 
                 updated_items.append(
                     KeptArtifactInfo(
@@ -1628,11 +1797,13 @@ class ConsoleOrchestrator:
                         synced_at=now,
                     )
                 )
-            self._update_run(run_id, [], keep_paths=updated_items)
+            self._update_run(run_id, [], is_real=False, keep_paths=updated_items)
             return [x.model_copy(deep=True) for x in updated_items]
 
-        tok = self._get_token_for_account(run.account_id)
-        assignments = self.backend.list_assignments(run.account_id, tok)
+        tok = self.vault.get_account_token(run.account_id)
+        if not tok:
+            raise ColabBackendError("missing_credential", f"No stored credential for account '{run.account_id}'.")
+        assignments = self._direct_backend.list_assignments(run.account_id, tok)
         raw = self._match_assignment_for_run(run, assignments)
         if not raw:
             raise ColabBackendError("runtime_lost", f"Runtime for '{run.session_name}' is no longer active on Colab.")
@@ -1641,7 +1812,7 @@ class ConsoleOrchestrator:
         inline_limit = 8 * 1024 * 1024
         chunk_bytes = 8 * 1024 * 1024
         fetch_code = (
-            "import base64, json, os, shutil, tarfile\n"
+            "import base64, hashlib, json, os, shutil, tarfile\n"
             f"specs = {spec_list!r}\n"
             "keep_root = os.environ.get('BOOST_KEEP_STAGE_DIR', '/root/.colab-boost/keep')\n"
             f"stage_root = os.path.join(keep_root, {run.run_id!r})\n"
@@ -1674,6 +1845,7 @@ class ConsoleOrchestrator:
             "    b64 = ''\n"
             "    stage_arc = ''\n"
             "    arc_bytes = 0\n"
+            "    arc_sha = ''\n"
             "    err_msg = ''\n"
             "    ds = bool(drive_map.get(p, False))\n"
             "    exists = os.path.lexists(p)\n"
@@ -1700,6 +1872,11 @@ class ConsoleOrchestrator:
             "                tf.add(p, arcname=os.path.basename(p.rstrip('/')) or slug, recursive=True, filter=_tar_filter)\n"
             "            os.replace(tmp_arc, stage_arc)\n"
             "            arc_bytes = os.path.getsize(stage_arc)\n"
+            "            h = hashlib.sha256()\n"
+            "            with open(stage_arc, 'rb') as hfh:\n"
+            "                for blk in iter(lambda: hfh.read(4 * 1024 * 1024), b''):\n"
+            "                    h.update(blk)\n"
+            "            arc_sha = h.hexdigest()\n"
             "            if has_drive:\n"
             "                try:\n"
             "                    shutil.copy2(stage_arc, os.path.join(drive_root, slug + '.tar.gz'))\n"
@@ -1713,10 +1890,10 @@ class ConsoleOrchestrator:
             "            try: os.remove(tmp_arc)\n"
             "            except OSError: pass\n"
             "            err_msg = str(exc)\n"
-            "    results.append({'path': p, 'slug': slug, 'exists': exists, 'file_count': fc, 'total_bytes': tb, 'b64': b64, 'stage_archive': stage_arc, 'archive_bytes': arc_bytes, 'drive_synced': ds, 'error': err_msg})\n"
+            "    results.append({'path': p, 'slug': slug, 'exists': exists, 'file_count': fc, 'total_bytes': tb, 'b64': b64, 'stage_archive': stage_arc, 'archive_bytes': arc_bytes, 'archive_sha256': arc_sha, 'drive_synced': ds, 'error': err_msg})\n"
             f"print({RESULT_MARKER!r} + json.dumps({{'items': results}}), flush=True)\n"
         )
-        res = self.backend.execute_python(raw, fetch_code, timeout_s=120.0)
+        res = self._direct_backend.execute_python(raw, fetch_code, timeout_s=120.0)
         if not res.ok or not res.marker_json:
             raise ColabBackendError("keep_sync_failed", f"Failed to archive keep paths from VM: {res.stderr[:200]}")
 
@@ -1730,21 +1907,33 @@ class ConsoleOrchestrator:
             if ritem.get("error"):
                 raise ColabBackendError("keep_sync_failed", f"Failed to archive {kp.path!r}: {ritem['error']}")
             arc_path = dest_dir / f"{slug}.tar.gz"
-            tmp_local = dest_dir / f"{slug}.tar.gz.tmp"
+            fd, tmp_name = tempfile.mkstemp(dir=str(dest_dir), prefix=f".{slug}.", suffix=".tmp")
+            os.close(fd)
+            tmp_local = Path(tmp_name)
             local_arc_str = kp.local_archive
             synced_now = False
             b64_data = str(ritem.get("b64") or "")
             stage_arc = str(ritem.get("stage_archive") or "")
             arc_bytes = int(ritem.get("archive_bytes") or 0)
-            if b64_data:
-                tmp_local.write_bytes(base64.b64decode(b64_data))
-                tmp_local.replace(arc_path)
-                local_arc_str = str(arc_path)
-                synced_now = True
-            elif stage_arc and arc_bytes > 0:
-                # Stream multi-chunk archive (> 8 MiB / > 48 MiB) safely without single-frame OOM or extra SSH slots
-                written = 0
-                try:
+            expected_sha = str(ritem.get("archive_sha256") or "")
+            try:
+                if b64_data:
+                    decoded = base64.b64decode(b64_data)
+                    if expected_sha:
+                        actual_sha = hashlib.sha256(decoded).hexdigest()
+                        if actual_sha != expected_sha:
+                            raise ColabBackendError(
+                                "keep_sync_failed",
+                                f"Archive SHA256 mismatch for {kp.path!r}: local={actual_sha[:12]} != remote={expected_sha[:12]}",
+                            )
+                    tmp_local.write_bytes(decoded)
+                    _replace_atomic(tmp_local, arc_path)
+                    local_arc_str = str(arc_path)
+                    synced_now = True
+                elif stage_arc and arc_bytes > 0:
+                    # Stream multi-chunk archive (> 8 MiB / > 48 MiB) safely without single-frame OOM or extra SSH slots
+                    written = 0
+                    local_hasher = hashlib.sha256()
                     with open(tmp_local, "wb") as out_fh:
                         while written < arc_bytes:
                             chunk_code = (
@@ -1754,7 +1943,7 @@ class ConsoleOrchestrator:
                                 f"    data = fh.read({chunk_bytes})\n"
                                 f"print({RESULT_MARKER!r} + json.dumps({{'n': len(data), 'b64': base64.b64encode(data).decode('ascii')}}), flush=True)\n"
                             )
-                            cres = self.backend.execute_python(raw, chunk_code, timeout_s=90.0)
+                            cres = self._direct_backend.execute_python(raw, chunk_code, timeout_s=90.0)
                             if not cres.ok or not cres.marker_json:
                                 raise ColabBackendError(
                                     "keep_sync_failed",
@@ -1765,24 +1954,34 @@ class ConsoleOrchestrator:
                             if not raw_chunk:
                                 break
                             out_fh.write(raw_chunk)
+                            local_hasher.update(raw_chunk)
                             written += len(raw_chunk)
                     if written != arc_bytes:
                         raise ColabBackendError(
                             "keep_sync_failed",
                             f"Incomplete archive stream for {kp.path!r} ({written}/{arc_bytes} bytes).",
                         )
-                    tmp_local.replace(arc_path)
+                    if expected_sha:
+                        actual_sha = local_hasher.hexdigest()
+                        if actual_sha != expected_sha:
+                            raise ColabBackendError(
+                                "keep_sync_failed",
+                                f"Archive SHA256 mismatch for {kp.path!r}: local={actual_sha[:12]} != remote={expected_sha[:12]}",
+                            )
+                    _replace_atomic(tmp_local, arc_path)
                     local_arc_str = str(arc_path)
                     synced_now = True
-                except BaseException:
+                elif int(ritem.get("file_count") or 0) == 0:
+                    with tarfile.open(tmp_local, "w:gz"):
+                        pass
+                    _replace_atomic(tmp_local, arc_path)
+                    local_arc_str = str(arc_path)
+                    synced_now = True
+                else:
                     tmp_local.unlink(missing_ok=True)
-                    raise
-            elif int(ritem.get("file_count") or 0) == 0:
-                with tarfile.open(tmp_local, "w:gz"):
-                    pass
-                tmp_local.replace(arc_path)
-                local_arc_str = str(arc_path)
-                synced_now = True
+            except BaseException:
+                tmp_local.unlink(missing_ok=True)
+                raise
             updated_real.append(
                 KeptArtifactInfo(
                     path=kp.path,
@@ -1794,7 +1993,7 @@ class ConsoleOrchestrator:
                     synced_at=now if synced_now else kp.synced_at,
                 )
             )
-        self._update_run(run_id, [], keep_paths=updated_real)
+        self._update_run(run_id, [], is_real=True, keep_paths=updated_real)
         return [x.model_copy(deep=True) for x in updated_real]
 
     def _collect_capability_secrets(self, manifest: RecipeManifest) -> tuple[dict[str, str], list[str]]:
@@ -1850,22 +2049,24 @@ class ConsoleOrchestrator:
         if not keep_specs:
             return (
                 "import json, os\n"
+                f"{_VM_PID_ALIVE_FN}"
                 f"d = {vm_run_dir!r}\n"
                 "ex = os.path.isdir(d)\n"
                 "st = json.load(open(d + '/status.json')) if os.path.exists(d + '/status.json') else None\n"
                 "pid = int(open(d + '/worker.pid').read().strip()) if os.path.exists(d + '/worker.pid') else 0\n"
-                "alive = bool(pid and os.path.exists(f'/proc/{pid}'))\n"
+                "alive = _pid_alive(pid)\n"
                 "lines = open(d + '/run.log', errors='replace').readlines()[-35:] if os.path.exists(d + '/run.log') else []\n"
                 f"print({RESULT_MARKER!r} + json.dumps({{'exists': ex, 'status': st, 'alive': alive, 'tail': [x.rstrip() for x in lines]}}), flush=True)\n"
             )
         kpaths = [kp.path for kp in keep_specs]
         return (
             "import json, os\n"
+            f"{_VM_PID_ALIVE_FN}"
             f"d = {vm_run_dir!r}\n"
             "ex = os.path.isdir(d)\n"
             "st = json.load(open(d + '/status.json')) if os.path.exists(d + '/status.json') else None\n"
             "pid = int(open(d + '/worker.pid').read().strip()) if os.path.exists(d + '/worker.pid') else 0\n"
-            "alive = bool(pid and os.path.exists(f'/proc/{pid}'))\n"
+            "alive = _pid_alive(pid)\n"
             "lines = open(d + '/run.log', errors='replace').readlines()[-35:] if os.path.exists(d + '/run.log') else []\n"
             "ks = {}\n"
             f"for kp in {kpaths!r}:\n"
@@ -1888,15 +2089,24 @@ class ConsoleOrchestrator:
             f"print({RESULT_MARKER!r} + json.dumps({{'exists': ex, 'status': st, 'alive': alive, 'tail': [x.rstrip() for x in lines], 'keep_stats': ks}}), flush=True)\n"
         )
 
-    def _merge_keep_stats(self, run_id: str, keep_stats: Optional[dict[str, Any]]) -> Optional[list[KeptArtifactInfo]]:
+    def _merge_keep_stats(
+        self,
+        run_id: str,
+        keep_stats: Optional[dict[str, Any]],
+        *,
+        is_real: Optional[bool] = None,
+        base_keep_paths: Optional[list[KeptArtifactInfo]] = None,
+    ) -> Optional[list[KeptArtifactInfo]]:
         if not keep_stats:
             return None
         with self._lock:
-            cur_run = self._runs_dict().get(run_id)
-            if not cur_run or not cur_run.keep_paths:
+            runs_map = self._runs_dict() if is_real is None else (self._real_runs if is_real else self._mock_runs)
+            cur_run = runs_map.get(run_id)
+            source_keep = (cur_run.keep_paths if cur_run and cur_run.keep_paths else None) or base_keep_paths
+            if not source_keep:
                 return None
             out: list[KeptArtifactInfo] = []
-            for kp in cur_run.keep_paths:
+            for kp in source_keep:
                 st = keep_stats.get(kp.path) or {}
                 cp = kp.model_copy(deep=True)
                 cp.file_count = int(st.get("file_count", cp.file_count))
@@ -1987,7 +2197,12 @@ class ConsoleOrchestrator:
             if recipe is not None:
                 _, cap_secrets = self._collect_capability_secrets(recipe.manifest)
                 if not run.keep_paths and recipe.manifest.keep:
-                    run.keep_paths = [KeptArtifactInfo(path=k.path, label=k.label) for k in recipe.manifest.keep]
+                    backfilled_keep = [KeptArtifactInfo(path=k.path, label=k.label) for k in recipe.manifest.keep]
+                    run.keep_paths = backfilled_keep
+                    with self._lock:
+                        live_run = self._real_runs.get(run.run_id)
+                        if live_run and not live_run.keep_paths:
+                            live_run.keep_paths = [kp.model_copy(deep=True) for kp in backfilled_keep]
             secrets = list(dict.fromkeys([*stored_input_secrets, *cap_secrets, *self.vault.all_known_secrets()]))
 
             if recipe is None:
@@ -2042,6 +2257,11 @@ class ConsoleOrchestrator:
             poll_snippet = self._build_poll_snippet(vm_run_dir, keep_specs)
             try:
                 pr = self._direct_backend.execute_python(raw, poll_snippet, timeout_s=25.0)
+                if not pr.ok or not isinstance(pr.marker_json, dict):
+                    raise ColabBackendError(
+                        "poll_failed",
+                        f"Worker status poll failed after restart: {(pr.stderr or pr.error_value or 'missing status marker')[:200]}",
+                    )
             except Exception:
                 if recipe is not None:
                     self._mark_real_run(run.run_id, secrets, session_endpoint=raw.endpoint)
@@ -2061,7 +2281,15 @@ class ConsoleOrchestrator:
             tail = payload.get("tail") or []
             alive = bool(payload.get("alive", False))
             exists = bool(payload.get("exists", bool(st or tail or "alive" in payload)))
-            merged_keep = self._merge_keep_stats(run.run_id, payload.get("keep_stats")) or run.keep_paths
+            merged_keep = (
+                self._merge_keep_stats(
+                    run.run_id,
+                    payload.get("keep_stats"),
+                    is_real=True,
+                    base_keep_paths=run.keep_paths,
+                )
+                or run.keep_paths
+            )
 
             if not exists or (not st and not alive):
                 self._mark_real_run(
@@ -2176,15 +2404,20 @@ class ConsoleOrchestrator:
 
     def _mark_real_run(self, run_id: str, secrets: list[str], **patch: Any) -> None:
         new_state = patch.get("state")
+        eff_secrets = list(dict.fromkeys([*secrets, *self.vault.all_known_secrets()]))
         with self._lock:
             run = self._real_runs.get(run_id)
             if not run:
                 return
+            if run.state == "cancelled" and new_state in ("provisioning", "starting", "running", "ready"):
+                return
             for k, v in patch.items():
                 if k == "message" and isinstance(v, str):
-                    v = redact_secrets(v, secrets)
+                    v = redact_secrets(v, eff_secrets)
                 elif k == "log_tail" and isinstance(v, list):
-                    v = [redact_secrets(str(line), secrets) for line in v]
+                    v = [redact_secrets(str(line), eff_secrets) for line in v]
+                elif k == "outputs" and isinstance(v, dict):
+                    v = redact_value(v, eff_secrets)
                 setattr(run, k, v)
             self._save_real_runs()
             snap = self._localize_run_copy(run)
@@ -2216,7 +2449,11 @@ class ConsoleOrchestrator:
             account_id=run.account_id,
             account_email=acc_email,
             accelerator=initial_raw.accelerator if initial_raw else recipe.manifest.provision.accelerator,
-            machine_shape=initial_raw.machine_shape if initial_raw else recipe.manifest.provision.accelerator and "STANDARD",  # type: ignore[arg-type]
+            machine_shape=(
+                initial_raw.machine_shape
+                if initial_raw
+                else (MachineShape.HIGH_RAM if recipe.manifest.provision.high_mem else MachineShape.STANDARD)
+            ),
         )
 
         def _worker() -> None:
@@ -2230,6 +2467,7 @@ class ConsoleOrchestrator:
                     cancel_ev=cancel_ev,
                     initial_raw=initial_raw,
                     use_direct_backend=True,
+                    best_effort_forward=True,
                 )
             except Exception as exc:
                 if self._shutdown_ev.is_set():
@@ -2252,24 +2490,80 @@ class ConsoleOrchestrator:
         manifest = recipe.manifest
         env_inputs, input_secrets, endpoint_ports = validate_and_build_env(manifest, req.inputs)
 
-        acc = self.active_account()
-        if not acc:
-            raise ColabBackendError("no_account", "Sign in to a Google account before deploying a model.")
+        is_real_mode = not self.backend.is_mock
+        provisioned_fresh = req.session_name is None
+
+        if req.provision is None:
+            prov_req = ProvisionRequest(
+                accelerator=manifest.provision.accelerator,
+                min_vram_mib=manifest.provision.min_vram_mib,
+                high_mem=manifest.provision.high_mem,
+            )
+        else:
+            explicit = req.provision.model_fields_set
+            eff_accel = (
+                req.provision.accelerator
+                if "accelerator" in explicit
+                else manifest.provision.accelerator
+            )
+            if "min_vram_mib" in explicit:
+                eff_min_vram = req.provision.min_vram_mib
+            elif eff_accel == manifest.provision.accelerator:
+                eff_min_vram = manifest.provision.min_vram_mib
+            else:
+                eff_min_vram = 0
+            prov_req = ProvisionRequest(
+                name=req.provision.name,
+                account_id=req.provision.account_id,
+                accelerator=eff_accel,
+                min_vram_mib=eff_min_vram,
+                high_mem=(
+                    req.provision.high_mem
+                    if "high_mem" in explicit
+                    else manifest.provision.high_mem
+                ),
+                auto_stop_minutes=req.provision.auto_stop_minutes,
+                idle_stop_minutes=req.provision.idle_stop_minutes,
+            )
+
+        bound_account_id: Optional[str] = None
+        initial_endpoint: Optional[str] = None
+        if not provisioned_fresh and req.session_name:
+            try:
+                existing_sessions = self.list_sessions(include_all_accounts=True)
+            except Exception:
+                existing_sessions = []
+            matched_sess = next(
+                (s for s in existing_sessions if s.name == req.session_name or s.endpoint == req.session_name),
+                None,
+            )
+            if matched_sess is not None:
+                bound_account_id = matched_sess.account_id
+                initial_endpoint = matched_sess.endpoint
+
+        if bound_account_id is None and prov_req.account_id:
+            with self._lock:
+                target_acc = (self._real_accounts if is_real_mode else self._mock_accounts).get(prov_req.account_id)
+            if not target_acc:
+                raise ColabBackendError("no_account", f"Unknown account '{prov_req.account_id}'.")
+            bound_account_id = target_acc.id
+
+        if bound_account_id is None:
+            acc = self.active_account()
+            if not acc:
+                raise ColabBackendError("no_account", "Sign in to a Google account before deploying a model.")
+            bound_account_id = acc.id
 
         cap_env, cap_secrets = self._collect_capability_secrets(manifest)
         all_secrets = [*input_secrets, *cap_secrets]
 
-        provisioned_fresh = req.session_name is None
-        prov_req = req.provision or ProvisionRequest(
-            accelerator=manifest.provision.accelerator,
-            min_vram_mib=manifest.provision.min_vram_mib,
-            high_mem=manifest.provision.high_mem,
-        )
         target_sess_name = req.session_name or (prov_req.name or f"boost-{manifest.id[:10]}-{uuid.uuid4().hex[:4]}")
         prov_req.name = target_sess_name
+        if provisioned_fresh and not prov_req.account_id:
+            prov_req.account_id = bound_account_id
 
         run_id = f"run-{uuid.uuid4().hex[:8]}"
-        if not self.backend.is_mock and input_secrets:
+        if is_real_mode and input_secrets:
             self.vault.set_run_secrets(run_id, input_secrets)
         cancel_ev = threading.Event()
         initial_keep = [KeptArtifactInfo(path=k.path, label=k.label) for k in manifest.keep]
@@ -2277,8 +2571,9 @@ class ConsoleOrchestrator:
             run_id=run_id,
             recipe_id=manifest.id,
             recipe_name=manifest.name,
-            account_id=acc.id,
+            account_id=bound_account_id,
             session_name=target_sess_name,
+            session_endpoint=initial_endpoint,
             provisioned_session=provisioned_fresh,
             stop_session_on_failure=req.stop_session_on_failure,
             endpoint_ports=dict(endpoint_ports),
@@ -2290,9 +2585,10 @@ class ConsoleOrchestrator:
             started_at=_utc_now(),
         )
         with self._lock:
-            self._runs_dict()[run_id] = run
+            (self._real_runs if is_real_mode else self._mock_runs)[run_id] = run
             self._run_cancels[run_id] = cancel_ev
-            self._persist_runs_if_real()
+            if is_real_mode:
+                self._save_real_runs()
         self._emit("run_updated", run.model_dump(mode="json"))
 
         worker_args = (
@@ -2306,6 +2602,7 @@ class ConsoleOrchestrator:
             endpoint_ports,
             req.stop_session_on_failure,
             cancel_ev,
+            is_real_mode,
         )
         if run_sync:
             self._execute_deployment(*worker_args)
@@ -2315,38 +2612,64 @@ class ConsoleOrchestrator:
 
     def cancel_deployment(self, run_id: str) -> DeploymentRun:
         cleaned_real = False
+        snap_payload: Optional[dict[str, Any]] = None
         with self._lock:
             ev = self._run_cancels.get(run_id)
-            run = self._runs_dict().get(run_id)
+            is_real_run = run_id in self._real_runs and (not self.backend.is_mock or run_id not in self._mock_runs)
+            runs_map = self._real_runs if is_real_run else self._mock_runs
+            run = runs_map.get(run_id)
             if not run:
                 raise KeyError(f"Unknown deployment run: {run_id}")
             if ev:
                 ev.set()
             if run.state in ("provisioning", "starting", "running"):
                 run.state = "cancelled"
-                run.message = "Cancelling deployment..."
-                self._persist_runs_if_real()
-                cleaned_real = not self.backend.is_mock and ev is None
+                if ev is None:
+                    run.message = "Cancelled by user."
+                    run.finished_at = _utc_now()
+                else:
+                    run.message = "Cancelling deployment..."
+                if is_real_run:
+                    self._save_real_runs()
+                snap_payload = self._localize_run_copy(run).model_dump(mode="json")
+                cleaned_real = is_real_run and ev is None
+            result = self._localize_run_copy(run)
         if cleaned_real:
             self.vault.delete_run_secrets(run_id)
-        return self.get_run(run_id)
+        if snap_payload is not None:
+            self._emit("run_updated", snap_payload)
+        return result
 
-    def _update_run(self, run_id: str, secrets: list[str], **patch: Any) -> None:
+    def _update_run(
+        self,
+        run_id: str,
+        secrets: list[str],
+        *,
+        is_real: Optional[bool] = None,
+        **patch: Any,
+    ) -> None:
         new_state = patch.get("state")
-        is_real = not self.backend.is_mock
+        eff_real = (not self.backend.is_mock) if is_real is None else is_real
+        eff_secrets = list(dict.fromkeys([*secrets, *self.vault.all_known_secrets()]))
         with self._lock:
-            run = self._runs_dict().get(run_id)
+            runs_map = self._real_runs if eff_real else self._mock_runs
+            run = runs_map.get(run_id)
             if not run:
+                return
+            if run.state == "cancelled" and new_state in ("provisioning", "starting", "running", "ready"):
                 return
             for k, v in patch.items():
                 if k == "message" and isinstance(v, str):
-                    v = redact_secrets(v, secrets)
+                    v = redact_secrets(v, eff_secrets)
                 elif k == "log_tail" and isinstance(v, list):
-                    v = [redact_secrets(str(line), secrets) for line in v]
+                    v = [redact_secrets(str(line), eff_secrets) for line in v]
+                elif k == "outputs" and isinstance(v, dict):
+                    v = redact_value(v, eff_secrets)
                 setattr(run, k, v)
-            self._persist_runs_if_real()
+            if eff_real:
+                self._save_real_runs()
             snap = self._localize_run_copy(run)
-        if is_real and new_state in ("ready", "failed", "cancelled"):
+        if eff_real and new_state in ("ready", "failed", "cancelled"):
             self.vault.delete_run_secrets(run_id)
         self._emit("run_updated", snap.model_dump(mode="json"))
 
@@ -2362,6 +2685,7 @@ class ConsoleOrchestrator:
         endpoint_ports: dict[str, int],
         stop_on_failure: bool,
         cancel_ev: threading.Event,
+        is_real_mode: bool = False,
     ) -> None:
         manifest = recipe.manifest
         session_info: Optional[SessionInfo] = None
@@ -2370,6 +2694,7 @@ class ConsoleOrchestrator:
                 self._update_run(
                     run_id,
                     secrets,
+                    is_real=is_real_mode,
                     state="cancelled",
                     message="Deployment cancelled before provisioning; 0 VMs billed.",
                     finished_at=_utc_now(),
@@ -2380,19 +2705,36 @@ class ConsoleOrchestrator:
                 session_info = self.provision_session(prov_req, cancel_ev=cancel_ev)
             else:
                 sessions = self.list_sessions(include_all_accounts=True)
-                session_info = next((s for s in sessions if s.name == prov_req.name), None)
+                session_info = next(
+                    (s for s in sessions if s.name == prov_req.name or s.endpoint == prov_req.name),
+                    None,
+                )
                 if not session_info:
                     raise ColabBackendError("session_missing", f"Session '{prov_req.name}' not found.")
 
-            self._update_run(run_id, secrets, session_endpoint=session_info.endpoint)
+            self._update_run(
+                run_id,
+                secrets,
+                is_real=is_real_mode,
+                session_endpoint=session_info.endpoint,
+                session_name=session_info.name,
+                account_id=session_info.account_id,
+            )
 
             if cancel_ev.is_set():
                 if provisioned_fresh and session_info:
                     self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_cancelled")
-                self._update_run(run_id, secrets, state="cancelled", message="Deployment cancelled; runtime released.", finished_at=_utc_now())
+                self._update_run(
+                    run_id,
+                    secrets,
+                    is_real=is_real_mode,
+                    state="cancelled",
+                    message="Deployment cancelled; runtime released.",
+                    finished_at=_utc_now(),
+                )
                 return
 
-            if self.backend.is_mock:
+            if not is_real_mode:
                 self._simulate_mock_deployment(run_id, manifest, session_info, env_inputs, secrets, endpoint_ports, cancel_ev)
             else:
                 self._drive_real_deployment(
@@ -2407,7 +2749,7 @@ class ConsoleOrchestrator:
                 except Exception:
                     pass
             state = "cancelled" if cancel_ev.is_set() else "failed"
-            self._update_run(run_id, secrets, state=state, message=str(exc), finished_at=_utc_now())
+            self._update_run(run_id, secrets, is_real=is_real_mode, state=state, message=str(exc), finished_at=_utc_now())
         finally:
             with self._lock:
                 self._run_cancels.pop(run_id, None)
@@ -2427,7 +2769,13 @@ class ConsoleOrchestrator:
         ]
         if manifest.keep:
             self._configure_vm_keep_hooks(
-                None, session_info.endpoint, session_info.name, session_info.account_id, run_id, manifest.keep
+                None,
+                session_info.endpoint,
+                session_info.name,
+                session_info.account_id,
+                run_id,
+                manifest.keep,
+                is_real=False,
             )
             joined_keep = ", ".join(kp.path for kp in manifest.keep)
             logs.append(f"[colab-boost] Armed [[keep]] wind-down preservation for: {joined_keep}")
@@ -2436,11 +2784,16 @@ class ConsoleOrchestrator:
         total = max(1, len(stages))
         repo = env_inputs.get("BOOST_INPUT_REPO") or env_inputs.get("BOOST_INPUT_MODEL_SIZE") or manifest.id
 
+        def _was_provisioned_mock() -> bool:
+            with self._lock:
+                r = self._mock_runs.get(run_id)
+                return bool(r and r.provisioned_session)
+
         for idx, st in enumerate(stages):
             if cancel_ev.is_set():
-                if self.get_run(run_id).provisioned_session:
+                if _was_provisioned_mock():
                     self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_cancelled")
-                self._update_run(run_id, secrets, state="cancelled", message="Cancelled by user; runtime stopped.", finished_at=_utc_now())
+                self._update_run(run_id, secrets, is_real=False, state="cancelled", message="Cancelled by user; runtime stopped.", finished_at=_utc_now())
                 return
             frac = round((idx + 0.5) / total, 2)
             label_en = st.label.get("en") or st.id
@@ -2448,6 +2801,7 @@ class ConsoleOrchestrator:
             self._update_run(
                 run_id,
                 secrets,
+                is_real=False,
                 state="running",
                 stage=st.id,
                 progress=frac,
@@ -2455,10 +2809,16 @@ class ConsoleOrchestrator:
                 log_tail=list(logs[-40:]),
             )
             if cancel_ev.wait(self.mock_step_delay_s):
-                if self.get_run(run_id).provisioned_session:
+                if _was_provisioned_mock():
                     self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_cancelled")
-                self._update_run(run_id, secrets, state="cancelled", message="Cancelled by user; runtime stopped.", finished_at=_utc_now())
+                self._update_run(run_id, secrets, is_real=False, state="cancelled", message="Cancelled by user; runtime stopped.", finished_at=_utc_now())
                 return
+
+        if cancel_ev.is_set():
+            if _was_provisioned_mock():
+                self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_cancelled")
+            self._update_run(run_id, secrets, is_real=False, state="cancelled", message="Cancelled by user; runtime stopped.", finished_at=_utc_now())
+            return
 
         model_alias = str(repo).rsplit("/", 1)[-1].lower().replace("-gguf", "")
         chosen_quant = env_inputs.get("BOOST_INPUT_QUANT", "Q8_0" if (session_info.vram_total_mib or 0) >= 70000 else "Q6_K")
@@ -2489,6 +2849,7 @@ class ConsoleOrchestrator:
         self._update_run(
             run_id,
             secrets,
+            is_real=False,
             state="ready",
             stage=stages[-1].id if stages else "ready",
             progress=1.0,
@@ -2511,8 +2872,10 @@ class ConsoleOrchestrator:
         endpoint_ports: dict[str, int],
         cancel_ev: threading.Event,
     ) -> None:
-        tok_init = self._get_token_for_account(session_info.account_id)
-        items_init = self.backend.list_assignments(session_info.account_id, tok_init)
+        tok_init = self.vault.get_account_token(session_info.account_id)
+        if not tok_init:
+            raise ColabBackendError("missing_credential", f"No stored credential for account '{session_info.account_id}'.")
+        items_init = self._direct_backend.list_assignments(session_info.account_id, tok_init)
         raw = next((a for a in items_init if a.endpoint == session_info.endpoint), None)
         if not raw:
             raise ColabBackendError("runtime_lost", f"Runtime {session_info.endpoint} vanished.")
@@ -2525,6 +2888,7 @@ class ConsoleOrchestrator:
                 session_info.account_id,
                 run_id,
                 recipe.manifest.keep,
+                is_real=True,
             )
 
         vm_run_dir = f"/root/.colab-boost/runs/{run_id}"
@@ -2553,7 +2917,7 @@ class ConsoleOrchestrator:
             "open(run_dir + '/worker.pid', 'w').write(str(p.pid))\n"
             f"print({RESULT_MARKER!r} + json.dumps({{'pid': p.pid}}), flush=True)\n"
         )
-        res = self.backend.execute_python(raw, launch_code, env=worker_env, timeout_s=30.0)
+        res = self._direct_backend.execute_python(raw, launch_code, env=worker_env, timeout_s=30.0)
         if not res.ok or not res.marker_json:
             raise ColabBackendError("worker_launch_failed", f"Failed to start worker on VM: {res.stderr[:240]}")
 
@@ -2565,7 +2929,8 @@ class ConsoleOrchestrator:
             endpoint_ports=endpoint_ports,
             cancel_ev=cancel_ev,
             initial_raw=raw,
-            use_direct_backend=False,
+            use_direct_backend=True,
+            best_effort_forward=False,
         )
 
     def _poll_real_deployment_loop(
@@ -2578,13 +2943,24 @@ class ConsoleOrchestrator:
         endpoint_ports: dict[str, int],
         cancel_ev: threading.Event,
         initial_raw: Optional[RawAssignment],
-        use_direct_backend: bool = False,
+        use_direct_backend: bool = True,
+        best_effort_forward: Optional[bool] = None,
     ) -> None:
         be = self._direct_backend if use_direct_backend else self.backend
-        update_fn = self._mark_real_run if use_direct_backend else self._update_run
+        eff_best_effort = use_direct_backend if best_effort_forward is None else best_effort_forward
+
+        def _update(rid: str, sec: list[str], **kw: Any) -> None:
+            if use_direct_backend:
+                self._mark_real_run(rid, sec, **kw)
+            else:
+                self._update_run(rid, sec, **kw)
 
         def fetch_fresh_assignment() -> RawAssignment:
-            tok_now = self.vault.get_account_token(session_info.account_id) if use_direct_backend else self._get_token_for_account(session_info.account_id)
+            tok_now = (
+                self.vault.get_account_token(session_info.account_id)
+                if use_direct_backend
+                else self._get_token_for_account(session_info.account_id)
+            )
             if not tok_now:
                 raise ColabBackendError("missing_credential", f"No credential for '{session_info.account_id}'.")
             items = be.list_assignments(session_info.account_id, tok_now)
@@ -2599,30 +2975,33 @@ class ConsoleOrchestrator:
         vm_run_dir = f"/root/.colab-boost/runs/{run_id}"
         poll_snippet = self._build_poll_snippet(vm_run_dir, recipe.manifest.keep)
 
+        def _finish_cancelled() -> None:
+            kill_code = (
+                "import os, signal\n"
+                f"pfile = {vm_run_dir!r} + '/worker.pid'\n"
+                "if os.path.exists(pfile):\n"
+                "    pid = int(open(pfile).read().strip())\n"
+                "    try: os.killpg(pid, signal.SIGTERM)\n"
+                "    except OSError: pass\n"
+            )
+            try:
+                be.execute_python(raw, kill_code, timeout_s=15.0)
+            except Exception:
+                pass
+            with self._lock:
+                r_obj = (self._real_runs if use_direct_backend else self._runs_dict()).get(run_id)
+                was_provisioned = bool(r_obj and r_obj.provisioned_session)
+            if was_provisioned:
+                try:
+                    self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_cancelled")
+                except Exception:
+                    pass
+            _update(run_id, secrets, state="cancelled", message="Cancelled by user.", finished_at=_utc_now())
+
         consecutive_poll_errors = 0
         while not self._shutdown_ev.is_set():
             if cancel_ev.wait(6.0):
-                kill_code = (
-                    "import os, signal\n"
-                    f"pfile = {vm_run_dir!r} + '/worker.pid'\n"
-                    "if os.path.exists(pfile):\n"
-                    "    pid = int(open(pfile).read().strip())\n"
-                    "    try: os.killpg(pid, signal.SIGTERM)\n"
-                    "    except OSError: pass\n"
-                )
-                try:
-                    be.execute_python(raw, kill_code, timeout_s=15.0)
-                except Exception:
-                    pass
-                with self._lock:
-                    r_obj = (self._real_runs if use_direct_backend else self._runs_dict()).get(run_id)
-                    was_provisioned = bool(r_obj and r_obj.provisioned_session)
-                if was_provisioned:
-                    try:
-                        self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_cancelled")
-                    except Exception:
-                        pass
-                update_fn(run_id, secrets, state="cancelled", message="Cancelled by user.", finished_at=_utc_now())
+                _finish_cancelled()
                 return
 
             if self._shutdown_ev.is_set():
@@ -2639,8 +3018,16 @@ class ConsoleOrchestrator:
 
             try:
                 pr = be.execute_python(raw, poll_snippet, timeout_s=25.0)
+                if not pr.ok or not isinstance(pr.marker_json, dict):
+                    raise ColabBackendError(
+                        "poll_failed",
+                        f"Worker status poll failed: {(pr.stderr or pr.error_value or 'missing status marker')[:200]}",
+                    )
                 consecutive_poll_errors = 0
             except Exception:
+                if cancel_ev.is_set():
+                    _finish_cancelled()
+                    return
                 consecutive_poll_errors += 1
                 if consecutive_poll_errors >= 3:
                     raise
@@ -2652,11 +3039,19 @@ class ConsoleOrchestrator:
                         raise
                 continue
 
+            if cancel_ev.is_set():
+                _finish_cancelled()
+                return
+
             payload = pr.marker_json or {}
             st = payload.get("status") or {}
             tail = payload.get("tail") or []
-            alive = bool(payload.get("alive", True))
-            merged_keep = self._merge_keep_stats(run_id, payload.get("keep_stats"))
+            alive = bool(payload.get("alive", False))
+            merged_keep = self._merge_keep_stats(
+                run_id,
+                payload.get("keep_stats"),
+                is_real=True if use_direct_backend else None,
+            )
 
             state = str(st.get("state") or "starting")
             stage = str(st.get("stage") or "")
@@ -2671,12 +3066,12 @@ class ConsoleOrchestrator:
                         recipe.manifest,
                         session_info.name,
                         endpoint_ports,
-                        best_effort=use_direct_backend,
+                        best_effort=eff_best_effort,
                     )
                 extra_ready: dict[str, Any] = {}
                 if merged_keep is not None:
                     extra_ready["keep_paths"] = merged_keep
-                update_fn(
+                _update(
                     run_id,
                     secrets,
                     state="ready",
@@ -2697,7 +3092,7 @@ class ConsoleOrchestrator:
             extra_run: dict[str, Any] = {}
             if merged_keep is not None:
                 extra_run["keep_paths"] = merged_keep
-            update_fn(
+            _update(
                 run_id,
                 secrets,
                 state="running",
@@ -2835,16 +3230,23 @@ class ConsoleOrchestrator:
                 "stderr": redact_secrets(res.stderr, secrets),
                 "error_name": res.error_name,
                 "error_value": redact_secrets(res.error_value or "", secrets) if res.error_value else None,
-                "marker_json": res.marker_json,
+                "marker_json": redact_value(res.marker_json, secrets),
             }
 
         if shell:
+            remote_timeout = max(1.0, float(timeout_s))
             wrapper = (
                 "import json, subprocess\n"
-                f"p = subprocess.run(['bash', '-lc', {code!r}], capture_output=True, text=True)\n"
-                f"print({RESULT_MARKER!r} + json.dumps({{'returncode': p.returncode, 'stdout': p.stdout, 'stderr': p.stderr}}), flush=True)\n"
+                "try:\n"
+                f"    p = subprocess.run(['bash', '-lc', {code!r}], capture_output=True, text=True, timeout={remote_timeout!r})\n"
+                f"    print({RESULT_MARKER!r} + json.dumps({{'returncode': p.returncode, 'stdout': p.stdout, 'stderr': p.stderr, 'timed_out': False}}), flush=True)\n"
+                "except subprocess.TimeoutExpired as exc:\n"
+                "    out_t = exc.stdout.decode('utf-8', errors='replace') if isinstance(exc.stdout, bytes) else (exc.stdout or '')\n"
+                "    err_t = exc.stderr.decode('utf-8', errors='replace') if isinstance(exc.stderr, bytes) else (exc.stderr or '')\n"
+                f"    err_t = (err_t + '\\n' if err_t else '') + 'Command timed out after {remote_timeout:g}s'\n"
+                f"    print({RESULT_MARKER!r} + json.dumps({{'returncode': 124, 'stdout': out_t, 'stderr': err_t, 'timed_out': True}}), flush=True)\n"
             )
-            res = self.backend.execute_python(raw, wrapper, env=env, timeout_s=timeout_s)
+            res = self.backend.execute_python(raw, wrapper, env=env, timeout_s=remote_timeout + 5.0)
             m = res.marker_json or {}
             rc = int(m.get("returncode", 0 if res.ok else 1))
             out_s = str(m.get("stdout", res.stdout))
@@ -2873,7 +3275,7 @@ class ConsoleOrchestrator:
             "stderr": redact_secrets(res.stderr, secrets),
             "error_name": res.error_name,
             "error_value": redact_secrets(res.error_value or "", secrets) if res.error_value else None,
-            "marker_json": res.marker_json,
+            "marker_json": redact_value(res.marker_json, secrets),
         }
 
     def upload_to_session(
@@ -2885,29 +3287,49 @@ class ConsoleOrchestrator:
         content_b64: Optional[str] = None,
         chunk_bytes: int = 4 * 1024 * 1024,
     ) -> dict[str, Any]:
-        """Uploads a local file (or base64 payload) directly to an active Colab VM with SHA256 verification."""
+        """Uploads a local file (or base64 payload) directly to an active Colab VM with streaming SHA256 verification."""
+        if isinstance(chunk_bytes, bool) or chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be a positive integer")
         rpath = self._validate_remote_path(remote_path)
         if bool(local_path) == bool(content_b64 is not None):
             raise ValueError("Provide exactly one of 'local_path' or 'content_b64'")
 
         validated_src: Optional[Path] = self._validate_local_path(local_path, mode="read") if local_path else None
         target, raw = self._resolve_session_and_assignment(identifier)
+        decoded_inline: Optional[bytes] = None
         if validated_src is not None:
             if not validated_src.is_file():
                 raise KeyError(f"Local file not found: {validated_src}")
-            data_bytes = validated_src.read_bytes()
         else:
             try:
-                data_bytes = base64.b64decode(content_b64 or "", validate=True)
+                decoded_inline = base64.b64decode(content_b64 or "", validate=True)
             except Exception as exc:
                 raise ValueError(f"Invalid base64 payload: {exc}") from exc
 
-        total_bytes = len(data_bytes)
-        expected_sha = hashlib.sha256(data_bytes).hexdigest()
-        total_chunks = max(1, (total_bytes + chunk_bytes - 1) // chunk_bytes)
-
         if self.backend.is_mock:
-            self._mock_backend.put_mock_file(target.endpoint, rpath, data_bytes)
+            if validated_src is not None:
+                hasher = hashlib.sha256()
+                buf = bytearray()
+                chunks_read = 0
+                with open(validated_src, "rb") as src_fh:
+                    while True:
+                        blk = src_fh.read(chunk_bytes)
+                        if not blk:
+                            break
+                        hasher.update(blk)
+                        buf.extend(blk)
+                        chunks_read += 1
+                mock_bytes = bytes(buf)
+                total_bytes = len(mock_bytes)
+                expected_sha = hasher.hexdigest()
+                total_chunks = max(1, chunks_read)
+            else:
+                assert decoded_inline is not None
+                mock_bytes = decoded_inline
+                total_bytes = len(mock_bytes)
+                expected_sha = hashlib.sha256(mock_bytes).hexdigest()
+                total_chunks = max(1, (total_bytes + chunk_bytes - 1) // chunk_bytes)
+            self._mock_backend.put_mock_file(target.endpoint, rpath, mock_bytes)
             return {
                 "session_name": target.name,
                 "remote_path": rpath,
@@ -2915,6 +3337,53 @@ class ConsoleOrchestrator:
                 "sha256": expected_sha,
                 "chunks": total_chunks,
             }
+
+        raw_fetched_at = time.monotonic()
+
+        def _refresh_raw() -> RawAssignment:
+            tok_now = self._get_token_for_account(target.account_id)
+            items = self.backend.list_assignments(target.account_id, tok_now)
+            found = next((a for a in items if a.endpoint == target.endpoint), None)
+            if not found:
+                raise ColabBackendError("runtime_lost", f"Runtime '{target.endpoint}' is no longer active.")
+            return found
+
+        def _maybe_refresh_token() -> None:
+            nonlocal raw, raw_fetched_at
+            refresh_after = max(60.0, float(raw.token_expires_in_seconds) - 300.0)
+            if time.monotonic() - raw_fetched_at >= refresh_after:
+                try:
+                    raw = _refresh_raw()
+                    raw_fetched_at = time.monotonic()
+                except ColabBackendError as re_exc:
+                    if re_exc.kind == "runtime_lost":
+                        raise
+                except Exception:
+                    pass
+
+        def _exec_chunk_with_retry(code_str: str, *, timeout_s: float, desc: str) -> ExecResult:
+            nonlocal raw, raw_fetched_at
+            _maybe_refresh_token()
+            last_err = ""
+            for attempt in range(3):  # initial attempt + up to 2 retries
+                try:
+                    cres = self.backend.execute_python(raw, code_str, timeout_s=timeout_s)
+                    if cres.ok:
+                        return cres
+                    last_err = (cres.stderr or cres.error_value or "remote execution error")[:200]
+                except Exception as exc:
+                    last_err = str(exc)[:200]
+                if attempt < 2:
+                    try:
+                        raw = _refresh_raw()
+                        raw_fetched_at = time.monotonic()
+                    except ColabBackendError as re_exc:
+                        if re_exc.kind == "runtime_lost":
+                            raise
+                    except Exception:
+                        pass
+                    time.sleep(0.15 * (attempt + 1))
+            raise ColabBackendError("upload_failed", f"{desc} failed: {last_err}")
 
         part_path = f"{rpath}.cboost.{uuid.uuid4().hex[:8]}.part"
         init_code = (
@@ -2928,22 +3397,45 @@ class ConsoleOrchestrator:
         if not init_res.ok:
             raise ColabBackendError("upload_failed", f"Failed to initialize remote file {rpath}: {init_res.stderr[:200]}")
 
+        hasher = hashlib.sha256()
+        total_bytes = 0
+        chunks_sent = 0
+
+        def _send_chunk(offset: int, slice_b: bytes, chunk_idx: int) -> None:
+            b64_chunk = base64.b64encode(slice_b).decode("ascii")
+            chunk_code = (
+                "import base64, json\n"
+                f"data = base64.b64decode({b64_chunk!r})\n"
+                f"with open({part_path!r}, 'r+b') as fh:\n"
+                f"    fh.seek({offset})\n"
+                "    fh.write(data)\n"
+                f"print({RESULT_MARKER!r} + json.dumps({{'written': len(data)}}), flush=True)\n"
+            )
+            _exec_chunk_with_retry(chunk_code, timeout_s=90.0, desc=f"Chunk {chunk_idx}")
+
         try:
-            for idx in range(total_chunks):
-                offset = idx * chunk_bytes
-                slice_b = data_bytes[offset : offset + chunk_bytes]
-                b64_chunk = base64.b64encode(slice_b).decode("ascii")
-                chunk_code = (
-                    "import base64, json\n"
-                    f"data = base64.b64decode({b64_chunk!r})\n"
-                    f"with open({part_path!r}, 'r+b') as fh:\n"
-                    f"    fh.seek({offset})\n"
-                    "    fh.write(data)\n"
-                    f"print({RESULT_MARKER!r} + json.dumps({{'written': len(data)}}), flush=True)\n"
-                )
-                cres = self.backend.execute_python(raw, chunk_code, timeout_s=90.0)
-                if not cres.ok:
-                    raise ColabBackendError("upload_failed", f"Chunk {idx + 1}/{total_chunks} failed: {cres.stderr[:200]}")
+            if validated_src is not None:
+                with open(validated_src, "rb") as src_fh:
+                    while True:
+                        slice_b = src_fh.read(chunk_bytes)
+                        if not slice_b:
+                            break
+                        offset = total_bytes
+                        total_bytes += len(slice_b)
+                        hasher.update(slice_b)
+                        chunks_sent += 1
+                        _send_chunk(offset, slice_b, chunks_sent)
+            else:
+                assert decoded_inline is not None
+                for offset in range(0, len(decoded_inline), chunk_bytes):
+                    slice_b = decoded_inline[offset : offset + chunk_bytes]
+                    total_bytes += len(slice_b)
+                    hasher.update(slice_b)
+                    chunks_sent += 1
+                    _send_chunk(offset, slice_b, chunks_sent)
+
+            total_chunks = max(1, chunks_sent)
+            expected_sha = hasher.hexdigest()
 
             verify_code = (
                 "import hashlib, json, os\n"
@@ -2961,6 +3453,7 @@ class ConsoleOrchestrator:
                 "os.replace(part, dst)\n"
                 f"print({RESULT_MARKER!r} + json.dumps({{'bytes': sz, 'sha256': sha}}), flush=True)\n"
             )
+            _maybe_refresh_token()
             vres = self.backend.execute_python(raw, verify_code, timeout_s=90.0)
             if not vres.ok:
                 raise ColabBackendError("upload_failed", f"Remote verification failed for {rpath}: {vres.stderr[:200]}")
@@ -2992,6 +3485,8 @@ class ConsoleOrchestrator:
         chunk_bytes: int = 4 * 1024 * 1024,
     ) -> dict[str, Any]:
         """Downloads a remote file from an active Colab VM with chunked SHA256 verification."""
+        if isinstance(chunk_bytes, bool) or chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be a positive integer")
         rpath = self._validate_remote_path(remote_path)
         validated_dst: Optional[Path] = self._validate_local_path(local_path, mode="write") if local_path else None
         target, raw = self._resolve_session_and_assignment(identifier)
@@ -3001,15 +3496,24 @@ class ConsoleOrchestrator:
             sha = hashlib.sha256(raw_bytes).hexdigest()
             chunks = max(1, (len(raw_bytes) + chunk_bytes - 1) // chunk_bytes)
             if validated_dst is not None:
-                dst = validated_dst
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                tmp = dst.with_name(dst.name + ".tmp")
-                tmp.write_bytes(raw_bytes)
-                tmp.replace(dst)
+                validated_dst.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=str(validated_dst.parent),
+                    prefix=f".{validated_dst.name}.",
+                    suffix=".tmp",
+                )
+                os.close(fd)
+                tmp_mock = Path(tmp_name)
+                try:
+                    tmp_mock.write_bytes(raw_bytes)
+                    _replace_atomic(tmp_mock, validated_dst)
+                except BaseException:
+                    tmp_mock.unlink(missing_ok=True)
+                    raise
                 return {
                     "session_name": target.name,
                     "remote_path": rpath,
-                    "local_path": str(dst),
+                    "local_path": str(validated_dst),
                     "bytes": len(raw_bytes),
                     "sha256": sha,
                     "chunks": chunks,
@@ -3055,12 +3559,17 @@ class ConsoleOrchestrator:
         received = 0
         chunks_buf: list[bytes] = []
 
-        dst: Optional[Path] = None
+        dst_path: Optional[Path] = validated_dst
         tmp_path: Optional[Path] = None
-        if validated_dst is not None:
-            dst = validated_dst
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = dst.with_name(dst.name + f".{uuid.uuid4().hex[:6]}.tmp")
+        if dst_path is not None:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(dst_path.parent),
+                prefix=f".{dst_path.name}.",
+                suffix=".tmp",
+            )
+            os.close(fd)
+            tmp_path = Path(tmp_name)
 
         try:
             fh = tmp_path.open("wb") if tmp_path is not None else None
@@ -3094,12 +3603,12 @@ class ConsoleOrchestrator:
                     "download_failed",
                     f"Download integrity mismatch for {rpath}: bytes={received}/{total_bytes} sha={actual_sha[:12]}!={expected_sha[:12]}",
                 )
-            if tmp_path is not None and dst is not None:
-                tmp_path.replace(dst)
+            if tmp_path is not None and dst_path is not None:
+                _replace_atomic(tmp_path, dst_path)
                 return {
                     "session_name": target.name,
                     "remote_path": rpath,
-                    "local_path": str(dst),
+                    "local_path": str(dst_path),
                     "bytes": total_bytes,
                     "sha256": actual_sha,
                     "chunks": total_chunks,

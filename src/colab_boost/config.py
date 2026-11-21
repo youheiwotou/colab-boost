@@ -5,9 +5,77 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
+import tempfile
+import time
+from typing import Callable, Optional
 
 from colab_boost.models import AppSettings
+
+
+def _replace_atomic(src: Path, dst: Path) -> None:
+    """Replaces ``dst`` with ``src``, retrying brief Windows sharing-violation PermissionError."""
+    attempts = 6 if os.name == "nt" else 1
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt >= attempts - 1:
+                raise
+            time.sleep(0.015 * (attempt + 1))
+
+
+def atomic_write_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    chmod_mode: Optional[int] = None,
+    prepare_tmp: Optional[Callable[[Path], None]] = None,
+) -> None:
+    """Writes bytes via a unique same-directory temp file and atomic ``os.replace``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        os.close(fd)
+        if chmod_mode is not None:
+            try:
+                os.chmod(tmp_path, chmod_mode)
+            except OSError:
+                pass
+        if prepare_tmp is not None:
+            prepare_tmp(tmp_path)
+        with open(tmp_path, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+        _replace_atomic(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(
+    path: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    chmod_mode: Optional[int] = None,
+    prepare_tmp: Optional[Callable[[Path], None]] = None,
+) -> None:
+    """Writes UTF-8 text via a unique same-directory temp file and atomic ``os.replace``."""
+    atomic_write_bytes(
+        path,
+        content.encode(encoding),
+        chmod_mode=chmod_mode,
+        prepare_tmp=prepare_tmp,
+    )
 
 
 def project_root() -> Path:
@@ -72,10 +140,9 @@ class SettingsStore:
 
     def save(self, settings: AppSettings) -> AppSettings:
         self.paths.ensure_dirs()
-        tmp = self.paths.settings_file.with_suffix(".json.tmp")
-        tmp.write_text(
+        atomic_write_text(
+            self.paths.settings_file,
             json.dumps(settings.model_dump(mode="json"), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        tmp.replace(self.paths.settings_file)
         return settings

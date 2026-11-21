@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class BackendMode(str, Enum):
@@ -174,6 +174,21 @@ class ProvisionRequest(BaseModel):
     min_vram_mib: int = Field(default=0, ge=0, le=163840)
     auto_stop_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
     idle_stop_minutes: Optional[int] = Field(default=None, ge=0, le=720)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        if len(v) > 64:
+            raise ValueError("Session name must be at most 64 characters.")
+        if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in v):
+            raise ValueError("Session name must not contain whitespace or control characters.")
+        if any(bad in v for bad in ("/", "\\", "..", "?", "#")):
+            raise ValueError("Session name must not contain '/', '\\\\', '..', '?', or '#'.")
+        if v in (".", ".."):
+            raise ValueError("Session name must not be '.' or '..'.")
+        return v
 
 
 class ProvisionOperation(BaseModel):

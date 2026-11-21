@@ -1438,3 +1438,241 @@ def test_reconcile_real_runs_redacts_vault_run_secrets_and_restores_ready_tunnel
             assert r_old.endpoints[0].status == "closed"
         finally:
             orch2.shutdown()
+
+
+def test_real_poll_error_cancel_race_mode_switch_reconcile_keep_stats_and_keep_sha256(tmp_path: Path) -> None:
+    """Proves poll pr.ok=False does not clobber state, cancel beats in-flight poll, mode switch isolates real runs, reconcile merges keep_stats, and keep sync checks SHA256."""
+    from datetime import datetime, timezone
+
+    # Part A: pr.ok=False retry without clobbering state + mode switch isolation
+    poll_step = [0]
+
+    class PollEdgeDirect(MockColabBackend):
+        @property
+        def is_mock(self) -> bool:
+            return False
+
+        def execute_python(self, assignment: RawAssignment, code: str, *, env=None, timeout_s: float = 45.0) -> ExecResult:
+            if "nvidia-smi" in code:
+                return ExecResult(
+                    ok=True,
+                    marker_json={"gpu_name": "NVIDIA L4", "vram_total_mib": 23034, "vram_used_mib": 100, "gpu_util_percent": 1.0, "runtime_addr": "127.0.0.1:9000"},
+                )
+            if "watchdog.py" in code or ("worker.pid" in code and "Popen" in code) or "existing_hooks" in code:
+                return ExecResult(ok=True, marker_json={"pid": 8888, "hooks_count": 1})
+            poll_step[0] += 1
+            if poll_step[0] == 1:
+                return ExecResult(
+                    ok=True,
+                    marker_json={
+                        "exists": True,
+                        "alive": True,
+                        "status": {"state": "running", "stage": "download", "progress": 0.4, "message": "Downloading model..."},
+                        "tail": ["line-1"],
+                    },
+                )
+            if poll_step[0] == 2:
+                # Transient non-raising execute failure (pr.ok=False) MUST NOT clobber stage/tail or assume alive=True
+                return ExecResult(ok=False, stderr="Kernel temporarily busy", marker_json=None)
+            return ExecResult(
+                ok=True,
+                marker_json={
+                    "exists": True,
+                    "alive": True,
+                    "status": {"state": "ready", "stage": "server", "progress": 1.0, "message": "Model live", "outputs": {"port": 8000}},
+                    "tail": ["line-1", "ready"],
+                },
+            )
+
+    paths_a = WorkspacePaths(tmp_path / "poll_edge")
+    orch_a = ConsoleOrchestrator(paths=paths_a, direct_backend=PollEdgeDirect("signed_out"), force_file_vault=True)
+    try:
+        orch_a.update_settings({"backend_mode": "real", "auto_forward_endpoints": False})
+        orch_a._register_authenticated_account("poll@studio.ai", "Poll", '{"refresh_token":"r"}')
+        with patch("threading.Event.wait", return_value=False):
+            run_a = orch_a.start_deployment(
+                DeployRequest(recipe_id="llama-cpp-gguf", inputs={"repo": "Qwen/Qwen2.5-7B-Instruct-GGUF"}),
+                run_sync=True,
+            )
+        assert poll_step[0] == 3
+        assert run_a.state == "ready"
+        assert run_a.log_tail == ["line-1", "ready"]
+    finally:
+        orch_a.shutdown()
+
+    # Part B: Cancel mid-poll broadcasts immediately & in-flight poll tick cannot flip cancelled back to running
+    in_poll = threading.Event()
+    release_poll = threading.Event()
+
+    class CancelRaceDirect(MockColabBackend):
+        @property
+        def is_mock(self) -> bool:
+            return False
+
+        def execute_python(self, assignment: RawAssignment, code: str, *, env=None, timeout_s: float = 45.0) -> ExecResult:
+            if "nvidia-smi" in code:
+                return ExecResult(
+                    ok=True,
+                    marker_json={"gpu_name": "NVIDIA L4", "vram_total_mib": 23034, "vram_used_mib": 100, "gpu_util_percent": 1.0, "runtime_addr": "127.0.0.1:9000"},
+                )
+            if "watchdog.py" in code or ("worker.pid" in code and "Popen" in code) or "os.killpg" in code:
+                return ExecResult(ok=True, marker_json={"pid": 8899})
+            in_poll.set()
+            release_poll.wait(timeout=5.0)
+            return ExecResult(
+                ok=True,
+                marker_json={
+                    "exists": True,
+                    "alive": True,
+                    "status": {"state": "running", "stage": "download", "progress": 0.5, "message": "Still downloading"},
+                    "tail": ["downloading"],
+                },
+            )
+
+    paths_b = WorkspacePaths(tmp_path / "cancel_race")
+    orch_b = ConsoleOrchestrator(paths=paths_b, direct_backend=CancelRaceDirect("signed_out"), force_file_vault=True)
+    events_b: list[dict] = []
+    orch_b.subscribe(events_b.append)
+    try:
+        orch_b.update_settings({"backend_mode": "real", "auto_forward_endpoints": False})
+        orch_b._register_authenticated_account("cancel@studio.ai", "Cancel", '{"refresh_token":"r"}')
+        orig_wait = threading.Event.wait
+
+        def fast_poll_wait(self_ev, timeout=None):
+            if timeout == 6.0:
+                return self_ev.is_set()
+            return orig_wait(self_ev, timeout)
+
+        with patch.object(threading.Event, "wait", fast_poll_wait):
+            run_b = orch_b.start_deployment(
+                DeployRequest(recipe_id="llama-cpp-gguf", inputs={"repo": "Qwen/Qwen2.5-7B-Instruct-GGUF"}),
+                run_sync=False,
+            )
+            assert in_poll.wait(timeout=4.0)
+            cancelled_snap = orch_b.cancel_deployment(run_b.run_id)
+            assert cancelled_snap.state == "cancelled"
+            # cancel_deployment must have emitted run_updated immediately
+            assert any(
+                ev["type"] == "run_updated"
+                and ev["data"].get("run_id") == run_b.run_id
+                and ev["data"].get("state") == "cancelled"
+                for ev in events_b
+            )
+            # Also switch to mock mode while real poll is finishing -> must still update _real_runs cleanly!
+            orch_b.update_settings({"backend_mode": "mock"})
+            release_poll.set()
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline and run_b.run_id in orch_b._run_cancels:
+                time.sleep(0.05)
+
+        assert orch_b._real_runs[run_b.run_id].state == "cancelled"
+        assert run_b.run_id not in orch_b._mock_runs
+    finally:
+        orch_b.shutdown()
+
+    # Part C: _reconcile_real_runs backfilling empty keep_paths merges keep_stats & reattach uses HIGH_RAM
+    captured_shapes: list[MachineShape] = []
+
+    class KeepReconcileDirect(MockColabBackend):
+        @property
+        def is_mock(self) -> bool:
+            return False
+
+        def execute_python(self, assignment: RawAssignment, code: str, *, env=None, timeout_s: float = 45.0) -> ExecResult:
+            if "base64.b64encode(raw_tar)" in code:
+                # Return a chunked archive with an expected SHA256 that does NOT match the corrupted chunk below
+                return ExecResult(
+                    ok=True,
+                    marker_json={
+                        "items": [
+                            {
+                                "path": "/content/ComfyUI/output",
+                                "slug": "content_ComfyUI_output",
+                                "exists": True,
+                                "file_count": 1,
+                                "total_bytes": 100,
+                                "b64": "",
+                                "stage_archive": "/root/.colab-boost/keep/run-keep-rec/content_ComfyUI_output.tar.gz",
+                                "archive_bytes": 16,
+                                "archive_sha256": "0" * 64,
+                                "drive_synced": False,
+                                "error": "",
+                            }
+                        ]
+                    },
+                )
+            if "fh.seek(" in code and "base64.b64encode(data)" in code:
+                import base64 as _b64
+
+                return ExecResult(ok=True, marker_json={"n": 16, "b64": _b64.b64encode(b"0123456789abcdef").decode("ascii")})
+            return ExecResult(
+                ok=True,
+                marker_json={
+                    "exists": True,
+                    "alive": True,
+                    "status": {"state": "ready", "stage": "server", "progress": 1.0, "message": "ComfyUI ready"},
+                    "tail": ["ready"],
+                    "keep_stats": {"/content/ComfyUI/output": {"file_count": 7, "total_bytes": 4096}},
+                },
+            )
+
+    paths_c = WorkspacePaths(tmp_path / "keep_reconcile")
+    fake_c = KeepReconcileDirect("signed_out")
+    orch_c1 = ConsoleOrchestrator(paths=paths_c, direct_backend=fake_c, force_file_vault=True)
+    orch_c1.update_settings({"backend_mode": "real", "auto_forward_endpoints": False})
+    acc_c = orch_c1._register_authenticated_account("keep@studio.ai", "Keep", '{"refresh_token":"r"}')
+    raw_c = fake_c.assign_runtime(acc_c.id, "{}", Accelerator.L4)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    paths_c.ledger_file.write_text(
+        json.dumps({raw_c.endpoint: {"name": "sess-keep", "account_id": acc_c.id, "created_at": now_iso}}),
+        encoding="utf-8",
+    )
+    paths_c.runs_file.write_text(
+        json.dumps(
+            [
+                {
+                    "run_id": "run-keep-rec",
+                    "recipe_id": "comfyui-studio",
+                    "recipe_name": {"en": "ComfyUI"},
+                    "account_id": acc_c.id,
+                    "session_name": "sess-keep",
+                    "session_endpoint": raw_c.endpoint,
+                    "state": "running",
+                    "stage": "server",
+                    "message": "Starting...",
+                    "keep_paths": [],
+                    "started_at": now_iso,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    orch_c1.shutdown()
+
+    orch_c2 = ConsoleOrchestrator(paths=paths_c, direct_backend=fake_c, force_file_vault=True)
+    try:
+        rec_run = orch_c2.get_run("run-keep-rec")
+        assert rec_run.state == "ready"
+        assert len(rec_run.keep_paths) == 1
+        assert rec_run.keep_paths[0].file_count == 7
+        assert rec_run.keep_paths[0].total_bytes == 4096
+
+        # Chunked keep sync must reject SHA256 mismatch
+        with pytest.raises(ColabBackendError, match="SHA256 mismatch"):
+            orch_c2.sync_keep_artifacts("run-keep-rec")
+
+        # _spawn_reattached_poller with initial_raw=None must honor recipe.manifest.provision.high_mem -> HIGH_RAM
+        h3_recipe = orch_c2.get_loaded_recipe("minimax-h3-studio")
+        assert h3_recipe.manifest.provision.high_mem is True
+
+        def spy_poll_loop(*, session_info, **_kwargs):
+            captured_shapes.append(session_info.machine_shape)
+
+        with patch.object(orch_c2, "_poll_real_deployment_loop", side_effect=spy_poll_loop):
+            orch_c2._spawn_reattached_poller(rec_run, h3_recipe, [], initial_raw=None)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not captured_shapes:
+                time.sleep(0.02)
+        assert captured_shapes == [MachineShape.HIGH_RAM]
+    finally:
+        orch_c2.shutdown()

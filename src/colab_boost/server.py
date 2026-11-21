@@ -26,7 +26,16 @@ from colab_boost.gguf_planner import (
     search_hf_gguf_repos,
     validate_hf_repo_id,
 )
-from colab_boost.models import DeployRequest, ProvisionRequest
+from colab_boost.models import (
+    ACCELERATOR_VRAM_REFERENCE_MIB,
+    APPROX_CCU_PER_HOUR,
+    GPU_ACCELERATORS,
+    HIGH_MEM_ONLY_ACCELERATORS,
+    TPU_ACCELERATORS,
+    Accelerator,
+    DeployRequest,
+    ProvisionRequest,
+)
 from colab_boost.orchestrator import ConsoleOrchestrator
 from colab_boost.recipe_loader import RecipeValidationError
 
@@ -35,6 +44,33 @@ logger = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "testserver"})
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_WS_QUEUE_MAX = 256
+_ACCELERATOR_DISPLAY_ORDER = (
+    Accelerator.G4,
+    Accelerator.A100,
+    Accelerator.H100,
+    Accelerator.L4,
+    Accelerator.T4,
+    Accelerator.V5E1,
+    Accelerator.V6E1,
+    Accelerator.NONE,
+)
+
+
+def _build_accelerator_specs() -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for acc in _ACCELERATOR_DISPLAY_ORDER:
+        kind = "gpu" if acc in GPU_ACCELERATORS else ("tpu" if acc in TPU_ACCELERATORS else "cpu")
+        specs.append(
+            {
+                "id": acc.value,
+                "kind": kind,
+                "vram_mib": list(ACCELERATOR_VRAM_REFERENCE_MIB.get(acc.value, [])),
+                "high_mem_only": acc in HIGH_MEM_ONLY_ACCELERATORS,
+                "approx_ccu_per_hour": float(APPROX_CCU_PER_HOUR.get(acc.value, 0.0)),
+            }
+        )
+    return specs
 
 
 def _extract_hostname_from_host(host_header: Optional[str]) -> Optional[str]:
@@ -214,26 +250,29 @@ def create_app(
     guard_interval_s: float = 30.0,
 ) -> FastAPI:
     orch = orchestrator or ConsoleOrchestrator()
-    ws_clients: set[WebSocket] = set()
+    ws_queues: dict[WebSocket, asyncio.Queue[Optional[dict[str, Any]]]] = {}
     loop_ref: list[Optional[asyncio.AbstractEventLoop]] = [None]
+
+    def _enqueue_on_loop(event: dict[str, Any]) -> None:
+        for q in list(ws_queues.values()):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
 
     def on_orch_event(event: dict[str, Any]) -> None:
         ev_loop = loop_ref[0]
-        if not ev_loop or not ws_clients:
+        if not ev_loop or not ws_queues:
             return
-
-        async def _broadcast() -> None:
-            dead: list[WebSocket] = []
-            for ws in list(ws_clients):
-                try:
-                    await ws.send_json(event)
-                except Exception:
-                    dead.append(ws)
-            for d in dead:
-                ws_clients.discard(d)
-
         try:
-            ev_loop.call_soon_threadsafe(lambda: asyncio.create_task(_broadcast()))
+            ev_loop.call_soon_threadsafe(_enqueue_on_loop, event)
         except RuntimeError:
             pass
 
@@ -272,7 +311,7 @@ def create_app(
             except Exception:
                 logger.exception("Error awaiting cancelled guard_monitor_loop")
             unsubscribe()
-            orch.shutdown()
+            await asyncio.to_thread(orch.shutdown)
 
     app = FastAPI(
         title="Colab Boost Console API",
@@ -340,18 +379,22 @@ def create_app(
     async def api_bootstrap() -> dict[str, Any]:
         accounts = await asyncio.to_thread(orch.list_accounts, False)
         sessions = await asyncio.to_thread(orch.list_sessions, True)
+        recipes = await asyncio.to_thread(orch.list_recipes)
+        secrets = await asyncio.to_thread(orch.vault.secret_status)
         return {
             "settings": orch.get_settings(),
             "accounts": accounts,
             "active_account": orch.active_account(),
             "sessions": sessions,
             "provision_ops": orch.list_provision_ops(),
-            "recipes": orch.list_recipes(),
+            "recipes": recipes,
             "runs": orch.list_runs(),
             "tunnels": orch.tunnels.list_tunnels(),
             "receipts": orch.list_receipts(),
-            "secrets": orch.vault.secret_status(),
+            "secrets": secrets,
             "curated_gguf_repos": list(CURATED_GGUF_CATALOG.keys()),
+            "accelerator_specs": _build_accelerator_specs(),
+            "approx_burn_rates": dict(APPROX_CCU_PER_HOUR),
         }
 
     @app.patch("/api/settings")
@@ -525,7 +568,7 @@ def create_app(
 
     @app.get("/api/recipes")
     async def api_list_recipes() -> Any:
-        return orch.list_recipes()
+        return await asyncio.to_thread(orch.list_recipes)
 
     @app.get("/api/deployments")
     async def api_list_deployments() -> Any:
@@ -584,7 +627,7 @@ def create_app(
 
     @app.get("/api/hf/search")
     async def api_hf_search(q: str = Query(default="")) -> dict[str, Any]:
-        hf_tok = orch.vault.get_secret("hf_token")
+        hf_tok = await asyncio.to_thread(orch.vault.get_secret, "hf_token")
         try:
             items = await search_hf_gguf_repos(q, hf_token=hf_tok, limit=10)
             return {"source": "huggingface", "items": items}
@@ -610,7 +653,7 @@ def create_app(
         except ValueError as exc:
             raise _map_domain_error(exc) from exc
 
-        hf_tok = orch.vault.get_secret("hf_token")
+        hf_tok = await asyncio.to_thread(orch.vault.get_secret, "hf_token")
         plan: Optional[GgufRepoPlan] = None
         source = "huggingface"
         try:
@@ -659,16 +702,18 @@ def create_app(
     @app.put("/api/secrets/{slot}")
     async def api_set_secret(slot: str, body: SecretUpdateBody) -> dict[str, Any]:
         try:
-            orch.vault.set_secret(slot, body.value)
-            return {"secrets": orch.vault.secret_status()}
+            await asyncio.to_thread(orch.vault.set_secret, slot, body.value)
+            status = await asyncio.to_thread(orch.vault.secret_status)
+            return {"secrets": status}
         except Exception as exc:
             raise _map_domain_error(exc) from exc
 
     @app.delete("/api/secrets/{slot}")
     async def api_delete_secret(slot: str) -> dict[str, Any]:
         try:
-            orch.vault.delete_secret(slot)
-            return {"secrets": orch.vault.secret_status()}
+            await asyncio.to_thread(orch.vault.delete_secret, slot)
+            status = await asyncio.to_thread(orch.vault.secret_status)
+            return {"secrets": status}
         except Exception as exc:
             raise _map_domain_error(exc) from exc
 
@@ -829,14 +874,46 @@ def create_app(
                 return
 
         await ws.accept()
-        ws_clients.add(ws)
+        q: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue(maxsize=_WS_QUEUE_MAX)
         try:
             await ws.send_json({"type": "connected", "data": {"backend_mode": orch.settings.backend_mode}})
+        except Exception:
+            return
+
+        ws_queues[ws] = q
+
+        async def _sender() -> None:
             while True:
-                await ws.receive_text()
+                item = await q.get()
+                if item is None:
+                    return
+                await ws.send_json(item)
+
+        sender_task = asyncio.create_task(_sender())
+        try:
+            while True:
+                receive_task = asyncio.create_task(ws.receive_text())
+                done, _ = await asyncio.wait(
+                    {receive_task, sender_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if receive_task in done:
+                    receive_task.result()
+                if sender_task in done:
+                    receive_task.cancel()
+                    try:
+                        await receive_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    break
         except WebSocketDisconnect:
             pass
         finally:
-            ws_clients.discard(ws)
+            ws_queues.pop(ws, None)
+            sender_task.cancel()
+            try:
+                await sender_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     return app

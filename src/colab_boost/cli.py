@@ -104,10 +104,21 @@ def _build_client_parser() -> argparse.ArgumentParser:
     p_dep.add_argument("--session", default=None, help="Reuse an existing running session name")
     p_dep.add_argument("--accel", default=None, help="Override accelerator (G4, A100, H100, L4, T4, NONE)")
     p_dep.add_argument("--min-vram", type=int, default=None, help="Minimum GPU VRAM in MiB (auto-retries smaller GPUs)")
-    p_dep.add_argument("--high-mem", action="store_true", help="Request High-RAM VM shape")
+    p_dep.add_argument(
+        "--high-mem",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override High-RAM VM shape (omit to keep recipe default)",
+    )
     p_dep.add_argument("--input", action="append", default=[], dest="inputs", help="Recipe input KEY=VALUE (repeatable)")
     p_dep.add_argument("--wait", action="store_true", help="Wait until deployment reaches ready/failed/cancelled")
     p_dep.add_argument("--poll-interval", type=float, default=3.0, help="Polling interval in seconds when --wait is set")
+    p_dep.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds to wait when --wait is set (optional)",
+    )
 
     p_ex = sub.add_parser("exec", help="Execute Python or Bash directly inside an active Colab VM")
     _add_common(p_ex)
@@ -136,6 +147,12 @@ def _build_client_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _ApiHttpError(RuntimeError):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(f"HTTP {status_code}: {message}")
+        self.status_code = status_code
+
+
 def _api_call(client: httpx.Client, method: str, path: str, **kwargs: Any) -> Any:
     token = _default_api_token()
     if token:
@@ -150,8 +167,8 @@ def _api_call(client: httpx.Client, method: str, path: str, **kwargs: Any) -> An
         payload = {"detail": resp.text}
     if not resp.is_success:
         detail = payload.get("detail") if isinstance(payload, dict) else payload
-        msg = detail.get("message") if isinstance(detail, dict) else str(detail)
-        raise RuntimeError(f"HTTP {resp.status_code}: {msg}")
+        msg = str(detail.get("message")) if isinstance(detail, dict) and detail.get("message") is not None else str(detail)
+        raise _ApiHttpError(resp.status_code, msg)
     return payload
 
 
@@ -189,16 +206,20 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
             return 0
 
         if args.cmd == "deploy":
+            if args.wait_timeout is not None and args.wait_timeout <= 0:
+                raise ValueError("--wait-timeout must be a positive number of seconds")
             inputs = _parse_kv_pairs(args.inputs)
             provision: dict[str, Any] | None = None
-            if args.session is None and (args.accel or args.min_vram is not None or args.high_mem):
+            if args.session is None and (
+                args.accel is not None or args.min_vram is not None or args.high_mem is not None
+            ):
                 provision = {}
-                if args.accel:
+                if args.accel is not None:
                     provision["accelerator"] = args.accel.upper()
                 if args.min_vram is not None:
                     provision["min_vram_mib"] = args.min_vram
-                if args.high_mem:
-                    provision["high_mem"] = True
+                if args.high_mem is not None:
+                    provision["high_mem"] = bool(args.high_mem)
             body: dict[str, Any] = {
                 "recipe_id": args.recipe_id,
                 "session_name": args.session,
@@ -208,9 +229,38 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
                 body["provision"] = provision
             run = _api_call(http, "POST", "/api/deployments", json=body)
             if args.wait:
+                wait_deadline = (
+                    (time.monotonic() + float(args.wait_timeout))
+                    if args.wait_timeout is not None
+                    else None
+                )
+                consecutive_net_errors = 0
+                max_net_retries = 5
                 while run.get("state") in ("provisioning", "starting", "running"):
-                    time.sleep(max(0.1, args.poll_interval))
-                    run = _api_call(http, "GET", f"/api/deployments/{run['run_id']}")
+                    sleep_s = max(0.1, float(args.poll_interval))
+                    if wait_deadline is not None:
+                        remaining = wait_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                f"Timed out waiting for deployment {run['run_id']} after {args.wait_timeout:g}s "
+                                f"(last state={run.get('state')})"
+                            )
+                        sleep_s = min(sleep_s, remaining)
+                    time.sleep(sleep_s)
+                    try:
+                        run = _api_call(http, "GET", f"/api/deployments/{run['run_id']}")
+                        consecutive_net_errors = 0
+                    except (httpx.TransportError, httpx.TimeoutException):
+                        consecutive_net_errors += 1
+                        if consecutive_net_errors > max_net_retries:
+                            raise
+                    except _ApiHttpError as exc:
+                        if exc.status_code in (502, 503, 504):
+                            consecutive_net_errors += 1
+                            if consecutive_net_errors > max_net_retries:
+                                raise
+                        else:
+                            raise
             if args.as_json:
                 print(json.dumps(run, indent=2, ensure_ascii=False))
             else:

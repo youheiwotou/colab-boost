@@ -319,3 +319,255 @@ def test_cli_stop_exit_codes_bearer_token_and_non_loopback_host_guard(
         sa_out = json.loads(capsys.readouterr().out)
         assert sa_out["zero_burn_verified"] is False
         assert len(sa_out["stop_errors"]) >= 1
+
+
+def test_provision_request_name_validation_rejects_traversal_and_control_chars(orchestrator: ConsoleOrchestrator) -> None:
+    from pydantic import ValidationError
+    from colab_boost.models import ProvisionRequest
+
+    invalid_names = [
+        "../escape",
+        "foo/bar",
+        "foo\\bar",
+        "a..b",
+        "sess?x=1",
+        "sess#frag",
+        "my session",
+        "   ",
+        "bad\nname",
+        "bad\x00name",
+        ".",
+    ]
+    for bad in invalid_names:
+        with pytest.raises(ValidationError):
+            ProvisionRequest(name=bad)
+
+    # Empty string normalizes to None; safe names pass
+    assert ProvisionRequest(name="").name is None
+    assert ProvisionRequest(name="boost-g4_h3.01").name == "boost-g4_h3.01"
+
+    app = create_app(orchestrator)
+    with TestClient(app) as client:
+        resp = client.post("/api/sessions", json={"name": "../drive-escape", "accelerator": "T4"})
+        assert resp.status_code == 422
+
+
+def test_cli_deploy_partial_override_preserves_high_mem_and_wait_retries_and_timeout(
+    orchestrator: ConsoleOrchestrator, capsys
+) -> None:
+    import httpx
+    from unittest.mock import patch
+
+    app = create_app(orchestrator)
+    with TestClient(app) as client:
+        orchestrator.stop_all_sessions()
+        # 1. README example: --accel G4 --min-vram 80000 WITHOUT --high-mem must keep minimax-h3 high_mem=True!
+        rc = run_client_subcommand(
+            [
+                "deploy",
+                "minimax-h3-studio",
+                "--accel",
+                "G4",
+                "--min-vram",
+                "80000",
+                "--wait",
+                "--poll-interval",
+                "0.05",
+                "--json",
+            ],
+            client=client,
+        )
+        assert rc == 0
+        dep = json.loads(capsys.readouterr().out)
+        assert dep["state"] == "ready"
+        sess = next(s for s in orchestrator.list_sessions() if s.name == dep["session_name"])
+        assert sess.machine_shape == MachineShape.HIGH_RAM
+
+        # 2. Explicit --no-high-mem overrides high_mem=False while preserving recipe's G4 accelerator
+        orchestrator.stop_all_sessions()
+        rc2 = run_client_subcommand(
+            [
+                "deploy",
+                "minimax-h3-studio",
+                "--no-high-mem",
+                "--wait",
+                "--poll-interval",
+                "0.05",
+                "--json",
+            ],
+            client=client,
+        )
+        assert rc2 == 0
+        dep2 = json.loads(capsys.readouterr().out)
+        sess2 = next(s for s in orchestrator.list_sessions() if s.name == dep2["session_name"])
+        assert sess2.accelerator == Accelerator.G4
+        assert sess2.machine_shape == MachineShape.STANDARD
+
+        # 3. deploy --wait retries transient network error during polling and succeeds
+        orchestrator.stop_all_sessions()
+        orchestrator.mock_step_delay_s = 0.08
+        orig_request = client.request
+        flaky_gets = [0]
+
+        def flaky_request(method: str, url: str, *args, **kwargs):
+            if method.upper() == "GET" and str(url).startswith("/api/deployments/"):
+                flaky_gets[0] += 1
+                if flaky_gets[0] <= 2:
+                    raise httpx.ConnectError("transient network reset")
+            return orig_request(method, url, *args, **kwargs)
+
+        with patch.object(client, "request", side_effect=flaky_request):
+            rc3 = run_client_subcommand(
+                [
+                    "deploy",
+                    "faster-whisper-api",
+                    "--wait",
+                    "--poll-interval",
+                    "0.05",
+                    "--wait-timeout",
+                    "5.0",
+                    "--json",
+                ],
+                client=client,
+            )
+        assert rc3 == 0
+        assert flaky_gets[0] >= 3
+        dep3 = json.loads(capsys.readouterr().out)
+        assert dep3["state"] == "ready"
+
+        # 4. deploy --wait --wait-timeout exits with error when run does not finish in time
+        orchestrator.stop_all_sessions()
+        orchestrator.mock_step_delay_s = 2.0
+        rc4 = run_client_subcommand(
+            [
+                "deploy",
+                "faster-whisper-api",
+                "--wait",
+                "--poll-interval",
+                "0.05",
+                "--wait-timeout",
+                "0.12",
+            ],
+            client=client,
+        )
+        err_out = capsys.readouterr().err
+        assert rc4 == 1
+        assert "Timed out waiting" in err_out
+        orchestrator.stop_all_sessions()
+
+
+def test_streaming_upload_retry_token_refresh_chunk_validation_shell_timeout_and_marker_redaction(
+    isolated_paths, tmp_path: Path
+) -> None:
+    from unittest.mock import patch
+
+    vm_root = tmp_path / "stream_vm"
+    list_calls = [0]
+    chunk_attempts = [0]
+    shell_snippets: list[str] = []
+
+    class FlakyStreamBackend(_RealExecFileStubBackend):
+        def list_assignments(self, account_id: str, token_json: str) -> list[RawAssignment]:
+            list_calls[0] += 1
+            return [
+                RawAssignment(
+                    endpoint=self.assignment.endpoint,
+                    accelerator=self.assignment.accelerator,
+                    machine_shape=self.assignment.machine_shape,
+                    proxy_url=self.assignment.proxy_url,
+                    proxy_token=f"tok-stream-{list_calls[0]}",
+                    token_expires_in_seconds=60,
+                )
+            ]
+
+        def execute_python(self, assignment: RawAssignment, code: str, *, env=None, timeout_s: float = 45.0) -> ExecResult:
+            if "subprocess.run(['bash', '-lc'" in code:
+                shell_snippets.append(code)
+                return ExecResult(
+                    ok=True,
+                    marker_json={"returncode": 124, "stdout": "", "stderr": "Command timed out after 7s", "timed_out": True},
+                )
+            if "fh.seek(" in code and "fh.write(data)" in code:
+                chunk_attempts[0] += 1
+                if chunk_attempts[0] == 2:
+                    # Simulate a transient chunk error on chunk 2 -> must retry & refresh proxy_token!
+                    return ExecResult(ok=False, stderr="Transient websocket hiccup")
+            return super().execute_python(assignment, code, env=env, timeout_s=timeout_s)
+
+    stub = FlakyStreamBackend(vm_root)
+    orch = ConsoleOrchestrator(paths=isolated_paths, direct_backend=stub, force_file_vault=True)
+    try:
+        orch.update_settings({"backend_mode": BackendMode.REAL})
+        orch._register_authenticated_account("stream@example.com", "Stream", "{}")
+        orch._real_ledger[stub.assignment.endpoint] = {
+            "name": "g4-stream",
+            "account_id": orch.active_account().id,
+            "created_at": "2026-11-19T00:00:00+00:00",
+        }
+        orch.vault.set_secret("hf_token", "hf_marker_secret_5566")
+
+        # 1. Invalid chunk_bytes <= 0 rejected
+        src = tmp_path / "big_stream.bin"
+        raw = b"STREAM_BLOCK_" * 250  # 3250 bytes -> 4 chunks at 1024
+        src.write_bytes(raw)
+        with pytest.raises(ValueError, match="chunk_bytes"):
+            orch.upload_to_session("g4-stream", "/content/bad.bin", local_path=str(src), chunk_bytes=0)
+        with pytest.raises(ValueError, match="chunk_bytes"):
+            orch.upload_to_session("g4-stream", "/content/bad.bin", local_path=str(src), chunk_bytes=-10)
+
+        # 2. Streaming upload MUST NOT call Path.read_bytes(), retries failed chunk, and matches SHA256
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("read_bytes must not be called for streaming upload")):
+            with patch("colab_boost.orchestrator.time.sleep"):
+                up = orch.upload_to_session("g4-stream", "/content/big_stream.bin", local_path=str(src), chunk_bytes=1024)
+        assert up["chunks"] == 4
+        assert up["bytes"] == len(raw)
+        assert up["sha256"] == hashlib.sha256(raw).hexdigest()
+        assert chunk_attempts[0] == 5  # 4 chunks + 1 retry
+        assert list_calls[0] >= 3  # refreshed token during retry
+        assert (vm_root / "big_stream.bin").read_bytes() == raw
+
+        # 3. shell=True passes timeout to remote subprocess.run and surfaces rc=124 on timeout
+        sh_res = orch.exec_on_session("g4-stream", "sleep 99", shell=True, timeout_s=7.0)
+        assert sh_res["ok"] is False
+        assert sh_res["returncode"] == 124
+        assert any("timeout=7.0" in s and "TimeoutExpired" in s for s in shell_snippets)
+
+        # 4. exec_on_session recursively redacts secrets inside marker_json
+        ex = orch.exec_on_session(
+            "g4-stream",
+            f"import json; print({RESULT_MARKER!r} + json.dumps({{'nested': {{'tok': 'hf_marker_secret_5566'}}, 'arr': ['hf_marker_secret_5566']}}))",
+        )
+        assert ex["ok"] is True
+        assert "hf_marker_secret_5566" not in json.dumps(ex["marker_json"])
+        assert ex["marker_json"]["nested"]["tok"] == "***"
+        assert ex["marker_json"]["arr"] == ["***"]
+    finally:
+        orch.shutdown()
+
+
+def test_bootstrap_exposes_accelerator_specs_burn_rates_and_ws_ordered_broadcast(
+    orchestrator: ConsoleOrchestrator,
+) -> None:
+    from colab_boost.models import APPROX_CCU_PER_HOUR
+
+    app = create_app(orchestrator)
+    with TestClient(app) as client:
+        boot = client.get("/api/bootstrap").json()
+        assert boot["approx_burn_rates"] == APPROX_CCU_PER_HOUR
+        specs = boot["accelerator_specs"]
+        spec_by_id = {item["id"]: item for item in specs}
+        assert set(spec_by_id.keys()) == {"G4", "A100", "H100", "L4", "T4", "V5E1", "V6E1", "NONE"}
+        assert spec_by_id["L4"]["high_mem_only"] is True
+        assert spec_by_id["V5E1"]["high_mem_only"] is True
+        assert spec_by_id["V6E1"]["high_mem_only"] is True
+        assert spec_by_id["G4"]["vram_mib"] == [97887]
+        assert spec_by_id["H100"]["approx_ccu_per_hour"] == APPROX_CCU_PER_HOUR["H100"]
+
+        # Verify ordered per-connection WS delivery for rapid bursts of events
+        with client.websocket_connect("/ws/events") as ws:
+            first = ws.receive_json()
+            assert first["type"] == "connected"
+            for seq in range(20):
+                orchestrator._emit("ordered_burst", {"seq": seq})
+            received = [ws.receive_json()["data"]["seq"] for _ in range(20)]
+            assert received == list(range(20))
