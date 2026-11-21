@@ -571,3 +571,152 @@ def test_bootstrap_exposes_accelerator_specs_burn_rates_and_ws_ordered_broadcast
                 orchestrator._emit("ordered_burst", {"seq": seq})
             received = [ws.receive_json()["data"]["seq"] for _ in range(20)]
             assert received == list(range(20))
+
+
+def test_gguf_plan_propagates_header_warning_and_settings_patch_forbids_unknown_fields(
+    isolated_paths,
+) -> None:
+    from unittest.mock import AsyncMock, patch
+    from colab_boost.config import SettingsStore
+    from colab_boost.gguf_planner import GgufRepoPlan, GgufVariant
+
+    # 1. AppSettings remains backward-compatible with legacy settings.json containing extra keys
+    isolated_paths.ensure_dirs()
+    isolated_paths.settings_file.write_text(
+        json.dumps({"language": "en", "legacy_removed_flag": True, "guards": {"auto_stop_minutes": 90, "old_guard": 7}}),
+        encoding="utf-8",
+    )
+    loaded_settings = SettingsStore(isolated_paths).load()
+    assert loaded_settings.language == "en"
+    assert loaded_settings.guards.auto_stop_minutes == 90
+
+    orch = ConsoleOrchestrator(paths=isolated_paths, force_file_vault=True)
+    app = create_app(orch)
+    try:
+        with TestClient(app) as client:
+            # 2. PATCH /api/settings accepts valid fields & rejects unknown top-level, nested guard, or null fields (422)
+            ok_patch = client.patch(
+                "/api/settings",
+                json={"theme": "light", "guards": {"idle_stop_minutes": 45}},
+            )
+            assert ok_patch.status_code == 200
+            assert ok_patch.json()["theme"] == "light"
+            assert ok_patch.json()["guards"]["idle_stop_minutes"] == 45
+
+            bad_top = client.patch("/api/settings", json={"unknown_setting": True})
+            assert bad_top.status_code == 422
+
+            bad_nested = client.patch("/api/settings", json={"guards": {"unknown_guard": 12}})
+            assert bad_nested.status_code == 422
+
+            bad_null = client.patch("/api/settings", json={"language": None})
+            assert bad_null.status_code == 422
+
+            # 3. /api/hf/gguf-plan surfaces header_truncated, header_warning, warnings & sliding_window at top level
+            truncated_plan = GgufRepoPlan(
+                repo="demo/BigHeader-GGUF",
+                variants=[GgufVariant(quant="Q4_K_M", files=["model-Q4_K_M.gguf"], size_bytes=4 * 1024**3)],
+                mmproj_files=[],
+                preferred_mmproj=None,
+                architecture="qwen2",
+                model_ctx=32768,
+                kv_bytes_per_token_f16=65536,
+                has_mtp=False,
+                sliding_window=8192,
+                header_truncated=True,
+                header_warning="GGUF metadata header was truncated at the 4 MiB probe limit.",
+            )
+            with patch(
+                "colab_boost.server.inspect_hf_gguf_repo",
+                new=AsyncMock(return_value=truncated_plan),
+            ):
+                resp = client.get("/api/hf/gguf-plan", params={"repo": "demo/BigHeader-GGUF"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["repo"] == "demo/BigHeader-GGUF"
+            assert data["sliding_window"] == 8192
+            assert data["header_truncated"] is True
+            assert data["header_warning"] == truncated_plan.header_warning
+            assert data["warnings"] == [truncated_plan.header_warning]
+            assert len(data["hardware_matrix"]) >= 5
+            assert all(row.get("header_truncated") is True for row in data["hardware_matrix"])
+    finally:
+        orch.shutdown()
+
+
+def test_cli_help_lists_all_subcommands_and_tunnels_receipts_extend_subcommands(
+    orchestrator: ConsoleOrchestrator, capsys
+) -> None:
+    from colab_boost.cli import CLIENT_SUBCOMMANDS, parse_args
+
+    # 1. Main --help epilog clearly lists all 11 client subcommands
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args(["--help"])
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    expected_cmds = {
+        "status",
+        "recipes",
+        "deploy",
+        "exec",
+        "upload",
+        "download",
+        "stop",
+        "stop-all",
+        "tunnels",
+        "receipts",
+        "extend",
+    }
+    assert expected_cmds.issubset(CLIENT_SUBCOMMANDS)
+    for cmd in expected_cmds:
+        assert cmd in help_text
+
+    # 2. Exercise tunnels, extend, and receipts in both text and --json modes
+    app = create_app(orchestrator)
+    with TestClient(app) as client:
+        # Empty tunnels
+        assert run_client_subcommand(["tunnels"], client=client) == 0
+        assert "No active tunnels." in capsys.readouterr().out
+
+        # Open a tunnel on existing demo session
+        sess = orchestrator.list_sessions()[0]
+        tun = orchestrator.open_tunnel(sess.name, remote_port=8000, local_port=8000, label="OpenAI API")
+
+        assert run_client_subcommand(["tunnels"], client=client) == 0
+        tun_text = capsys.readouterr().out
+        assert tun.id in tun_text
+        assert sess.name in tun_text
+
+        assert run_client_subcommand(["tunnels", "--json"], client=client) == 0
+        tun_json = json.loads(capsys.readouterr().out)
+        assert any(t["id"] == tun.id for t in tun_json)
+
+        # Extend session deadline
+        prev_deadline = sess.watchdog.deadline_epoch or 0.0
+        assert run_client_subcommand(["extend", sess.name, "--minutes", "45"], client=client) == 0
+        ext_text = capsys.readouterr().out
+        assert f"Extended {sess.name} (+45m)" in ext_text
+
+        assert run_client_subcommand(["extend", sess.name, "--minutes", "30", "--json"], client=client) == 0
+        ext_json = json.loads(capsys.readouterr().out)
+        assert ext_json["name"] == sess.name
+        assert ext_json["watchdog"]["active"] is True
+        assert ext_json["watchdog"]["deadline_epoch"] > prev_deadline
+
+        # Invalid --minutes rejected cleanly
+        assert run_client_subcommand(["extend", sess.name, "--minutes", "0"], client=client) == 1
+        assert "--minutes" in capsys.readouterr().err
+
+        # Stop session to produce a receipt, then list via receipts subcommand
+        assert run_client_subcommand(["stop", sess.name, "--json"], client=client) == 0
+        stopped_rc = json.loads(capsys.readouterr().out)
+
+        assert run_client_subcommand(["receipts"], client=client) == 0
+        rc_text = capsys.readouterr().out
+        assert stopped_rc["receipt_id"] in rc_text
+        assert sess.name in rc_text
+
+        assert run_client_subcommand(["receipts", "--limit", "1", "--json"], client=client) == 0
+        rc_json = json.loads(capsys.readouterr().out)
+        assert len(rc_json) == 1
+        assert rc_json[0]["receipt_id"] == stopped_rc["receipt_id"]

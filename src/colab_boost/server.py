@@ -35,11 +35,27 @@ from colab_boost.models import (
     Accelerator,
     DeployRequest,
     ProvisionRequest,
+    SettingsPatch,
 )
 from colab_boost.orchestrator import ConsoleOrchestrator
 from colab_boost.recipe_loader import RecipeValidationError
+from colab_boost.vault import redact_secrets
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_error_text(
+    orch: ConsoleOrchestrator,
+    exc: BaseException,
+    extra_secrets: Optional[list[str]] = None,
+) -> str:
+    try:
+        secrets = list(orch.vault.all_known_secrets())
+    except Exception:
+        secrets = []
+    if extra_secrets:
+        secrets.extend(s for s in extra_secrets if s)
+    return redact_secrets(f"{type(exc).__name__}: {exc}", secrets)
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "testserver"})
@@ -273,8 +289,8 @@ def create_app(
             return
         try:
             ev_loop.call_soon_threadsafe(_enqueue_on_loop, event)
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            logger.debug("Skipping WebSocket event dispatch on closed loop: %s", exc)
 
     unsubscribe = orch.subscribe(on_orch_event)
 
@@ -398,7 +414,7 @@ def create_app(
         }
 
     @app.patch("/api/settings")
-    async def api_update_settings(patch: dict[str, Any]) -> Any:
+    async def api_update_settings(patch: SettingsPatch) -> Any:
         try:
             return await asyncio.to_thread(orch.update_settings, patch)
         except Exception as exc:
@@ -631,7 +647,11 @@ def create_app(
         try:
             items = await search_hf_gguf_repos(q, hf_token=hf_tok, limit=10)
             return {"source": "huggingface", "items": items}
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Hugging Face GGUF search failed; falling back to curated catalog: %s",
+                _safe_error_text(orch, exc, [hf_tok] if hf_tok else None),
+            )
             # Graceful fallback to curated catalog if offline or rate-limited
             ql = q.strip().lower()
             fallback = [
@@ -661,6 +681,11 @@ def create_app(
         except Exception as exc:
             preset = CURATED_GGUF_CATALOG.get(repo_id)
             if preset:
+                logger.warning(
+                    "Hugging Face GGUF inspection failed for %s; using curated fallback: %s",
+                    repo_id,
+                    _safe_error_text(orch, exc, [hf_tok] if hf_tok else None),
+                )
                 source = "curated_fallback"
                 from colab_boost.gguf_planner import group_gguf_files
 
@@ -676,12 +701,18 @@ def create_app(
                     has_mtp=False,
                 )
             else:
+                logger.warning(
+                    "Hugging Face GGUF inspection failed for %s: %s",
+                    repo_id,
+                    _safe_error_text(orch, exc, [hf_tok] if hf_tok else None),
+                )
                 raise HTTPException(
                     status_code=502,
                     detail={"kind": "hf_unreachable", "message": f"Could not inspect Hugging Face repo '{repo_id}'."},
                 ) from exc
 
         matrix = build_hardware_fit_matrix(plan, quant=quant, requested_ctx=ctx, kv_type=kv)
+        warnings_list = [plan.header_warning] if plan.header_warning else []
         return {
             "source": source,
             "repo": plan.repo,
@@ -689,7 +720,11 @@ def create_app(
             "model_ctx": plan.model_ctx,
             "kv_bytes_per_token_f16": plan.kv_bytes_per_token_f16,
             "has_mtp": plan.has_mtp,
+            "sliding_window": plan.sliding_window,
             "preferred_mmproj": plan.preferred_mmproj,
+            "header_truncated": bool(plan.header_truncated),
+            "header_warning": plan.header_warning,
+            "warnings": warnings_list,
             "variants": [
                 {"quant": v.quant, "size_gib": v.size_gib, "files": v.files}
                 for v in plan.variants
@@ -812,8 +847,12 @@ def create_app(
                             m_items = (m_resp.json() or {}).get("data") or []
                             if isinstance(m_items, list) and m_items and isinstance(m_items[0], dict) and m_items[0].get("id"):
                                 resolved_model = str(m_items[0]["id"])
-                    except Exception:
-                        pass
+                    except Exception as disc_exc:
+                        logger.debug(
+                            "Playground /models auto-discovery failed for %s: %s",
+                            target_url,
+                            _safe_error_text(orch, disc_exc, [body.api_key] if body.api_key else None),
+                        )
 
                 eff_model = resolved_model or "default"
                 resp = await client.post(
@@ -829,9 +868,11 @@ def create_app(
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as exc:
+            safe_msg = _safe_error_text(orch, exc, [body.api_key] if body.api_key else None)
+            logger.warning("Playground chat request to %s failed: %s", target_url, safe_msg)
             raise HTTPException(
                 status_code=502,
-                detail={"kind": "upstream_error", "message": f"Model endpoint request failed: {exc}"},
+                detail={"kind": "upstream_error", "message": f"Model endpoint request failed: {safe_msg}"},
             ) from exc
 
         elapsed_s = max(0.001, time.perf_counter() - t0)
@@ -877,7 +918,8 @@ def create_app(
         q: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue(maxsize=_WS_QUEUE_MAX)
         try:
             await ws.send_json({"type": "connected", "data": {"backend_mode": orch.settings.backend_mode}})
-        except Exception:
+        except Exception as exc:
+            logger.debug("WebSocket initial handshake send failed: %s", type(exc).__name__)
             return
 
         ws_queues[ws] = q
@@ -903,8 +945,10 @@ def create_app(
                     receive_task.cancel()
                     try:
                         await receive_task
-                    except (asyncio.CancelledError, Exception):
+                    except asyncio.CancelledError:
                         pass
+                    except Exception as exc:
+                        logger.debug("WebSocket receive task cleanup error: %s", type(exc).__name__)
                     break
         except WebSocketDisconnect:
             pass
@@ -913,7 +957,9 @@ def create_app(
             sender_task.cancel()
             try:
                 await sender_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as exc:
+                logger.debug("WebSocket sender task cleanup error: %s", type(exc).__name__)
 
     return app

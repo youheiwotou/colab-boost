@@ -21,13 +21,48 @@ from colab_boost.models import BackendMode
 from colab_boost.orchestrator import ConsoleOrchestrator
 from colab_boost.server import create_app
 
-CLIENT_SUBCOMMANDS = frozenset({"status", "recipes", "deploy", "exec", "upload", "download", "stop", "stop-all"})
+CLIENT_SUBCOMMANDS = frozenset(
+    {
+        "status",
+        "recipes",
+        "deploy",
+        "exec",
+        "upload",
+        "download",
+        "stop",
+        "stop-all",
+        "tunnels",
+        "receipts",
+        "extend",
+    }
+)
+
+_MAIN_HELP_EPILOG = """\
+Client subcommands (control a running Colab Boost Console server):
+  status                        Show backend mode, active account CCU, sessions, tunnels & runs
+  recipes                       List available model deployment recipes
+  deploy <recipe_id>            Launch a recipe deployment (optionally waiting until READY)
+  exec <session> <code>         Execute Python or Bash directly inside an active Colab VM
+  upload <session> <src> <dst>  Upload a local file to an active Colab VM with SHA256 verification
+  download <session> <src> <dst>
+                                Download a file from an active Colab VM with SHA256 verification
+  stop <session>                Stop a single Colab session and record an unassign receipt
+  stop-all                      Stop ALL active Colab sessions and verify zero billing
+  tunnels                       List active local SSH port-forward tunnels
+  receipts                      List recent runtime unassign / zero-burn receipts
+  extend <session> --minutes <N>
+                                Extend a session's VM watchdog auto-stop deadline
+
+Run 'colab-boost <subcommand> --help' for subcommand options (all support --api-url and --json).
+"""
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="colab-boost",
         description="Colab Boost Console — Rapid model deployment & cost-guarded Google Colab control plane.",
+        epilog=_MAIN_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--mock", action="store_true", help="Start in deterministic Sandbox/Demo mode (0 billing)")
@@ -144,6 +179,22 @@ def _build_client_parser() -> argparse.ArgumentParser:
     p_stop.add_argument("identifier", help="Session name or endpoint")
 
     _add_common(sub.add_parser("stop-all", help="Stop ALL active Colab sessions and verify zero billing"))
+
+    _add_common(sub.add_parser("tunnels", help="List active local SSH port-forward tunnels"))
+
+    p_rc = sub.add_parser("receipts", help="List recent runtime unassign / zero-burn receipts")
+    _add_common(p_rc)
+    p_rc.add_argument("--limit", type=int, default=20, help="Maximum number of receipts to display (default: 20)")
+
+    p_ext = sub.add_parser("extend", help="Extend a session's VM watchdog auto-stop deadline")
+    _add_common(p_ext)
+    p_ext.add_argument("session", help="Session name or endpoint")
+    p_ext.add_argument(
+        "--minutes",
+        type=int,
+        default=120,
+        help="Minutes to add to the watchdog auto-stop deadline (1-1440, default: 120)",
+    )
     return parser
 
 
@@ -333,6 +384,59 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
                     f"remaining={res['remaining_sessions']} | zero_burn_verified={res['zero_burn_verified']}"
                 )
             return 0 if res.get("zero_burn_verified") else 2
+
+        if args.cmd == "tunnels":
+            tunnels = _api_call(http, "GET", "/api/tunnels")
+            if args.as_json:
+                print(json.dumps(tunnels, indent=2, ensure_ascii=False))
+            elif not tunnels:
+                print("No active tunnels.")
+            else:
+                for t in tunnels:
+                    print(
+                        f"- {t['id']} | {t['session_name']} VM:{t['remote_port']} -> {t['local_url']} "
+                        f"[{t['status']}] ({t.get('label', 'Port Forward')})"
+                    )
+            return 0
+
+        if args.cmd == "receipts":
+            if args.limit <= 0:
+                raise ValueError("--limit must be a positive integer")
+            receipts = _api_call(http, "GET", "/api/receipts")
+            if isinstance(receipts, list):
+                receipts = receipts[: args.limit]
+            if args.as_json:
+                print(json.dumps(receipts, indent=2, ensure_ascii=False))
+            elif not receipts:
+                print("No unassign receipts recorded.")
+            else:
+                for r in receipts:
+                    ts = str(r.get("timestamp") or "")[:19]
+                    print(
+                        f"- {r['receipt_id']} | {ts} | {r['session_name']} [{r['accelerator']}] "
+                        f"verified={r['verified_unassigned']} | reason={r['reason']}"
+                    )
+            return 0
+
+        if args.cmd == "extend":
+            if args.minutes < 1 or args.minutes > 1440:
+                raise ValueError("--minutes must be between 1 and 1440")
+            sess_seg = quote(args.session, safe="")
+            sess = _api_call(
+                http,
+                "POST",
+                f"/api/sessions/{sess_seg}/extend",
+                json={"add_minutes": args.minutes},
+            )
+            if args.as_json:
+                print(json.dumps(sess, indent=2, ensure_ascii=False))
+            else:
+                wd = sess.get("watchdog") or {}
+                print(
+                    f"Extended {sess['name']} (+{args.minutes}m) | "
+                    f"watchdog_active={wd.get('active')} | deadline_epoch={wd.get('deadline_epoch')}"
+                )
+            return 0
 
         return 2
     except Exception as exc:

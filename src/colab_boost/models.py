@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class BackendMode(str, Enum):
@@ -117,6 +117,49 @@ class AppSettings(BaseModel):
     default_min_vram_mib: int = 0
     guards: CostGuardSettings = Field(default_factory=CostGuardSettings)
     auto_forward_endpoints: bool = True
+
+
+class CostGuardSettingsPatch(BaseModel):
+    """Strictly typed partial update for cost guard settings (rejects unknown keys)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    auto_stop_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+    idle_stop_minutes: Optional[int] = Field(default=None, ge=0, le=720)
+    balance_floor_ccu: Optional[float] = Field(default=None, ge=0.0, le=10000.0)
+    session_spend_cap_ccu: Optional[float] = Field(default=None, ge=0.0, le=10000.0)
+    max_vram_retries: Optional[int] = Field(default=None, ge=1, le=8)
+    max_managed_sessions: Optional[int] = Field(default=None, ge=1, le=5)
+
+    @model_validator(mode="after")
+    def _reject_null_fields(self) -> "CostGuardSettingsPatch":
+        for field_name in self.model_fields_set:
+            if getattr(self, field_name) is None:
+                raise ValueError(f"Field '{field_name}' cannot be null.")
+        return self
+
+
+class SettingsPatch(BaseModel):
+    """Strictly typed partial update for ``PATCH /api/settings`` (rejects unknown keys)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend_mode: Optional[BackendMode] = None
+    mock_scenario: Optional[Literal["demo", "single", "signed_out"]] = None
+    language: Optional[Literal["zh-CN", "en"]] = None
+    theme: Optional[Literal["dark", "light"]] = None
+    default_accelerator: Optional[Accelerator] = None
+    default_high_mem: Optional[bool] = None
+    default_min_vram_mib: Optional[int] = Field(default=None, ge=0, le=163840)
+    guards: Optional[CostGuardSettingsPatch] = None
+    auto_forward_endpoints: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _reject_null_fields(self) -> "SettingsPatch":
+        for field_name in self.model_fields_set:
+            if getattr(self, field_name) is None:
+                raise ValueError(f"Field '{field_name}' cannot be null.")
+        return self
 
 
 class WatchdogState(BaseModel):

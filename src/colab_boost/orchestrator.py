@@ -43,6 +43,7 @@ from colab_boost.models import (
     RecipeKeepSpec,
     RecipeManifest,
     SessionInfo,
+    SettingsPatch,
     TunnelInfo,
     UnassignReceipt,
     UsageSnapshot,
@@ -55,27 +56,18 @@ from colab_boost.recipe_loader import (
 )
 from colab_boost.ssh_bridge import SshTunnelManager
 from colab_boost.vault import CredentialVault, redact_secrets, redact_value
+from colab_boost.vm_assets.remote_scripts import (
+    build_keep_sync_script,
+    build_keep_winddown_hook_script,
+    build_watchdog_install_script,
+    build_watchdog_patch_respawn_script,
+    build_worker_poll_script,
+)
 
 logger = logging.getLogger(__name__)
 
-_VM_PID_ALIVE_FN = (
-    "def _pid_alive(pid):\n"
-    "    if not pid or pid <= 0:\n"
-    "        return False\n"
-    "    stat_path = f'/proc/{pid}/stat'\n"
-    "    if not os.path.exists(stat_path):\n"
-    "        return False\n"
-    "    try:\n"
-    "        raw_stat = open(stat_path, encoding='utf-8', errors='replace').read()\n"
-    "        rparen = raw_stat.rfind(')')\n"
-    "        if rparen != -1:\n"
-    "            fields = raw_stat[rparen + 1:].split()\n"
-    "            if fields and fields[0] in ('Z', 'X', 'x'):\n"
-    "                return False\n"
-    "        return True\n"
-    "    except OSError:\n"
-    "        return False\n"
-)
+_TERMINAL_PROVISION_STATES = frozenset({"ready", "cancelled", "failed"})
+_TERMINAL_RUN_STATES = frozenset({"ready", "failed", "cancelled"})
 
 
 def _path_is_within(candidate: Path, root: Path) -> bool:
@@ -108,66 +100,14 @@ def _build_keep_winddown_hooks(
     if not keep_specs:
         return []
     spec_items = [{"path": kp.path, "slug": _sanitize_keep_slug(kp.path)} for kp in keep_specs]
-    hook_script = (
-        "import json, os, shutil, tarfile, time\n"
-        f"specs = {spec_items!r}\n"
-        "keep_root = os.environ.get('BOOST_KEEP_STAGE_DIR', '/root/.colab-boost/keep')\n"
-        f"stage_root = os.path.join(keep_root, {run_id!r})\n"
-        "os.makedirs(stage_root, exist_ok=True)\n"
-        "drive_mount = os.environ.get('BOOST_DRIVE_MOUNT', '/content/drive/MyDrive')\n"
-        f"drive_base = os.path.join(drive_mount, 'ColabBoost', {session_name!r}, {run_id!r})\n"
-        "has_drive = os.path.isdir(drive_mount)\n"
-        "if has_drive:\n"
-        "    os.makedirs(drive_base, exist_ok=True)\n"
-        "def _tar_filter(ti):\n"
-        "    if ti.issym() and (ti.linkname.startswith('/') or '..' in ti.linkname.split('/')):\n"
-        "        return None\n"
-        "    if not (ti.isfile() or ti.isdir() or ti.issym()):\n"
-        "        return None\n"
-        "    return ti\n"
-        f"manifest = {{'run_id': {run_id!r}, 'saved_at': time.time(), 'items': []}}\n"
-        "for item in specs:\n"
-        "    p = item['path']\n"
-        "    slug = item['slug']\n"
-        "    entry = {'path': p, 'exists': os.path.lexists(p), 'file_count': 0, 'total_bytes': 0, 'drive_synced': False}\n"
-        "    if os.path.lexists(p):\n"
-        "        if os.path.isfile(p) and not os.path.islink(p):\n"
-        "            entry['file_count'] = 1\n"
-        "            entry['total_bytes'] = os.path.getsize(p)\n"
-        "        elif os.path.isdir(p) and not os.path.islink(p):\n"
-        "            for r, _, fs in os.walk(p, followlinks=False):\n"
-        "                for fn in fs:\n"
-        "                    fp = os.path.join(r, fn)\n"
-        "                    if os.path.islink(fp):\n"
-        "                        continue\n"
-        "                    try:\n"
-        "                        if os.path.isfile(fp):\n"
-        "                            entry['file_count'] += 1\n"
-        "                            entry['total_bytes'] += os.path.getsize(fp)\n"
-        "                    except OSError:\n"
-        "                        pass\n"
-        "        arc_path = os.path.join(stage_root, slug + '.tar.gz')\n"
-        "        tmp_arc = arc_path + '.tmp'\n"
-        "        try:\n"
-        "            with tarfile.open(tmp_arc, 'w:gz') as tf:\n"
-        "                tf.add(p, arcname=os.path.basename(p.rstrip('/')) or slug, recursive=True, filter=_tar_filter)\n"
-        "            os.replace(tmp_arc, arc_path)\n"
-        "            entry['archive'] = arc_path\n"
-        "            if has_drive:\n"
-        "                shutil.copy2(arc_path, os.path.join(drive_base, slug + '.tar.gz'))\n"
-        "                entry['drive_synced'] = True\n"
-        "        except Exception as exc:\n"
-        "            try: os.remove(tmp_arc)\n"
-        "            except OSError: pass\n"
-        "            entry['error'] = str(exc)\n"
-        "    manifest['items'].append(entry)\n"
-        "with open(os.path.join(stage_root, 'keep_manifest.json'), 'w', encoding='utf-8') as fh:\n"
-        "    json.dump(manifest, fh)\n"
-    )
+    hook_script = build_keep_winddown_hook_script(run_id, session_name, spec_items)
     return [{"argv": ["python3", "-c", hook_script], "timeout_s": 120}]
 
 
 class ConsoleOrchestrator:
+    MAX_TERMINAL_PROVISION_OPS: int = 50
+    MAX_TERMINAL_RUNS: int = 50
+
     def __init__(
         self,
         paths: Optional[WorkspacePaths] = None,
@@ -207,6 +147,8 @@ class ConsoleOrchestrator:
         self._mock_ledger: dict[str, dict[str, Any]] = {}
 
         # Live operations & deployment runs (separated between real & mock modes)
+        self._max_terminal_provision_ops: int = self.MAX_TERMINAL_PROVISION_OPS
+        self._max_terminal_runs: int = self.MAX_TERMINAL_RUNS
         self._provision_ops: dict[str, ProvisionOperation] = {}
         self._provision_cancels: dict[str, threading.Event] = {}
         self._provision_done: dict[str, threading.Event] = {}
@@ -220,10 +162,65 @@ class ConsoleOrchestrator:
         if self.settings.backend_mode == BackendMode.REAL:
             self._reconcile_real_runs()
 
+    def _safe_error_text(self, exc: BaseException) -> str:
+        """Formats an exception message with all known secrets redacted."""
+        try:
+            secrets = self.vault.all_known_secrets()
+        except Exception:
+            secrets = []
+        return redact_secrets(f"{type(exc).__name__}: {exc}", secrets)
+
+    def _prune_provision_ops_locked(self) -> None:
+        """Bounds in-memory terminal provision operations while preserving all active ops."""
+        limit = max(0, int(self._max_terminal_provision_ops))
+        terminal_ids = [
+            oid
+            for oid, op in self._provision_ops.items()
+            if op.state in _TERMINAL_PROVISION_STATES and oid not in self._provision_cancels
+        ]
+        excess = len(terminal_ids) - limit
+        if excess <= 0:
+            return
+        terminal_ids.sort(
+            key=lambda oid: self._provision_ops[oid].finished_at or self._provision_ops[oid].started_at
+        )
+        for oid in terminal_ids[:excess]:
+            self._provision_ops.pop(oid, None)
+
+    def _prune_runs_locked(self, runs_map: dict[str, DeploymentRun]) -> None:
+        """Bounds in-memory terminal deployment runs while preserving all active runs."""
+        limit = max(0, int(self._max_terminal_runs))
+        terminal_ids = [
+            rid
+            for rid, run in runs_map.items()
+            if run.state in _TERMINAL_RUN_STATES and rid not in self._run_cancels
+        ]
+        excess = len(terminal_ids) - limit
+        if excess <= 0:
+            return
+        terminal_ids.sort(key=lambda rid: runs_map[rid].finished_at or runs_map[rid].started_at)
+        for rid in terminal_ids[:excess]:
+            runs_map.pop(rid, None)
+
     def shutdown(self) -> None:
-        """Stops local background pollers and SSH tunnels without terminating remote Colab VMs."""
+        """Stops local background pollers, SSH tunnels, and backend pools without terminating remote Colab VMs."""
         self._shutdown_ev.set()
-        self.tunnels.stop_all()
+        try:
+            self.tunnels.stop_all()
+        except Exception as exc:
+            logger.warning("Error stopping SSH tunnels during shutdown: %s", self._safe_error_text(exc))
+        tunnels_close = getattr(self.tunnels, "close", None)
+        if callable(tunnels_close):
+            try:
+                tunnels_close()
+            except Exception as exc:
+                logger.warning("Error closing SSH tunnel manager during shutdown: %s", self._safe_error_text(exc))
+        backend_close = getattr(self._direct_backend, "close", None)
+        if callable(backend_close):
+            try:
+                backend_close()
+            except Exception as exc:
+                logger.warning("Error closing direct backend during shutdown: %s", self._safe_error_text(exc))
 
     def _localized_label(self, labels: dict[str, str], fallback: str = "") -> str:
         lang = self.settings.language
@@ -256,8 +253,8 @@ class ConsoleOrchestrator:
         for cb in subs:
             try:
                 cb(msg)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Event listener failed for %s: %s", event_type, self._safe_error_text(exc))
 
     def _load_real_accounts(self) -> dict[str, AccountRecord]:
         if not self.paths.accounts_file.exists():
@@ -270,7 +267,8 @@ class ConsoleOrchestrator:
                 rec.has_credential = self.vault.has_account_token(rec.id)
                 out[rec.id] = rec
             return out
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed loading accounts file %s: %s", self.paths.accounts_file, self._safe_error_text(exc))
             return {}
 
     def _save_real_accounts(self) -> None:
@@ -290,7 +288,8 @@ class ConsoleOrchestrator:
         try:
             data = json.loads(self.paths.ledger_file.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed loading ledger file %s: %s", self.paths.ledger_file, self._safe_error_text(exc))
             return {}
 
     def _save_real_ledger(self) -> None:
@@ -312,11 +311,13 @@ class ConsoleOrchestrator:
                 run = DeploymentRun.model_validate(item)
                 out[run.run_id] = run
             return out
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed loading runs file %s: %s", self.paths.runs_file, self._safe_error_text(exc))
             return {}
 
     def _save_real_runs(self) -> None:
-        items = [r.model_dump(mode="json") for r in list(self._real_runs.values())[-50:]]
+        self._prune_runs_locked(self._real_runs)
+        items = [r.model_dump(mode="json") for r in self._real_runs.values()]
         atomic_write_text(
             self.paths.runs_file,
             json.dumps(items, indent=2, ensure_ascii=False),
@@ -329,7 +330,8 @@ class ConsoleOrchestrator:
         for fp in files:
             try:
                 out.append(UnassignReceipt.model_validate_json(fp.read_text(encoding="utf-8")))
-            except Exception:
+            except Exception as exc:
+                logger.warning("Skipping unreadable receipt %s: %s", fp.name, self._safe_error_text(exc))
                 continue
         return out
 
@@ -390,13 +392,15 @@ class ConsoleOrchestrator:
         with self._lock:
             return self.settings.model_copy(deep=True)
 
-    def update_settings(self, patch: dict[str, Any]) -> AppSettings:
+    def update_settings(self, patch: dict[str, Any] | SettingsPatch) -> AppSettings:
+        validated = patch if isinstance(patch, SettingsPatch) else SettingsPatch.model_validate(patch)
+        patch_data = validated.model_dump(exclude_unset=True, mode="json")
         with self._lock:
             merged = self.settings.model_dump(mode="json")
-            if "guards" in patch and isinstance(patch["guards"], dict):
-                merged["guards"] = {**merged["guards"], **patch["guards"]}
-                patch = {k: v for k, v in patch.items() if k != "guards"}
-            merged.update(patch)
+            if "guards" in patch_data and isinstance(patch_data["guards"], dict):
+                merged["guards"] = {**merged["guards"], **patch_data["guards"]}
+                patch_data = {k: v for k, v in patch_data.items() if k != "guards"}
+            merged.update(patch_data)
             prev_mode = self.settings.backend_mode
             prev_scenario = self.settings.mock_scenario
             prev_lang = self.settings.language
@@ -738,8 +742,8 @@ class ConsoleOrchestrator:
                         vram_total = hp.vram_total_mib or None
                         vram_used = hp.vram_used_mib
                         gpu_util = hp.gpu_util_percent
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Mock hardware probe failed for %s: %s", raw.endpoint, self._safe_error_text(exc))
 
                 sess_tunnels = [t for t in all_tunnels if t.session_name == name]
                 with self._lock:
@@ -833,35 +837,7 @@ class ConsoleOrchestrator:
         src = _watchdog_source()
         cfg_json = json.dumps(wd_cfg)
         hooks_json = json.dumps(hook_list)
-        launcher = (
-            "import json, os, subprocess, sys, tempfile\n"
-            "wd_dir = '/root/.colab-boost/watchdog'\n"
-            "os.makedirs(wd_dir, exist_ok=True)\n"
-            "hb_file = '/root/.colab-boost/heartbeat'\n"
-            "os.makedirs(os.path.dirname(hb_file) or '/', exist_ok=True)\n"
-            "open(hb_file, 'a', encoding='utf-8').close()\n"
-            "os.utime(hb_file, None)\n"
-            "def _atomic_w(dst_path, txt):\n"
-            "    fd, tmp_p = tempfile.mkstemp(dir=wd_dir, prefix='.wd.', suffix='.tmp')\n"
-            "    try:\n"
-            "        with os.fdopen(fd, 'w', encoding='utf-8') as fh:\n"
-            "            fh.write(txt)\n"
-            "            fh.flush()\n"
-            "        os.replace(tmp_p, dst_path)\n"
-            "    except Exception:\n"
-            "        try: os.remove(tmp_p)\n"
-            "        except OSError: pass\n"
-            "        raise\n"
-            f"_atomic_w(wd_dir + '/watchdog.py', {src!r})\n"
-            f"_atomic_w(wd_dir + '/watchdog.json', {cfg_json!r})\n"
-            "p = subprocess.Popen("
-            "[sys.executable, wd_dir + '/watchdog.py', '--config', wd_dir + '/watchdog.json', '--hooks-stdin'], "
-            "stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, start_new_session=True)\n"
-            "if p.stdin:\n"
-            f"    p.stdin.write({hooks_json!r})\n"
-            "    p.stdin.close()\n"
-            f"print({RESULT_MARKER!r} + json.dumps({{'pid': p.pid}}), flush=True)\n"
-        )
+        launcher = build_watchdog_install_script(src, cfg_json, hooks_json)
         res = self.backend.execute_python(assignment, launcher, timeout_s=30.0)
         ok = bool(res.ok and res.marker_json and res.marker_json.get("pid"))
         return {
@@ -887,8 +863,8 @@ class ConsoleOrchestrator:
     def _run_provision_thread(self, op_id: str, req: ProvisionRequest, cancel_ev: threading.Event) -> None:
         try:
             self._run_provision_sync(op_id, req, cancel_ev)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Async provision op %s ended with error: %s", op_id, self._safe_error_text(exc))
 
     def _create_provision_op(
         self, req: ProvisionRequest, *, cancel_ev: Optional[threading.Event] = None
@@ -946,6 +922,7 @@ class ConsoleOrchestrator:
             self._provision_ops[op_id] = op
             self._provision_cancels[op_id] = effective_cancel
             self._provision_done[op_id] = done_ev
+            self._prune_provision_ops_locked()
 
         self._emit("provision_updated", op.model_copy(deep=True).model_dump(mode="json"))
         return op_id, effective_cancel
@@ -970,6 +947,8 @@ class ConsoleOrchestrator:
             for k, v in updates.items():
                 setattr(op, k, v)
             snap = op.model_copy(deep=True)
+            if op.state in _TERMINAL_PROVISION_STATES:
+                self._prune_provision_ops_locked()
         self._emit("provision_updated", snap.model_dump(mode="json"))
 
     def _run_provision_sync(self, op_id: str, req: ProvisionRequest, cancel_ev: threading.Event) -> SessionInfo:
@@ -1155,6 +1134,7 @@ class ConsoleOrchestrator:
             with self._lock:
                 self._provision_cancels.pop(op_id, None)
                 done_ev = self._provision_done.pop(op_id, None)
+                self._prune_provision_ops_locked()
             if done_ev is not None:
                 done_ev.set()
 
@@ -1219,8 +1199,12 @@ class ConsoleOrchestrator:
                 for k_rid in keep_run_ids:
                     try:
                         self.sync_keep_artifacts(k_rid)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "Best-effort keep artifact sync failed for run %s before stop: %s",
+                            k_rid,
+                            self._safe_error_text(exc),
+                        )
 
             # Stop any local tunnels & cancel running deployments on this session
             self.tunnels.stop_session_tunnels(target.name)
@@ -1404,56 +1388,12 @@ class ConsoleOrchestrator:
             if not raw:
                 raise KeyError(f"Runtime '{target.endpoint}' disappeared.")
             wd_src = _watchdog_source()
-            patch_code = (
-                "import json, os, subprocess, sys, tempfile, time\n"
-                f"{_VM_PID_ALIVE_FN}"
-                "wd_dir = '/root/.colab-boost/watchdog'\n"
-                "os.makedirs(wd_dir, exist_ok=True)\n"
-                "cfg_path = wd_dir + '/watchdog.json'\n"
-                "pid_path = wd_dir + '/watchdog.pid'\n"
-                "script_path = wd_dir + '/watchdog.py'\n"
-                "cfg = {}\n"
-                "if os.path.exists(cfg_path):\n"
-                "    try: cfg = json.load(open(cfg_path, encoding='utf-8'))\n"
-                "    except Exception: cfg = {}\n"
-                f"cfg['deadline_epoch'] = {new_deadline!r}\n"
-                f"cfg['remaining_s'] = {new_remaining_s!r}\n"
-                "cfg.pop('max_runtime_s', None)\n"
-                "cfg['cancelled'] = False\n"
-                f"cfg.setdefault('idle_timeout_s', {default_idle_s!r})\n"
-                "cfg.setdefault('runtime_addr', os.environ.get('TBE_RUNTIME_ADDR'))\n"
-                "cfg.setdefault('heartbeat_file', '/root/.colab-boost/heartbeat')\n"
-                "cfg.setdefault('log_file', wd_dir + '/watchdog.log')\n"
-                "cfg.setdefault('poll_s', 15)\n"
-                "cfg.setdefault('grace_s', 180)\n"
-                "cfg.setdefault('started_at', time.time())\n"
-                "hb_file = cfg.get('heartbeat_file') or '/root/.colab-boost/heartbeat'\n"
-                "os.makedirs(os.path.dirname(hb_file) or '/', exist_ok=True)\n"
-                "open(hb_file, 'a', encoding='utf-8').close()\n"
-                "os.utime(hb_file, None)\n"
-                "def _atomic_w(dst_path, txt):\n"
-                "    fd, tmp_p = tempfile.mkstemp(dir=wd_dir, prefix='.wd.', suffix='.tmp')\n"
-                "    try:\n"
-                "        with os.fdopen(fd, 'w', encoding='utf-8') as fh:\n"
-                "            fh.write(txt)\n"
-                "            fh.flush()\n"
-                "        os.replace(tmp_p, dst_path)\n"
-                "    except Exception:\n"
-                "        try: os.remove(tmp_p)\n"
-                "        except OSError: pass\n"
-                "        raise\n"
-                "_atomic_w(cfg_path, json.dumps(cfg))\n"
-                "pid = 0\n"
-                "if os.path.exists(pid_path):\n"
-                "    try: pid = int(open(pid_path).read().strip())\n"
-                "    except Exception: pid = 0\n"
-                "alive = _pid_alive(pid)\n"
-                "if not alive:\n"
-                f"    _atomic_w(script_path, {wd_src!r})\n"
-                "    p = subprocess.Popen([sys.executable, script_path, '--config', cfg_path], "
-                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
-                "    pid = p.pid\n"
-                f"print({RESULT_MARKER!r} + json.dumps({{'pid': pid, 'deadline_epoch': cfg['deadline_epoch'], 'remaining_s': cfg['remaining_s']}}), flush=True)\n"
+            patch_code = build_watchdog_patch_respawn_script(
+                wd_src,
+                deadline_epoch=new_deadline,
+                remaining_s=new_remaining_s,
+                default_idle_s=default_idle_s,
+                touch_heartbeat=True,
             )
             res = self.backend.execute_python(raw, patch_code, timeout_s=25.0)
             if not res.ok or not res.marker_json or not res.marker_json.get("pid"):
@@ -1591,7 +1531,12 @@ class ConsoleOrchestrator:
         def kill_stale_sshd() -> None:
             try:
                 cur_raw = fetch_latest_raw()
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Could not refresh assignment before killing stale sshd for %s: %s",
+                    target.name,
+                    self._safe_error_text(exc),
+                )
                 cur_raw = raw
             self.backend.execute_python(
                 cur_raw,
@@ -1689,47 +1634,10 @@ class ConsoleOrchestrator:
             return
 
         wd_src = _watchdog_source()
-        patch_code = (
-            "import json, os, subprocess, sys, tempfile, time\n"
-            f"{_VM_PID_ALIVE_FN}"
-            "wd_dir = '/root/.colab-boost/watchdog'\n"
-            "os.makedirs(wd_dir, exist_ok=True)\n"
-            "cfg_path = wd_dir + '/watchdog.json'\n"
-            "pid_path = wd_dir + '/watchdog.pid'\n"
-            "script_path = wd_dir + '/watchdog.py'\n"
-            "cfg = {}\n"
-            "if os.path.exists(cfg_path):\n"
-            "    try: cfg = json.load(open(cfg_path, encoding='utf-8'))\n"
-            "    except Exception: cfg = {}\n"
-            "existing_hooks = cfg.get('hooks') if isinstance(cfg.get('hooks'), list) else []\n"
-            f"for h in {hooks!r}:\n"
-            "    if h not in existing_hooks:\n"
-            "        existing_hooks.append(h)\n"
-            "cfg['hooks'] = existing_hooks\n"
-            "def _atomic_w(dst_path, txt):\n"
-            "    fd, tmp_p = tempfile.mkstemp(dir=wd_dir, prefix='.wd.', suffix='.tmp')\n"
-            "    try:\n"
-            "        with os.fdopen(fd, 'w', encoding='utf-8') as fh:\n"
-            "            fh.write(txt)\n"
-            "            fh.flush()\n"
-            "        os.replace(tmp_p, dst_path)\n"
-            "    except Exception:\n"
-            "        try: os.remove(tmp_p)\n"
-            "        except OSError: pass\n"
-            "        raise\n"
-            "_atomic_w(cfg_path, json.dumps(cfg))\n"
-            "has_guard = bool(cfg.get('deadline_epoch') or cfg.get('remaining_s') or cfg.get('idle_timeout_s'))\n"
-            "pid = 0\n"
-            "if os.path.exists(pid_path):\n"
-            "    try: pid = int(open(pid_path).read().strip())\n"
-            "    except Exception: pid = 0\n"
-            "alive = _pid_alive(pid)\n"
-            "if has_guard and not alive:\n"
-            f"    _atomic_w(script_path, {wd_src!r})\n"
-            "    p = subprocess.Popen([sys.executable, script_path, '--config', cfg_path], "
-            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
-            "    pid = p.pid\n"
-            f"print({RESULT_MARKER!r} + json.dumps({{'hooks_count': len(existing_hooks), 'pid': pid}}), flush=True)\n"
+        patch_code = build_watchdog_patch_respawn_script(
+            wd_src,
+            append_hooks=hooks,
+            respawn_only_if_guarded=True,
         )
         be = self._direct_backend if eff_real else self.backend
         be.execute_python(raw, patch_code, timeout_s=25.0)
@@ -1811,87 +1719,11 @@ class ConsoleOrchestrator:
         spec_list = [{"path": kp.path, "slug": _sanitize_keep_slug(kp.path)} for kp in run.keep_paths]
         inline_limit = 8 * 1024 * 1024
         chunk_bytes = 8 * 1024 * 1024
-        fetch_code = (
-            "import base64, hashlib, json, os, shutil, tarfile\n"
-            f"specs = {spec_list!r}\n"
-            "keep_root = os.environ.get('BOOST_KEEP_STAGE_DIR', '/root/.colab-boost/keep')\n"
-            f"stage_root = os.path.join(keep_root, {run.run_id!r})\n"
-            "os.makedirs(stage_root, exist_ok=True)\n"
-            "stage_manifest = os.path.join(stage_root, 'keep_manifest.json')\n"
-            "drive_map = {}\n"
-            "if os.path.exists(stage_manifest):\n"
-            "    try:\n"
-            "        for it in json.load(open(stage_manifest, encoding='utf-8')).get('items', []):\n"
-            "            drive_map[it.get('path')] = bool(it.get('drive_synced'))\n"
-            "    except Exception:\n"
-            "        pass\n"
-            "drive_mount = os.environ.get('BOOST_DRIVE_MOUNT', '/content/drive/MyDrive')\n"
-            f"drive_root = os.path.join(drive_mount, 'ColabBoost', {run.session_name!r}, {run.run_id!r})\n"
-            "has_drive = os.path.isdir(drive_mount)\n"
-            "if has_drive:\n"
-            "    os.makedirs(drive_root, exist_ok=True)\n"
-            "def _tar_filter(ti):\n"
-            "    if ti.issym() and (ti.linkname.startswith('/') or '..' in ti.linkname.split('/')):\n"
-            "        return None\n"
-            "    if not (ti.isfile() or ti.isdir() or ti.issym()):\n"
-            "        return None\n"
-            "    return ti\n"
-            "results = []\n"
-            "for sp in specs:\n"
-            "    p = sp['path']\n"
-            "    slug = sp['slug']\n"
-            "    fc = 0\n"
-            "    tb = 0\n"
-            "    b64 = ''\n"
-            "    stage_arc = ''\n"
-            "    arc_bytes = 0\n"
-            "    arc_sha = ''\n"
-            "    err_msg = ''\n"
-            "    ds = bool(drive_map.get(p, False))\n"
-            "    exists = os.path.lexists(p)\n"
-            "    if exists:\n"
-            "        if os.path.isfile(p) and not os.path.islink(p):\n"
-            "            fc = 1\n"
-            "            tb = os.path.getsize(p)\n"
-            "        elif os.path.isdir(p) and not os.path.islink(p):\n"
-            "            for r, _, fs in os.walk(p, followlinks=False):\n"
-            "                for fn in fs:\n"
-            "                    fp = os.path.join(r, fn)\n"
-            "                    if os.path.islink(fp):\n"
-            "                        continue\n"
-            "                    try:\n"
-            "                        if os.path.isfile(fp):\n"
-            "                            fc += 1\n"
-            "                            tb += os.path.getsize(fp)\n"
-            "                    except OSError:\n"
-            "                        pass\n"
-            "        stage_arc = os.path.join(stage_root, slug + '.tar.gz')\n"
-            "        tmp_arc = stage_arc + '.tmp'\n"
-            "        try:\n"
-            "            with tarfile.open(tmp_arc, mode='w:gz') as tf:\n"
-            "                tf.add(p, arcname=os.path.basename(p.rstrip('/')) or slug, recursive=True, filter=_tar_filter)\n"
-            "            os.replace(tmp_arc, stage_arc)\n"
-            "            arc_bytes = os.path.getsize(stage_arc)\n"
-            "            h = hashlib.sha256()\n"
-            "            with open(stage_arc, 'rb') as hfh:\n"
-            "                for blk in iter(lambda: hfh.read(4 * 1024 * 1024), b''):\n"
-            "                    h.update(blk)\n"
-            "            arc_sha = h.hexdigest()\n"
-            "            if has_drive:\n"
-            "                try:\n"
-            "                    shutil.copy2(stage_arc, os.path.join(drive_root, slug + '.tar.gz'))\n"
-            "                    ds = True\n"
-            "                except OSError:\n"
-            "                    pass\n"
-            f"            if arc_bytes <= {inline_limit}:\n"
-            "                raw_tar = open(stage_arc, 'rb').read()\n"
-            "                b64 = base64.b64encode(raw_tar).decode('ascii')\n"
-            "        except Exception as exc:\n"
-            "            try: os.remove(tmp_arc)\n"
-            "            except OSError: pass\n"
-            "            err_msg = str(exc)\n"
-            "    results.append({'path': p, 'slug': slug, 'exists': exists, 'file_count': fc, 'total_bytes': tb, 'b64': b64, 'stage_archive': stage_arc, 'archive_bytes': arc_bytes, 'archive_sha256': arc_sha, 'drive_synced': ds, 'error': err_msg})\n"
-            f"print({RESULT_MARKER!r} + json.dumps({{'items': results}}), flush=True)\n"
+        fetch_code = build_keep_sync_script(
+            run.run_id,
+            run.session_name,
+            spec_list,
+            inline_limit_bytes=inline_limit,
         )
         res = self._direct_backend.execute_python(raw, fetch_code, timeout_s=120.0)
         if not res.ok or not res.marker_json:
@@ -2046,48 +1878,7 @@ class ConsoleOrchestrator:
         )
 
     def _build_poll_snippet(self, vm_run_dir: str, keep_specs: list[RecipeKeepSpec]) -> str:
-        if not keep_specs:
-            return (
-                "import json, os\n"
-                f"{_VM_PID_ALIVE_FN}"
-                f"d = {vm_run_dir!r}\n"
-                "ex = os.path.isdir(d)\n"
-                "st = json.load(open(d + '/status.json')) if os.path.exists(d + '/status.json') else None\n"
-                "pid = int(open(d + '/worker.pid').read().strip()) if os.path.exists(d + '/worker.pid') else 0\n"
-                "alive = _pid_alive(pid)\n"
-                "lines = open(d + '/run.log', errors='replace').readlines()[-35:] if os.path.exists(d + '/run.log') else []\n"
-                f"print({RESULT_MARKER!r} + json.dumps({{'exists': ex, 'status': st, 'alive': alive, 'tail': [x.rstrip() for x in lines]}}), flush=True)\n"
-            )
-        kpaths = [kp.path for kp in keep_specs]
-        return (
-            "import json, os\n"
-            f"{_VM_PID_ALIVE_FN}"
-            f"d = {vm_run_dir!r}\n"
-            "ex = os.path.isdir(d)\n"
-            "st = json.load(open(d + '/status.json')) if os.path.exists(d + '/status.json') else None\n"
-            "pid = int(open(d + '/worker.pid').read().strip()) if os.path.exists(d + '/worker.pid') else 0\n"
-            "alive = _pid_alive(pid)\n"
-            "lines = open(d + '/run.log', errors='replace').readlines()[-35:] if os.path.exists(d + '/run.log') else []\n"
-            "ks = {}\n"
-            f"for kp in {kpaths!r}:\n"
-            "    fc, tb = 0, 0\n"
-            "    if os.path.isfile(kp) and not os.path.islink(kp):\n"
-            "        fc, tb = 1, os.path.getsize(kp)\n"
-            "    elif os.path.isdir(kp) and not os.path.islink(kp):\n"
-            "        for r, _, fs in os.walk(kp, followlinks=False):\n"
-            "            for fn in fs:\n"
-            "                fp = os.path.join(r, fn)\n"
-            "                if os.path.islink(fp):\n"
-            "                    continue\n"
-            "                try:\n"
-            "                    if os.path.isfile(fp):\n"
-            "                        fc += 1\n"
-            "                        tb += os.path.getsize(fp)\n"
-            "                except OSError:\n"
-            "                    pass\n"
-            "    ks[kp] = {'file_count': fc, 'total_bytes': tb}\n"
-            f"print({RESULT_MARKER!r} + json.dumps({{'exists': ex, 'status': st, 'alive': alive, 'tail': [x.rstrip() for x in lines], 'keep_stats': ks}}), flush=True)\n"
-        )
+        return build_worker_poll_script(vm_run_dir, [kp.path for kp in keep_specs])
 
     def _merge_keep_stats(
         self,
@@ -2262,7 +2053,12 @@ class ConsoleOrchestrator:
                         "poll_failed",
                         f"Worker status poll failed after restart: {(pr.stderr or pr.error_value or 'missing status marker')[:200]}",
                     )
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "Initial status poll failed for run %s during restart reconcile: %s",
+                    run.run_id,
+                    self._safe_error_text(exc),
+                )
                 if recipe is not None:
                     self._mark_real_run(run.run_id, secrets, session_endpoint=raw.endpoint)
                     self._spawn_reattached_poller(run, recipe, secrets, initial_raw=raw)
@@ -2419,8 +2215,8 @@ class ConsoleOrchestrator:
                 elif k == "outputs" and isinstance(v, dict):
                     v = redact_value(v, eff_secrets)
                 setattr(run, k, v)
-            self._save_real_runs()
             snap = self._localize_run_copy(run)
+            self._save_real_runs()
         if new_state in ("ready", "failed", "cancelled"):
             self.vault.delete_run_secrets(run_id)
         self._emit("run_updated", snap.model_dump(mode="json"))
@@ -2475,13 +2271,19 @@ class ConsoleOrchestrator:
                 if run.provisioned_session and run.stop_session_on_failure and sess_stub.endpoint:
                     try:
                         self.stop_session(sess_stub.endpoint, account_id=sess_stub.account_id, reason="deploy_failed_cleanup")
-                    except Exception:
-                        pass
+                    except Exception as stop_exc:
+                        logger.warning(
+                            "Cleanup stop failed for reattached run %s (%s): %s",
+                            run.run_id,
+                            sess_stub.endpoint,
+                            self._safe_error_text(stop_exc),
+                        )
                 st = "cancelled" if cancel_ev.is_set() else "failed"
                 self._mark_real_run(run.run_id, secrets, state=st, message=str(exc), finished_at=_utc_now())
             finally:
                 with self._lock:
                     self._run_cancels.pop(run.run_id, None)
+                    self._prune_runs_locked(self._real_runs)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2531,7 +2333,12 @@ class ConsoleOrchestrator:
         if not provisioned_fresh and req.session_name:
             try:
                 existing_sessions = self.list_sessions(include_all_accounts=True)
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Failed listing sessions while resolving reused session %s: %s",
+                    req.session_name,
+                    self._safe_error_text(exc),
+                )
                 existing_sessions = []
             matched_sess = next(
                 (s for s in existing_sessions if s.name == req.session_name or s.endpoint == req.session_name),
@@ -2585,8 +2392,10 @@ class ConsoleOrchestrator:
             started_at=_utc_now(),
         )
         with self._lock:
-            (self._real_runs if is_real_mode else self._mock_runs)[run_id] = run
+            target_runs = self._real_runs if is_real_mode else self._mock_runs
+            target_runs[run_id] = run
             self._run_cancels[run_id] = cancel_ev
+            self._prune_runs_locked(target_runs)
             if is_real_mode:
                 self._save_real_runs()
         self._emit("run_updated", run.model_dump(mode="json"))
@@ -2631,6 +2440,8 @@ class ConsoleOrchestrator:
                     run.message = "Cancelling deployment..."
                 if is_real_run:
                     self._save_real_runs()
+                else:
+                    self._prune_runs_locked(runs_map)
                 snap_payload = self._localize_run_copy(run).model_dump(mode="json")
                 cleaned_real = is_real_run and ev is None
             result = self._localize_run_copy(run)
@@ -2666,9 +2477,11 @@ class ConsoleOrchestrator:
                 elif k == "outputs" and isinstance(v, dict):
                     v = redact_value(v, eff_secrets)
                 setattr(run, k, v)
+            snap = self._localize_run_copy(run)
             if eff_real:
                 self._save_real_runs()
-            snap = self._localize_run_copy(run)
+            elif run.state in _TERMINAL_RUN_STATES:
+                self._prune_runs_locked(runs_map)
         if eff_real and new_state in ("ready", "failed", "cancelled"):
             self.vault.delete_run_secrets(run_id)
         self._emit("run_updated", snap.model_dump(mode="json"))
@@ -2746,13 +2559,19 @@ class ConsoleOrchestrator:
             if provisioned_fresh and stop_on_failure and session_info:
                 try:
                     self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_failed_cleanup")
-                except Exception:
-                    pass
+                except Exception as stop_exc:
+                    logger.warning(
+                        "Cleanup stop failed for deployment %s (%s): %s",
+                        run_id,
+                        session_info.endpoint,
+                        self._safe_error_text(stop_exc),
+                    )
             state = "cancelled" if cancel_ev.is_set() else "failed"
             self._update_run(run_id, secrets, is_real=is_real_mode, state=state, message=str(exc), finished_at=_utc_now())
         finally:
             with self._lock:
                 self._run_cancels.pop(run_id, None)
+                self._prune_runs_locked(self._real_runs if is_real_mode else self._mock_runs)
 
     def _simulate_mock_deployment(
         self,
@@ -2986,16 +2805,21 @@ class ConsoleOrchestrator:
             )
             try:
                 be.execute_python(raw, kill_code, timeout_s=15.0)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Best-effort worker kill failed for run %s: %s", run_id, self._safe_error_text(exc))
             with self._lock:
                 r_obj = (self._real_runs if use_direct_backend else self._runs_dict()).get(run_id)
                 was_provisioned = bool(r_obj and r_obj.provisioned_session)
             if was_provisioned:
                 try:
                     self.stop_session(session_info.endpoint, account_id=session_info.account_id, reason="deploy_cancelled")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "Cleanup stop failed after cancelling run %s (%s): %s",
+                        run_id,
+                        session_info.endpoint,
+                        self._safe_error_text(exc),
+                    )
             _update(run_id, secrets, state="cancelled", message="Cancelled by user.", finished_at=_utc_now())
 
         consecutive_poll_errors = 0
@@ -3013,8 +2837,12 @@ class ConsoleOrchestrator:
                 try:
                     raw = fetch_fresh_assignment()
                     raw_fetched_at = time.monotonic()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "Proactive proxy token refresh failed for run %s: %s",
+                        run_id,
+                        self._safe_error_text(exc),
+                    )
 
             try:
                 pr = be.execute_python(raw, poll_snippet, timeout_s=25.0)
@@ -3358,8 +3186,9 @@ class ConsoleOrchestrator:
                 except ColabBackendError as re_exc:
                     if re_exc.kind == "runtime_lost":
                         raise
-                except Exception:
-                    pass
+                    logger.debug("Upload proactive token refresh skipped (%s): %s", re_exc.kind, self._safe_error_text(re_exc))
+                except Exception as exc:
+                    logger.debug("Upload proactive token refresh failed: %s", self._safe_error_text(exc))
 
         def _exec_chunk_with_retry(code_str: str, *, timeout_s: float, desc: str) -> ExecResult:
             nonlocal raw, raw_fetched_at
@@ -3380,8 +3209,9 @@ class ConsoleOrchestrator:
                     except ColabBackendError as re_exc:
                         if re_exc.kind == "runtime_lost":
                             raise
-                    except Exception:
-                        pass
+                        logger.debug("Upload retry token refresh failed (%s): %s", re_exc.kind, self._safe_error_text(re_exc))
+                    except Exception as exc:
+                        logger.debug("Upload retry token refresh failed: %s", self._safe_error_text(exc))
                     time.sleep(0.15 * (attempt + 1))
             raise ColabBackendError("upload_failed", f"{desc} failed: {last_err}")
 
@@ -3464,8 +3294,12 @@ class ConsoleOrchestrator:
                     f"import os\ntry:\n    os.remove({part_path!r})\nexcept OSError:\n    pass\n",
                     timeout_s=15.0,
                 )
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                logger.debug(
+                    "Best-effort remote partial file cleanup failed for %s: %s",
+                    part_path,
+                    self._safe_error_text(cleanup_exc),
+                )
             raise
 
         return {

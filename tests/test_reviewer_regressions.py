@@ -1676,3 +1676,104 @@ def test_real_poll_error_cancel_race_mode_switch_reconcile_keep_stats_and_keep_s
         assert captured_shapes == [MachineShape.HIGH_RAM]
     finally:
         orch_c2.shutdown()
+
+
+def test_remote_scripts_builders_execute_and_preserve_safety_invariants(tmp_path: Path) -> None:
+    """Directly unit-tests vm_assets.remote_scripts builders for tar filtering, stats walking, poll & watchdog patching."""
+    import os
+    import subprocess
+    import sys
+    import tarfile
+
+    from colab_boost.vm_assets.remote_scripts import (
+        build_keep_sync_script,
+        build_keep_winddown_hook_script,
+        build_watchdog_install_script,
+        build_watchdog_patch_respawn_script,
+        build_worker_poll_script,
+    )
+
+    out_dir = tmp_path / "artifacts"
+    out_dir.mkdir()
+    (out_dir / "model_out.bin").write_bytes(b"hello-world-12345")
+    try:
+        os.symlink("../escape.txt", out_dir / "bad_rel_link")
+        os.symlink("/etc/passwd", out_dir / "bad_abs_link")
+    except OSError:
+        pass
+
+    specs = [{"path": out_dir.as_posix(), "slug": "artifacts"}]
+    stage_dir = tmp_path / "stage"
+    drive_dir = tmp_path / "drive"
+    drive_dir.mkdir()
+    env = {
+        **dict(os.environ),
+        "BOOST_KEEP_STAGE_DIR": str(stage_dir),
+        "BOOST_DRIVE_MOUNT": str(drive_dir),
+    }
+
+    # 1. Wind-down hook script archives files, skips escaping symlinks, writes manifest & copies to Drive
+    hook_src = build_keep_winddown_hook_script("run-unit-1", "sess-unit", specs)
+    compile(hook_src, "<keep_hook>", "exec")
+    subprocess.run([sys.executable, "-c", hook_src], env=env, check=True, timeout=15)
+    manifest = json.loads((stage_dir / "run-unit-1" / "keep_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["items"][0]["file_count"] == 1
+    assert manifest["items"][0]["total_bytes"] == 17
+    assert manifest["items"][0]["drive_synced"] is True
+    arc_path = Path(manifest["items"][0]["archive"])
+    with tarfile.open(arc_path, "r:gz") as tf:
+        names = tf.getnames()
+        assert any(n.endswith("model_out.bin") for n in names)
+        assert not any("bad_rel_link" in n or "bad_abs_link" in n for n in names)
+
+    # 2. Keep sync script returns RESULT_MARKER JSON with SHA256 and inline b64
+    sync_src = build_keep_sync_script("run-unit-1", "sess-unit", specs, inline_limit_bytes=1024 * 1024)
+    compile(sync_src, "<keep_sync>", "exec")
+    sync_out = subprocess.run([sys.executable, "-c", sync_src], env=env, capture_output=True, text=True, check=True, timeout=15).stdout
+    sync_marker = json.loads(next(line[len(RESULT_MARKER):] for line in sync_out.splitlines() if line.startswith(RESULT_MARKER)))
+    item = sync_marker["items"][0]
+    assert item["file_count"] == 1
+    assert item["total_bytes"] == 17
+    assert len(item["archive_sha256"]) == 64
+    assert bool(item["b64"])
+
+    # 3. Worker poll script reports status, tail, and keep_stats cleanly
+    run_dir = tmp_path / "vm_run"
+    run_dir.mkdir()
+    (run_dir / "status.json").write_text(json.dumps({"state": "running", "stage": "download"}), encoding="utf-8")
+    (run_dir / "run.log").write_text("line1\nline2\n", encoding="utf-8")
+    poll_src = build_worker_poll_script(run_dir.as_posix(), [out_dir.as_posix()])
+    compile(poll_src, "<worker_poll>", "exec")
+    poll_out = subprocess.run([sys.executable, "-c", poll_src], capture_output=True, text=True, check=True, timeout=15).stdout
+    poll_marker = json.loads(next(line[len(RESULT_MARKER):] for line in poll_out.splitlines() if line.startswith(RESULT_MARKER)))
+    assert poll_marker["exists"] is True
+    assert poll_marker["status"]["state"] == "running"
+    assert poll_marker["tail"] == ["line1", "line2"]
+    assert poll_marker["keep_stats"][out_dir.as_posix()] == {"file_count": 1, "total_bytes": 17}
+
+    # 4. Watchdog install & patch/respawn scripts compile cleanly and contain expected guards
+    install_src = build_watchdog_install_script("print('wd')", '{"remaining_s": 600}', "[]")
+    compile(install_src, "<wd_install>", "exec")
+    assert "tempfile.mkstemp" in install_src
+    assert "--hooks-stdin" in install_src
+
+    ext_src = build_watchdog_patch_respawn_script(
+        "print('wd')",
+        deadline_epoch=1234567890.0,
+        remaining_s=3600.0,
+        default_idle_s=1800,
+        touch_heartbeat=True,
+    )
+    compile(ext_src, "<wd_extend>", "exec")
+    assert "os.utime(hb_file, None)" in ext_src
+    assert "cfg['remaining_s'] =" in ext_src
+    assert "/proc/{pid}/stat" in ext_src
+
+    hook_patch_src = build_watchdog_patch_respawn_script(
+        "print('wd')",
+        append_hooks=[{"argv": ["echo", "hi"], "timeout_s": 10}],
+        respawn_only_if_guarded=True,
+    )
+    compile(hook_patch_src, "<wd_hooks>", "exec")
+    assert "existing_hooks = cfg.get('hooks')" in hook_patch_src
+    assert "if has_guard and not alive:" in hook_patch_src

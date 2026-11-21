@@ -676,3 +676,149 @@ def test_update_settings_does_not_hold_lock_during_tunnel_stop_all(isolated_path
         assert lock_was_free[0] is True
     finally:
         orch.shutdown()
+
+
+def test_shutdown_closes_tunnels_and_direct_backend_and_handles_errors(isolated_paths: WorkspacePaths) -> None:
+    """shutdown() must invoke tunnels.stop_all(), tunnels.close(), and _direct_backend.close() safely."""
+    calls: list[str] = []
+
+    class ClosableDirect(MockColabBackend):
+        @property
+        def is_mock(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            calls.append("backend.close")
+
+    orch = ConsoleOrchestrator(
+        paths=isolated_paths,
+        direct_backend=ClosableDirect("signed_out"),
+        force_file_vault=True,
+    )
+    orig_stop_all = orch.tunnels.stop_all
+    orig_close = orch.tunnels.close
+
+    def _spy_stop_all() -> int:
+        calls.append("tunnels.stop_all")
+        return orig_stop_all()
+
+    def _spy_close() -> int:
+        calls.append("tunnels.close")
+        return orig_close()
+
+    orch.tunnels.stop_all = _spy_stop_all  # type: ignore[method-assign]
+    orch.tunnels.close = _spy_close  # type: ignore[method-assign]
+
+    orch.shutdown()
+    assert "tunnels.stop_all" in calls
+    assert "tunnels.close" in calls
+    assert "backend.close" in calls
+    assert orch.tunnels._closed is True
+
+    # Even if tunnels.stop_all raises, backend.close must still be called
+    calls.clear()
+
+    def _boom_stop_all() -> int:
+        calls.append("tunnels.stop_all_boom")
+        raise RuntimeError("simulated tunnel error")
+
+    orch.tunnels.stop_all = _boom_stop_all  # type: ignore[method-assign]
+    orch.shutdown()
+    assert "tunnels.stop_all_boom" in calls
+    assert "tunnels.close" in calls
+    assert "backend.close" in calls
+
+
+def test_memory_bounds_prune_terminal_provision_ops_and_runs_preserving_active(
+    isolated_paths: WorkspacePaths,
+) -> None:
+    """In-memory _provision_ops and _real_runs/_mock_runs must prune oldest terminal entries while keeping active ones."""
+    from datetime import datetime, timedelta, timezone
+    from colab_boost.models import DeploymentRun, ProvisionOperation
+
+    orch = ConsoleOrchestrator(paths=isolated_paths, force_file_vault=True)
+    try:
+        orch._max_terminal_provision_ops = 3
+        orch._max_terminal_runs = 3
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Seed 5 terminal provision ops + 1 active provision op
+        with orch._lock:
+            for i in range(5):
+                oid = f"prov-done-{i}"
+                orch._provision_ops[oid] = ProvisionOperation(
+                    op_id=oid,
+                    session_name=f"sess-{i}",
+                    account_id="acc-1",
+                    accelerator=Accelerator.T4,
+                    state="ready" if i % 2 == 0 else "failed",
+                    started_at=base + timedelta(minutes=i),
+                    finished_at=base + timedelta(minutes=i, seconds=30),
+                )
+            orch._provision_ops["prov-active"] = ProvisionOperation(
+                op_id="prov-active",
+                session_name="sess-active",
+                account_id="acc-1",
+                accelerator=Accelerator.A100,
+                state="allocating",
+                started_at=base,
+            )
+            orch._prune_provision_ops_locked()
+
+        remaining_ops = {op.op_id for op in orch.list_provision_ops()}
+        assert "prov-active" in remaining_ops
+        assert remaining_ops == {"prov-active", "prov-done-2", "prov-done-3", "prov-done-4"}
+
+        # Seed 5 terminal real runs + 1 active real run, then save -> oldest 2 terminal runs evicted
+        with orch._lock:
+            for i in range(5):
+                rid = f"run-done-{i}"
+                orch._real_runs[rid] = DeploymentRun(
+                    run_id=rid,
+                    recipe_id="llama-cpp-gguf",
+                    recipe_name={"en": "GGUF"},
+                    account_id="acc-1",
+                    session_name=f"sess-{i}",
+                    state="ready" if i % 2 == 0 else "failed",
+                    started_at=base + timedelta(minutes=i),
+                    finished_at=base + timedelta(minutes=i, seconds=45),
+                )
+            orch._real_runs["run-active"] = DeploymentRun(
+                run_id="run-active",
+                recipe_id="llama-cpp-gguf",
+                recipe_name={"en": "GGUF"},
+                account_id="acc-1",
+                session_name="sess-live",
+                state="running",
+                started_at=base,
+            )
+            orch._save_real_runs()
+
+        assert set(orch._real_runs.keys()) == {"run-active", "run-done-2", "run-done-3", "run-done-4"}
+    finally:
+        orch.shutdown()
+
+
+def test_background_exception_logging_redacts_known_secrets(
+    isolated_paths: WorkspacePaths, caplog
+) -> None:
+    """Background warning/debug logs emitted by orchestrator must redact stored secrets."""
+    import logging
+
+    orch = ConsoleOrchestrator(paths=isolated_paths, force_file_vault=True)
+    try:
+        secret = "hf_LogRedactionSecret998877"
+        orch.vault.set_secret("hf_token", secret)
+
+        def _failing_listener(_ev: dict) -> None:
+            raise RuntimeError(f"listener leaked {secret}")
+
+        orch.subscribe(_failing_listener)
+        with caplog.at_level(logging.DEBUG, logger="colab_boost.orchestrator"):
+            orch._emit("test_event", {"ok": True})
+
+        assert any("Event listener failed" in rec.getMessage() for rec in caplog.records)
+        assert all(secret not in rec.getMessage() for rec in caplog.records)
+        assert any("***" in rec.getMessage() for rec in caplog.records)
+    finally:
+        orch.shutdown()
