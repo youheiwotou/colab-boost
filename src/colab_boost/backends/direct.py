@@ -14,12 +14,13 @@ Kernel WebSocket channel:
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import requests
 import websocket
@@ -137,6 +138,52 @@ def deserialize_jupyter_ws_message(raw: str | bytes) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
+def _parse_float_field(data: dict[str, Any], *keys: str) -> Optional[float]:
+    """Parses the first valid finite numeric field among ``keys``, rejecting ``None`` and ``bool``."""
+    for key in keys:
+        if key not in data:
+            continue
+        raw = data[key]
+        if raw is None or isinstance(raw, bool):
+            continue
+        if isinstance(raw, (int, float)):
+            val = float(raw)
+            if math.isfinite(val):
+                return val
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                continue
+            try:
+                val = float(text)
+            except ValueError:
+                continue
+            if math.isfinite(val):
+                return val
+    return None
+
+
+def _parse_int_field(data: dict[str, Any], *keys: str) -> Optional[int]:
+    val = _parse_float_field(data, *keys)
+    if val is None:
+        return None
+    return int(val)
+
+
+def _is_transient_error(exc: ColabBackendError) -> bool:
+    return exc.kind in ("timeout", "network") or exc.status_code in (502, 503, 504)
+
+
+def _is_complete_assignment(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    ep = str(item.get("endpoint") or "").strip()
+    proxy = item.get("runtimeProxyInfo")
+    if not ep or not isinstance(proxy, dict):
+        return False
+    return bool(str(proxy.get("url") or "").strip() and str(proxy.get("token") or "").strip())
+
+
 class DirectColabBackend(ColabBackend):
     def __init__(
         self,
@@ -146,12 +193,20 @@ class DirectColabBackend(ColabBackend):
         on_token_refreshed: Optional[Callable[[str, str], None]] = None,
         assign_retries: int = 2,
         retry_backoff_s: float = 5.0,
+        unassign_retries: int = 2,
+        unassign_backoff_s: float = 1.0,
+        unassign_verify_polls: int = 3,
+        unassign_verify_interval_s: float = 1.0,
     ) -> None:
         self.colab_domain = colab_domain.rstrip("/")
         self._http_session_factory = http_session_factory
         self._on_token_refreshed = on_token_refreshed
         self.assign_retries = assign_retries
         self.retry_backoff_s = retry_backoff_s
+        self.unassign_retries = unassign_retries
+        self.unassign_backoff_s = unassign_backoff_s
+        self.unassign_verify_polls = unassign_verify_polls
+        self.unassign_verify_interval_s = unassign_verify_interval_s
         self._pending_flows: dict[str, InstalledAppFlow] = {}
         self._lock = threading.Lock()
 
@@ -299,10 +354,28 @@ class DirectColabBackend(ColabBackend):
 
     def fetch_usage(self, account_id: str, token_json: str) -> UsageSnapshot:
         data = self._colab_request(token_json, "/tun/m/ccu-info", account_id=account_id, timeout=20.0)
-        bal = float(data.get("currentBalance", data.get("paidComputeUnitsBalance", 0.0)))
-        rate = float(data.get("consumptionRateHourly", 0.0))
-        count = int(data.get("assignmentsCount", 0))
-        eligible = [str(g).upper() for g in (data.get("eligibleGpus") or []) if g]
+        now = datetime.now(timezone.utc)
+        if not isinstance(data, dict) or not data:
+            return UsageSnapshot(
+                status="unknown",
+                balance_ccu=None,
+                fetched_at=now,
+                stale_reason="ccu-info returned empty or non-object payload",
+            )
+        bal = _parse_float_field(data, "currentBalance", "paidComputeUnitsBalance")
+        if bal is None:
+            return UsageSnapshot(
+                status="unknown",
+                balance_ccu=None,
+                fetched_at=now,
+                stale_reason="ccu-info missing valid balance field",
+            )
+        parsed_rate = _parse_float_field(data, "consumptionRateHourly")
+        rate = parsed_rate if parsed_rate is not None else 0.0
+        parsed_count = _parse_int_field(data, "assignmentsCount")
+        count = parsed_count if parsed_count is not None else 0
+        raw_eligible = data.get("eligibleGpus")
+        eligible = [str(g).upper() for g in raw_eligible if g] if isinstance(raw_eligible, list) else []
         hours_left = round(bal / rate, 2) if rate > 0.01 else None
         return UsageSnapshot(
             status="live",
@@ -311,7 +384,7 @@ class DirectColabBackend(ColabBackend):
             assignments_count=count,
             hours_remaining=hours_left,
             eligible_gpus=eligible,
-            fetched_at=datetime.now(timezone.utc),
+            fetched_at=now,
         )
 
     def _parse_assignment_item(self, item: dict[str, Any], default_accel: Accelerator = Accelerator.NONE) -> RawAssignment:
@@ -322,15 +395,115 @@ class DirectColabBackend(ColabBackend):
             accel = default_accel
         raw_shape = item.get("machineShape", 0)
         shape = MachineShape.HIGH_RAM if raw_shape in (1, "HIGH_RAM", "SHAPE_HIGHMEM", "hm") else MachineShape.STANDARD
-        proxy = item.get("runtimeProxyInfo") or {}
+        proxy = item.get("runtimeProxyInfo") if isinstance(item.get("runtimeProxyInfo"), dict) else {}
+        raw_exp = _parse_int_field(proxy, "tokenExpiresInSeconds")
         return RawAssignment(
-            endpoint=str(item.get("endpoint") or ""),
+            endpoint=str(item.get("endpoint") or "").strip(),
             accelerator=accel,
             machine_shape=shape,
-            proxy_url=str(proxy.get("url") or "").rstrip("/"),
-            proxy_token=str(proxy.get("token") or ""),
-            token_expires_in_seconds=int(proxy.get("tokenExpiresInSeconds") or 3600),
+            proxy_url=str(proxy.get("url") or "").strip().rstrip("/"),
+            proxy_token=str(proxy.get("token") or "").strip(),
+            token_expires_in_seconds=raw_exp if raw_exp and raw_exp > 0 else 3600,
         )
+
+    def _best_effort_unassign(self, account_id: str, token_json: str, endpoint: str) -> None:
+        if not endpoint:
+            return
+        try:
+            self.unassign_runtime(account_id, token_json, endpoint)
+        except Exception:
+            pass
+
+    def _validate_assignment_response(
+        self,
+        account_id: str,
+        token_json: str,
+        res: Any,
+        *,
+        default_accel: Accelerator,
+    ) -> RawAssignment:
+        if not isinstance(res, dict):
+            raise ColabBackendError("protocol_error", "Colab /tun/m/assign returned a non-object response.")
+
+        outcome = res.get("outcome")
+        if outcome is not None:
+            outcome_str = str(outcome).strip().upper()
+            is_ok_outcome = (
+                (isinstance(outcome, int) and not isinstance(outcome, bool) and outcome in (0, 1))
+                or outcome_str in ("", "0", "1", "SUCCESS", "OUTCOME_SUCCESS", "UNDEFINED", "OUTCOME_UNDEFINED")
+            )
+            if not is_ok_outcome:
+                leaked_ep = str(res.get("endpoint") or "").strip()
+                if leaked_ep:
+                    self._best_effort_unassign(account_id, token_json, leaked_ep)
+                if outcome == 4 or "DENYLIST" in outcome_str:
+                    raise ColabBackendError(
+                        "denylisted",
+                        f"Colab denied runtime allocation: account restricted/denylisted (outcome={outcome}).",
+                    )
+                if (
+                    (isinstance(outcome, int) and not isinstance(outcome, bool) and outcome in (2, 3, 5))
+                    or any(tok in outcome_str for tok in ("QUOTA", "DENIED", "EXCEEDED", "LIMIT", "CAPACITY"))
+                ):
+                    raise ColabBackendError(
+                        "quota_denied",
+                        f"Colab denied runtime allocation for '{default_accel.value}' due to quota or capacity (outcome={outcome}).",
+                    )
+                raise ColabBackendError(
+                    "assign_denied",
+                    f"Colab refused runtime allocation for '{default_accel.value}' (outcome={outcome}).",
+                )
+
+        parsed = self._parse_assignment_item(res, default_accel=default_accel)
+        if not parsed.endpoint:
+            raise ColabBackendError("protocol_error", "Colab /tun/m/assign response missing endpoint.")
+        if not parsed.proxy_url or not parsed.proxy_token:
+            self._best_effort_unassign(account_id, token_json, parsed.endpoint)
+            raise ColabBackendError(
+                "protocol_error",
+                f"Colab /tun/m/assign returned incomplete runtimeProxyInfo for endpoint '{parsed.endpoint}'.",
+            )
+        return parsed
+
+    def _final_assign_recheck(
+        self,
+        account_id: str,
+        token_json: str,
+        params: dict[str, str],
+        accelerator: Accelerator,
+    ) -> Optional[RawAssignment]:
+        try:
+            recheck = self._colab_request(
+                token_json,
+                "/tun/m/assign",
+                account_id=account_id,
+                method="GET",
+                params=params,
+                timeout=30.0,
+            )
+        except Exception:
+            return None
+
+        if not isinstance(recheck, dict):
+            return None
+        if _is_complete_assignment(recheck):
+            try:
+                return self._validate_assignment_response(
+                    account_id,
+                    token_json,
+                    recheck,
+                    default_accel=accelerator,
+                )
+            except ColabBackendError:
+                ep = str(recheck.get("endpoint") or "").strip()
+                if ep:
+                    self._best_effort_unassign(account_id, token_json, ep)
+                return None
+
+        partial_ep = str(recheck.get("endpoint") or "").strip()
+        if partial_ep:
+            self._best_effort_unassign(account_id, token_json, partial_ep)
+        return None
 
     def list_assignments(self, account_id: str, token_json: str) -> list[RawAssignment]:
         data = self._colab_request(token_json, "/tun/m/assignments", account_id=account_id, timeout=25.0)
@@ -360,8 +533,10 @@ class DirectColabBackend(ColabBackend):
             params["shape"] = "hm"
 
         first = self._colab_request(token_json, "/tun/m/assign", account_id=account_id, method="GET", params=params, timeout=60.0)
-        if "endpoint" in first and "runtimeProxyInfo" in first:
-            return self._parse_assignment_item(first, default_accel=accelerator)
+        if not isinstance(first, dict):
+            raise ColabBackendError("protocol_error", "Colab /tun/m/assign GET returned a non-object response.")
+        if _is_complete_assignment(first):
+            return self._validate_assignment_response(account_id, token_json, first, default_accel=accelerator)
 
         xsrf_token = str(first.get("token") or "")
         if not xsrf_token:
@@ -379,7 +554,7 @@ class DirectColabBackend(ColabBackend):
                     headers={XSRF_HEADER: xsrf_token},
                     timeout=120.0,
                 )
-                return self._parse_assignment_item(res, default_accel=accelerator)
+                return self._validate_assignment_response(account_id, token_json, res, default_accel=accelerator)
             except ColabBackendError as exc:
                 last_err = exc
                 if exc.kind == "rejected_400" and accelerator != Accelerator.NONE:
@@ -388,40 +563,96 @@ class DirectColabBackend(ColabBackend):
                         f"Your Google account is not entitled to accelerator '{accelerator.value}' (HTTP 400). Try L4 or T4.",
                         status_code=400,
                     ) from exc
+                if exc.kind in ("quota_denied", "denylisted", "assign_denied", "protocol_error"):
+                    raise
                 if exc.kind == "capacity_412" or (exc.status_code and exc.status_code not in (502, 503, 504)):
                     if exc.kind != "timeout":
                         raise
                 if attempt >= self.assign_retries:
+                    if exc.kind in ("timeout", "network"):
+                        recovered = self._final_assign_recheck(account_id, token_json, params, accelerator)
+                        if recovered is not None:
+                            return recovered
                     raise
                 time.sleep(self.retry_backoff_s * (2**attempt))
-                recheck = self._colab_request(token_json, "/tun/m/assign", account_id=account_id, method="GET", params=params, timeout=45.0)
-                if "endpoint" in recheck and "runtimeProxyInfo" in recheck:
-                    return self._parse_assignment_item(recheck, default_accel=accelerator)
+                try:
+                    recheck = self._colab_request(
+                        token_json,
+                        "/tun/m/assign",
+                        account_id=account_id,
+                        method="GET",
+                        params=params,
+                        timeout=45.0,
+                    )
+                except ColabBackendError as recheck_exc:
+                    if _is_transient_error(recheck_exc):
+                        continue
+                    raise
+                if isinstance(recheck, dict):
+                    if _is_complete_assignment(recheck):
+                        return self._validate_assignment_response(
+                            account_id,
+                            token_json,
+                            recheck,
+                            default_accel=accelerator,
+                        )
+                    fresh_xsrf = str(recheck.get("token") or "")
+                    if fresh_xsrf:
+                        xsrf_token = fresh_xsrf
+                    elif recheck.get("endpoint"):
+                        self._best_effort_unassign(account_id, token_json, str(recheck.get("endpoint") or "").strip())
 
         raise last_err or ColabBackendError("assign_failed", "Failed to allocate Colab runtime.")
+
+    def _list_assignments_with_retry(self, account_id: str, token_json: str) -> list[RawAssignment]:
+        max_retries = max(0, self.unassign_retries)
+        for attempt in range(max_retries + 1):
+            try:
+                return self.list_assignments(account_id, token_json)
+            except ColabBackendError as exc:
+                if _is_transient_error(exc) and attempt < max_retries:
+                    time.sleep(self.unassign_backoff_s * (2**attempt))
+                    continue
+                raise
+        return []
 
     def unassign_runtime(self, account_id: str, token_json: str, endpoint: str) -> bool:
         if not endpoint:
             return False
-        try:
-            prep = self._colab_request(token_json, f"/tun/m/unassign/{endpoint}", account_id=account_id, method="GET", timeout=25.0)
-            xsrf_token = str(prep.get("token") or "")
-            headers = {XSRF_HEADER: xsrf_token} if xsrf_token else {}
-            self._colab_request(
-                token_json,
-                f"/tun/m/unassign/{endpoint}",
-                account_id=account_id,
-                method="POST",
-                headers=headers,
-                timeout=30.0,
-            )
-        except ColabBackendError as exc:
-            if exc.status_code == 404:
-                return True
-            raise
+        encoded_ep = quote(endpoint, safe="")
+        unassign_path = f"/tun/m/unassign/{encoded_ep}"
+        max_retries = max(0, self.unassign_retries)
 
-        remaining = self.list_assignments(account_id, token_json)
-        return all(a.endpoint != endpoint for a in remaining)
+        for attempt in range(max_retries + 1):
+            try:
+                prep = self._colab_request(token_json, unassign_path, account_id=account_id, method="GET", timeout=25.0)
+                xsrf_token = str(prep.get("token") or "") if isinstance(prep, dict) else ""
+                headers = {XSRF_HEADER: xsrf_token} if xsrf_token else {}
+                self._colab_request(
+                    token_json,
+                    unassign_path,
+                    account_id=account_id,
+                    method="POST",
+                    headers=headers,
+                    timeout=30.0,
+                )
+                break
+            except ColabBackendError as exc:
+                if exc.status_code == 404:
+                    return True
+                if _is_transient_error(exc) and attempt < max_retries:
+                    time.sleep(self.unassign_backoff_s * (2**attempt))
+                    continue
+                raise
+
+        polls = max(1, self.unassign_verify_polls)
+        for poll_idx in range(polls):
+            remaining = self._list_assignments_with_retry(account_id, token_json)
+            if all(a.endpoint != endpoint for a in remaining):
+                return True
+            if poll_idx + 1 < polls and self.unassign_verify_interval_s > 0:
+                time.sleep(self.unassign_verify_interval_s)
+        return False
 
     # -------------------- Jupyter Kernel WebSocket Execution --------------------
 

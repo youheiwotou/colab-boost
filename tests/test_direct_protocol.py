@@ -281,3 +281,329 @@ def test_direct_jupyter_kernel_websocket_execution_wire_protocol() -> None:
     finally:
         ws_loop_holder[0].call_soon_threadsafe(stop_ws_holder[0].set)
 
+
+def test_fetch_usage_never_coerces_missing_empty_or_invalid_balance_to_zero() -> None:
+    payloads: list[tuple[int, str]] = [
+        (200, XSSI_PREFIX + "{}"),
+        (200, ""),
+        (200, XSSI_PREFIX + "[]"),
+        (200, XSSI_PREFIX + json.dumps({"consumptionRateHourly": 2.5, "assignmentsCount": 1})),
+        (200, XSSI_PREFIX + json.dumps({"currentBalance": None})),
+        (200, XSSI_PREFIX + json.dumps({"currentBalance": True})),
+        (200, XSSI_PREFIX + json.dumps({"currentBalance": "not-a-number"})),
+        (200, XSSI_PREFIX + json.dumps({"currentBalance": None, "paidComputeUnitsBalance": 42.25})),
+        (200, XSSI_PREFIX + json.dumps({"currentBalance": 0.0, "consumptionRateHourly": 0.0})),
+    ]
+    idx = [0]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            code, body = payloads[idx[0]]
+            idx[0] += 1
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+
+        def log_message(self, *_args):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        host, port = srv.server_address
+        backend = DirectColabBackend(
+            colab_domain=f"http://{host}:{port}",
+            http_session_factory=lambda _tok: requests.Session(),
+        )
+        # First 7 invalid/missing/empty cases MUST all return status='unknown' and balance_ccu=None
+        for _ in range(7):
+            snap = backend.fetch_usage("acc-1", "{}")
+            assert snap.status == "unknown"
+            assert snap.balance_ccu is None
+            assert snap.stale_reason
+
+        # Fallback to paidComputeUnitsBalance when currentBalance is null
+        snap_fallback = backend.fetch_usage("acc-1", "{}")
+        assert snap_fallback.status == "live"
+        assert snap_fallback.balance_ccu == 42.25
+
+        # Legitimate explicit 0.0 balance stays live
+        snap_zero = backend.fetch_usage("acc-1", "{}")
+        assert snap_zero.status == "live"
+        assert snap_zero.balance_ccu == 0.0
+    finally:
+        srv.shutdown()
+
+
+def test_unassign_runtime_url_encoding_transient_retry_and_eventual_consistency() -> None:
+    special_ep = "ep/with space?x=1"
+    seen_paths: list[str] = []
+    counts = {"get": 0, "post": 0, "list": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _xssi(self, code: int, obj: dict) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write((XSSI_PREFIX + json.dumps(obj)).encode("utf-8"))
+
+        def do_GET(self):  # noqa: N802
+            seen_paths.append(self.path)
+            if self.path.startswith("/tun/m/unassign/"):
+                counts["get"] += 1
+                if counts["get"] == 1:
+                    self._xssi(503, {"error": "transient get"})
+                    return
+                self._xssi(200, {"token": f"xsrf-{counts['get']}"})
+            elif self.path.startswith("/tun/m/assignments"):
+                counts["list"] += 1
+                if counts["list"] == 1:
+                    self._xssi(503, {"error": "transient list"})
+                    return
+                if counts["list"] == 2:
+                    # Eventual consistency lag: endpoint still listed once right after POST
+                    self._xssi(200, {"assignments": [{"endpoint": special_ep, "accelerator": "T4"}]})
+                    return
+                self._xssi(200, {"assignments": []})
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):  # noqa: N802
+            seen_paths.append(self.path)
+            if self.path.startswith("/tun/m/unassign/"):
+                counts["post"] += 1
+                if counts["post"] == 1:
+                    self._xssi(502, {"error": "transient post"})
+                    return
+                self._xssi(200, {})
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *_args):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        host, port = srv.server_address
+        backend = DirectColabBackend(
+            colab_domain=f"http://{host}:{port}",
+            http_session_factory=lambda _tok: requests.Session(),
+            unassign_retries=3,
+            unassign_backoff_s=0.01,
+            unassign_verify_polls=3,
+            unassign_verify_interval_s=0.01,
+        )
+        assert backend.unassign_runtime("acc-1", "{}", special_ep) is True
+        assert any(p.startswith("/tun/m/unassign/ep%2Fwith%20space%3Fx%3D1?") for p in seen_paths)
+        assert counts["get"] == 3  # 1 failed 503 + 1 before failed POST + 1 before success POST
+        assert counts["post"] == 2
+        assert counts["list"] == 3  # 1 failed 503 + 1 stale poll + 1 empty confirmed
+    finally:
+        srv.shutdown()
+
+
+def test_assign_runtime_validates_outcome_and_cleans_up_incomplete_proxy() -> None:
+    mode = ["quota"]
+    unassigned_eps: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _xssi(self, code: int, obj: dict) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write((XSSI_PREFIX + json.dumps(obj)).encode("utf-8"))
+
+        def do_GET(self):  # noqa: N802
+            if self.path.startswith("/tun/m/assign"):
+                self._xssi(200, {"token": "xsrf-1"})
+            elif self.path.startswith("/tun/m/unassign/"):
+                self._xssi(200, {"token": "xsrf-u"})
+            elif self.path.startswith("/tun/m/assignments"):
+                self._xssi(200, {"assignments": []})
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):  # noqa: N802
+            if self.path.startswith("/tun/m/assign"):
+                if mode[0] == "quota":
+                    self._xssi(200, {"outcome": 2})
+                elif mode[0] == "denylisted":
+                    self._xssi(200, {"outcome": 4})
+                elif mode[0] == "empty":
+                    self._xssi(200, {})
+                elif mode[0] == "half":
+                    self._xssi(200, {"endpoint": "ep-half-broken", "accelerator": "A100", "runtimeProxyInfo": {}})
+            elif self.path.startswith("/tun/m/unassign/"):
+                ep = self.path.split("/tun/m/unassign/", 1)[1].split("?", 1)[0]
+                unassigned_eps.append(ep)
+                self._xssi(200, {})
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *_args):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        host, port = srv.server_address
+        backend = DirectColabBackend(
+            colab_domain=f"http://{host}:{port}",
+            http_session_factory=lambda _tok: requests.Session(),
+            assign_retries=1,
+            retry_backoff_s=0.01,
+            unassign_backoff_s=0.01,
+            unassign_verify_interval_s=0.01,
+        )
+
+        mode[0] = "quota"
+        with pytest.raises(ColabBackendError) as e_quota:
+            backend.assign_runtime("acc-1", "{}", Accelerator.A100)
+        assert e_quota.value.kind == "quota_denied"
+
+        mode[0] = "denylisted"
+        with pytest.raises(ColabBackendError) as e_deny:
+            backend.assign_runtime("acc-1", "{}", Accelerator.A100)
+        assert e_deny.value.kind == "denylisted"
+
+        mode[0] = "empty"
+        with pytest.raises(ColabBackendError) as e_empty:
+            backend.assign_runtime("acc-1", "{}", Accelerator.A100)
+        assert e_empty.value.kind == "protocol_error"
+
+        mode[0] = "half"
+        with pytest.raises(ColabBackendError) as e_half:
+            backend.assign_runtime("acc-1", "{}", Accelerator.A100)
+        assert e_half.value.kind == "protocol_error"
+        assert "ep-half-broken" in unassigned_eps
+    finally:
+        srv.shutdown()
+
+
+def test_assign_runtime_recheck_xsrf_refresh_transient_recheck_and_final_timeout_recovery() -> None:
+    # 1. Recheck 503 does not abort retry, and fresh XSRF token from recheck is used on subsequent POST
+    get_calls = [0]
+    post_xsrfs: list[str] = []
+
+    class RetryHandler(BaseHTTPRequestHandler):
+        def _xssi(self, code: int, obj: dict) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write((XSSI_PREFIX + json.dumps(obj)).encode("utf-8"))
+
+        def do_GET(self):  # noqa: N802
+            if self.path.startswith("/tun/m/assign"):
+                get_calls[0] += 1
+                if get_calls[0] == 1:
+                    self._xssi(200, {"token": "xsrf-v1"})
+                elif get_calls[0] == 2:
+                    self._xssi(503, {"error": "recheck blip"})
+                else:
+                    self._xssi(200, {"token": "xsrf-v2"})
+
+        def do_POST(self):  # noqa: N802
+            xsrf = self.headers.get("X-Goog-Colab-Token") or ""
+            post_xsrfs.append(xsrf)
+            if xsrf != "xsrf-v2":
+                self._xssi(503, {"error": "stale or busy"})
+                return
+            self._xssi(
+                200,
+                {
+                    "endpoint": "ep-recovered-xsrf",
+                    "accelerator": "L4",
+                    "runtimeProxyInfo": {"url": "https://ep-recovered-xsrf.colab.test", "token": "tok-ok"},
+                },
+            )
+
+        def log_message(self, *_args):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), RetryHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        host, port = srv.server_address
+        backend = DirectColabBackend(
+            colab_domain=f"http://{host}:{port}",
+            http_session_factory=lambda _tok: requests.Session(),
+            assign_retries=2,
+            retry_backoff_s=0.01,
+        )
+        raw = backend.assign_runtime("acc-1", "{}", Accelerator.L4)
+        assert raw.endpoint == "ep-recovered-xsrf"
+        assert post_xsrfs == ["xsrf-v1", "xsrf-v1", "xsrf-v2"]
+    finally:
+        srv.shutdown()
+
+    # 2. Final attempt timeout triggers final recheck: recovers valid VM if allocated, or cleans up half-baked VM
+    class FakeTimeoutSession:
+        def __init__(self, final_recheck_body: dict) -> None:
+            self.final_recheck_body = final_recheck_body
+            self.get_count = 0
+            self.unassign_posts: list[str] = []
+
+        def request(self, method: str, url: str, **_kwargs):
+            resp = requests.Response()
+            resp.status_code = 200
+            if "/tun/m/unassign/" in url:
+                if method == "POST":
+                    self.unassign_posts.append(url)
+                    resp._content = (XSSI_PREFIX + "{}").encode("utf-8")
+                else:
+                    resp._content = (XSSI_PREFIX + json.dumps({"token": "xsrf-u"})).encode("utf-8")
+                return resp
+            if "/tun/m/assignments" in url:
+                resp._content = (XSSI_PREFIX + json.dumps({"assignments": []})).encode("utf-8")
+                return resp
+            if method == "GET":
+                self.get_count += 1
+                if self.get_count == 1:
+                    resp._content = (XSSI_PREFIX + json.dumps({"token": "xsrf-init"})).encode("utf-8")
+                else:
+                    resp._content = (XSSI_PREFIX + json.dumps(self.final_recheck_body)).encode("utf-8")
+                return resp
+            raise requests.exceptions.Timeout("read timed out")
+
+    # 2a: Final recheck recovers complete VM
+    sess_ok = FakeTimeoutSession(
+        {
+            "endpoint": "ep-after-timeout",
+            "accelerator": "A100",
+            "runtimeProxyInfo": {"url": "https://ep-after-timeout.colab.test", "token": "tok-after"},
+        }
+    )
+    be_ok = DirectColabBackend(
+        http_session_factory=lambda _tok: sess_ok,
+        assign_retries=0,
+        retry_backoff_s=0.01,
+    )
+    recovered = be_ok.assign_runtime("acc-1", "{}", Accelerator.A100)
+    assert recovered.endpoint == "ep-after-timeout"
+    assert sess_ok.get_count == 2
+
+    # 2b: Final recheck finds half-baked VM -> cleans it up and re-raises timeout
+    sess_half = FakeTimeoutSession({"endpoint": "ep-leaked-half", "runtimeProxyInfo": {}})
+    be_half = DirectColabBackend(
+        http_session_factory=lambda _tok: sess_half,
+        assign_retries=0,
+        retry_backoff_s=0.01,
+        unassign_backoff_s=0.01,
+        unassign_verify_interval_s=0.01,
+    )
+    with pytest.raises(ColabBackendError) as exc_timeout:
+        be_half.assign_runtime("acc-1", "{}", Accelerator.A100)
+    assert exc_timeout.value.kind == "timeout"
+    assert any("ep-leaked-half" in u for u in sess_half.unassign_posts)
+
+
