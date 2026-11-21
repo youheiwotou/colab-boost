@@ -984,4 +984,332 @@ def test_base_probe_hardware_reports_error_when_execute_python_fails() -> None:
     assert hp_missing.probe_error
 
 
+def test_oauth_begin_complete_state_validation_expiry_and_exchange_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers begin_oauth_login / complete_oauth_login including state check, unknown/expired flows, and exchange failure."""
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlparse
+
+    from colab_boost.backends.direct import REMOTE_REDIRECT_URI
+
+    created_flows: list[Any] = []
+    fail_exchange = [False]
+
+    class FakeFlow:
+        def __init__(self, client_config: dict, scopes: list[str]) -> None:
+            self.client_config = client_config
+            self.scopes = scopes
+            self.redirect_uri = ""
+            self.state = "oauth-state-nonce-7788"
+            self.oauth2session = SimpleNamespace(scope="initial-scope")
+            self.fetched_codes: list[str] = []
+            self.credentials = SimpleNamespace(
+                to_json=lambda: json.dumps({"token": "tok-oauth-ok", "refresh_token": "rt-oauth-ok"})
+            )
+            created_flows.append(self)
+
+        def authorization_url(self, **kwargs: Any) -> tuple[str, str]:
+            assert kwargs.get("access_type") == "offline"
+            assert kwargs.get("prompt") == "consent"
+            assert self.redirect_uri == REMOTE_REDIRECT_URI
+            url = (
+                "https://accounts.google.com/o/oauth2/auth"
+                f"?state={self.state}&redirect_uri={self.redirect_uri}&response_type=code"
+            )
+            return url, self.state
+
+        def fetch_token(self, *, code: str) -> dict[str, Any]:
+            self.fetched_codes.append(code)
+            assert self.oauth2session.scope is None
+            if fail_exchange[0]:
+                raise ValueError("state mismatch or invalid_grant")
+            return {"access_token": "tok-oauth-ok", "scope": "openid email"}
+
+    monkeypatch.setattr(
+        "colab_boost.backends.direct.InstalledAppFlow.from_client_config",
+        staticmethod(lambda cfg, scopes: FakeFlow(cfg, scopes)),
+    )
+
+    backend = DirectColabBackend(pending_flow_ttl_s=30.0)
+    monkeypatch.setattr(
+        backend,
+        "inspect_token",
+        lambda tj: {"email": "oauth.user@example.com", "display_name": "OAuth User", "token_json": tj},
+    )
+
+    # 1. Seed a stale flow and verify begin_oauth_login prunes it and embeds state in auth_url
+    with backend._lock:
+        backend._pending_flows["oauth-expired-old"] = (0.0, FakeFlow({}, []))  # type: ignore[assignment]
+
+    started = backend.begin_oauth_login()
+    assert started["flow_id"].startswith("oauth-")
+    assert "oauth-expired-old" not in backend._pending_flows
+    qs = parse_qs(urlparse(started["auth_url"]).query)
+    assert qs["state"] == ["oauth-state-nonce-7788"]
+    assert qs["redirect_uri"] == [REMOTE_REDIRECT_URI]
+
+    # 2. Blank auth code rejected before consuming flow
+    with pytest.raises(ColabBackendError) as err_blank:
+        backend.complete_oauth_login(started["flow_id"], "   ")
+    assert err_blank.value.kind == "invalid_code"
+
+    # 3. Unknown flow_id rejected as flow_expired
+    with pytest.raises(ColabBackendError) as err_unknown:
+        backend.complete_oauth_login("oauth-unknown-999", "code-xyz")
+    assert err_unknown.value.kind == "flow_expired"
+
+    # 4. Happy-path exchange succeeds, restores oauth2session.scope, and consumes flow (single-use)
+    info = backend.complete_oauth_login(started["flow_id"], "  auth-code-123  ")
+    assert info["email"] == "oauth.user@example.com"
+    assert created_flows[-1].fetched_codes == ["auth-code-123"]
+    assert created_flows[-1].oauth2session.scope == "openid email"
+
+    with pytest.raises(ColabBackendError) as err_replay:
+        backend.complete_oauth_login(started["flow_id"], "auth-code-123")
+    assert err_replay.value.kind == "flow_expired"
+
+    # 5. Exchange failure wraps cleanly as ColabBackendError("oauth_exchange_failed")
+    started2 = backend.begin_oauth_login()
+    fail_exchange[0] = True
+    with pytest.raises(ColabBackendError) as err_ex:
+        backend.complete_oauth_login(started2["flow_id"], "bad-code")
+    assert err_ex.value.kind == "oauth_exchange_failed"
+
+
+def test_inspect_token_userinfo_success_unverified_and_corrupt_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers inspect_token primary userinfo path, unverified fallback failure, defensive refresh wrap, and invalid JSON."""
+    backend = DirectColabBackend()
+
+    # 1. Corrupt JSON credential -> invalid_credential
+    with pytest.raises(ColabBackendError) as err_bad:
+        backend.inspect_token("{not-json")
+    assert err_bad.value.kind == "invalid_credential"
+
+    class FakeCreds:
+        def __init__(self, token: str, refresh_token: str = "rt-1", fail_refresh: bool = False) -> None:
+            self.token = token
+            self.refresh_token = refresh_token
+            self.expired = False
+            self._fail_refresh = fail_refresh
+
+        def refresh(self, _req: Any) -> None:
+            if self._fail_refresh:
+                raise RuntimeError("refresh endpoint 400")
+            self.token = "tok-refreshed"
+
+        def to_json(self) -> str:
+            return json.dumps({"token": self.token, "refresh_token": self.refresh_token})
+
+    userinfo_mode = ["ok"]
+    tokeninfo_mode = ["fail"]
+
+    class FakeAuthSession:
+        def __init__(self, _creds: Any) -> None:
+            self.closed = False
+
+        def get(self, _url: str, **_kwargs: Any):
+            if userinfo_mode[0] == "raise":
+                raise requests.ConnectionError("userinfo down")
+            resp = requests.Response()
+            resp.status_code = 200 if userinfo_mode[0] == "ok" else 500
+            resp._content = (
+                json.dumps({"email": "primary@studio.ai", "name": "Primary User"}).encode("utf-8")
+                if userinfo_mode[0] == "ok"
+                else b"{}"
+            )
+            return resp
+
+        def close(self) -> None:
+            self.closed = True
+
+    def fake_tokeninfo_get(_url: str, **_kwargs: Any):
+        if tokeninfo_mode[0] == "raise":
+            raise requests.Timeout("tokeninfo timed out")
+        resp = requests.Response()
+        resp.status_code = 401
+        resp._content = b"{}"
+        return resp
+
+    monkeypatch.setattr("colab_boost.backends.direct.AuthorizedSession", FakeAuthSession)
+    monkeypatch.setattr("colab_boost.backends.direct.requests.get", fake_tokeninfo_get)
+    monkeypatch.setattr(
+        "colab_boost.backends.direct.Credentials.from_authorized_user_info",
+        staticmethod(lambda _info: FakeCreds("tok-primary")),
+    )
+
+    # 2. Primary USERINFO_URL returns email & display_name directly
+    res = backend.inspect_token("{}")
+    assert res["email"] == "primary@studio.ai"
+    assert res["display_name"] == "Primary User"
+
+    # 3. Both USERINFO_URL and TOKENINFO_URL fail -> unverified_account
+    userinfo_mode[0] = "raise"
+    tokeninfo_mode[0] = "raise"
+    with pytest.raises(ColabBackendError) as err_unv:
+        backend.inspect_token("{}")
+    assert err_unv.value.kind == "unverified_account"
+
+    # 4. Defensive refresh inside inspect_token wraps refresh error as token_refresh_failed
+    monkeypatch.setattr(
+        backend,
+        "_credentials_from_json",
+        lambda _tj: FakeCreds("", refresh_token="rt-fail", fail_refresh=True),
+    )
+    with pytest.raises(ColabBackendError) as err_ref:
+        backend.inspect_token("{}")
+    assert err_ref.value.kind == "token_refresh_failed"
+
+
+def test_execute_python_error_traceback_stderr_display_kernel_dead_and_disconnect() -> None:
+    """Covers execute_python error/traceback frames, stderr, display_data, execute_reply-only errors, kernel_dead, and early WS close."""
+    import asyncio
+
+    from websockets.asyncio.server import serve as ws_serve
+
+    from colab_boost.backends.base import RESULT_MARKER, RawAssignment
+
+    ws_port_box: list[int] = []
+    ws_ready = threading.Event()
+    stop_holder: list[asyncio.Event] = []
+    loop_holder: list[asyncio.AbstractEventLoop] = []
+    scenario = ["traceback_error"]
+
+    def run_ws() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop_holder.append(loop)
+        stop_ev = asyncio.Event()
+        stop_holder.append(stop_ev)
+
+        async def handler(ws):
+            raw = await ws.recv()
+            msg = json.loads(raw)
+            msg_id = msg["header"]["msg_id"]
+            sess_id = msg["header"]["session"]
+            mode = scenario[0]
+
+            if mode == "traceback_error":
+                # Unrelated frame (different parent_header) must be ignored
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "stream", "session": sess_id},
+                    "parent_header": {"msg_id": "other-msg-id"},
+                    "content": {"name": "stdout", "text": "IGNORE_ME\n"},
+                }))
+                # Stderr stream + display_data + malformed RESULT_MARKER line
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "stream", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {"name": "stderr", "text": "warn: low vram\n"},
+                }))
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "display_data", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {"data": {"text/plain": f"disp-out\n{RESULT_MARKER}{{bad-json"}},
+                }))
+                # Error frame with traceback
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "error", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {
+                        "ename": "ZeroDivisionError",
+                        "evalue": "division by zero",
+                        "traceback": ["Traceback (most recent call last):", "  1 / 0", "ZeroDivisionError: division by zero"],
+                    },
+                }))
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "execute_reply", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {"status": "error", "ename": "ZeroDivisionError", "evalue": "division by zero"},
+                }))
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "status", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {"execution_state": "idle"},
+                }))
+            elif mode == "reply_only_error":
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "execute_reply", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {"status": "error", "ename": "SyntaxError", "evalue": "invalid syntax"},
+                }))
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "status", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {"execution_state": "idle"},
+                }))
+            elif mode == "kernel_dead":
+                # Broadcast with empty parent_header must immediately raise kernel_dead
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "status", "session": sess_id},
+                    "parent_header": {},
+                    "content": {"execution_state": "dead"},
+                }))
+            elif mode == "early_disconnect":
+                await ws.send(json.dumps({
+                    "header": {"msg_type": "stream", "session": sess_id},
+                    "parent_header": {"msg_id": msg_id},
+                    "content": {"name": "stdout", "text": "partial before drop\n"},
+                }))
+                await ws.close()
+
+        async def main_ws():
+            async with ws_serve(handler, "127.0.0.1", 0) as server:
+                ws_port_box.append(server.sockets[0].getsockname()[1])
+                ws_ready.set()
+                await stop_ev.wait()
+
+        loop.run_until_complete(main_ws())
+
+    threading.Thread(target=run_ws, daemon=True).start()
+    assert ws_ready.wait(timeout=5.0)
+
+    backend = DirectColabBackend()
+    backend._ensure_jupyter_kernel = lambda _a: "kern-err-paths"  # type: ignore[method-assign]
+    raw_assign = RawAssignment(
+        endpoint="ep-ws-err",
+        accelerator=Accelerator.L4,
+        machine_shape=MachineShape.STANDARD,
+        proxy_url=f"http://127.0.0.1:{ws_port_box[0]}",
+        proxy_token="tok-ws-err",
+    )
+
+    try:
+        # 1. Error + traceback + stderr + display_data + ignored foreign parent_header + bad marker JSON
+        scenario[0] = "traceback_error"
+        res_tb = backend.execute_python(raw_assign, "1 / 0", timeout_s=5.0)
+        assert res_tb.ok is False
+        assert res_tb.error_name == "ZeroDivisionError"
+        assert res_tb.error_value == "division by zero"
+        assert "Traceback (most recent call last):" in res_tb.stderr
+        assert "warn: low vram" in res_tb.stderr
+        assert "disp-out" in res_tb.stdout
+        assert "IGNORE_ME" not in res_tb.stdout
+        assert res_tb.marker_json is None
+
+        # 2. execute_reply error without preceding error frame
+        scenario[0] = "reply_only_error"
+        res_rep = backend.execute_python(raw_assign, "def (", timeout_s=5.0)
+        assert res_rep.ok is False
+        assert res_rep.error_name == "SyntaxError"
+        assert res_rep.error_value == "invalid syntax"
+
+        # 3. Kernel death broadcast -> ColabBackendError("kernel_dead")
+        scenario[0] = "kernel_dead"
+        with pytest.raises(ColabBackendError) as err_dead:
+            backend.execute_python(raw_assign, "import os; os._exit(1)", timeout_s=5.0)
+        assert err_dead.value.kind == "kernel_dead"
+
+        # 4. Premature WS close before reply+idle -> ColabBackendError("exec_disconnected")
+        scenario[0] = "early_disconnect"
+        with pytest.raises(ColabBackendError) as err_disc:
+            backend.execute_python(raw_assign, "print('hi')", timeout_s=5.0)
+        assert err_disc.value.kind == "exec_disconnected"
+    finally:
+        loop_holder[0].call_soon_threadsafe(stop_holder[0].set)
+
+
+
 

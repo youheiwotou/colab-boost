@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +17,40 @@ from colab_boost.config import project_root
 
 def _watchdog_script() -> Path:
     return project_root() / "src" / "colab_boost" / "vm_assets" / "watchdog.py"
+
+
+def _wait_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.05,
+    desc: str = "condition",
+) -> None:
+    """Polls ``predicate`` with a bounded timeout instead of relying on brittle fixed sleeps."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"Timed out waiting for {desc} after {timeout:.2f}s")
+        time.sleep(min(interval, remaining))
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _terminate_proc(proc: subprocess.Popen | None) -> None:
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 class _UnassignRecorder:
@@ -99,57 +135,83 @@ def test_watchdog_winddown_hook_and_deadline_unassign(tmp_path: Path) -> None:
 
 def test_watchdog_gpu_busy_delays_idle_then_releases_when_idle(tmp_path: Path) -> None:
     rec = _UnassignRecorder()
+    proc: subprocess.Popen | None = None
     try:
         gpu_val_file = tmp_path / "gpu_util.txt"
         gpu_val_file.write_text("45.0\n", encoding="utf-8")
+        probe_log = tmp_path / "gpu_probes.log"
         hb_file = tmp_path / "heartbeat"
         hb_file.write_text("", encoding="utf-8")
 
+        probe_script = (
+            f"open({str(probe_log)!r}, 'a', encoding='utf-8').write('1\\n');"
+            f"print(open({str(gpu_val_file)!r}, encoding='utf-8').read())"
+        )
         cfg_file = tmp_path / "watchdog_idle.json"
         cfg = {
             "deadline_epoch": None,
-            "idle_timeout_s": 0.6,
+            "idle_timeout_s": 0.4,
             "cancelled": False,
             "heartbeat_file": str(hb_file),
             "poll_s": 0.1,
             "started_at": time.time(),
-            "gpu_probe_cmd": [sys.executable, "-c", f"print(open({str(gpu_val_file)!r}).read())"],
+            "gpu_probe_cmd": [sys.executable, "-c", probe_script],
         }
         cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
 
         proc = subprocess.Popen(
             [sys.executable, str(_watchdog_script()), "--config", str(cfg_file), "--unassign-url", rec.url]
         )
-        # Keep GPU busy past the 0.6s idle window -> must NOT unassign while busy!
-        time.sleep(0.85)
+        # Wait deterministically for startup & first GPU probe, then verify staying alive past 0.4s idle window
+        _wait_until(
+            lambda: probe_log.exists() and len(probe_log.read_text(encoding="utf-8").splitlines()) >= 1,
+            timeout=5.0,
+            desc="initial GPU probe",
+        )
+        first_probe_at = time.monotonic()
+        _wait_until(
+            lambda: (
+                (time.monotonic() - first_probe_at) >= 0.55
+                and len(probe_log.read_text(encoding="utf-8").splitlines()) >= 5
+            ),
+            timeout=5.0,
+            desc="multiple GPU-busy polls past idle_timeout_s",
+        )
         assert proc.poll() is None
         assert rec.calls == 0
 
-        # Now GPU drops to 0% -> watchdog should unassign within ~1.2s
+        # Now GPU drops to 0% -> watchdog should unassign shortly after idle_timeout_s
         gpu_val_file.write_text("0.0\n", encoding="utf-8")
         rc = proc.wait(timeout=5)
         assert rc == 0
         assert rec.calls == 1
     finally:
+        _terminate_proc(proc)
         rec.close()
 
 
 def test_watchdog_reloads_dynamic_hooks_from_config_before_idle_unassign(tmp_path: Path) -> None:
     """Proves watchdog picks up [[keep]] wind-down hooks added to watchdog.json after startup."""
     rec = _UnassignRecorder()
+    proc: subprocess.Popen | None = None
     try:
         gpu_val_file = tmp_path / "gpu_util_dyn.txt"
         gpu_val_file.write_text("60.0\n", encoding="utf-8")
+        probe_log = tmp_path / "dyn_probes.log"
         kept_marker = tmp_path / "kept_on_idle.txt"
 
+        probe_script = (
+            f"open({str(probe_log)!r}, 'a', encoding='utf-8').write('1\\n');"
+            f"print(open({str(gpu_val_file)!r}, encoding='utf-8').read())"
+        )
         cfg_file = tmp_path / "watchdog_dyn.json"
         cfg = {
             "deadline_epoch": None,
-            "idle_timeout_s": 0.5,
+            "idle_timeout_s": 0.4,
             "cancelled": False,
             "poll_s": 0.1,
             "started_at": time.time(),
-            "gpu_probe_cmd": [sys.executable, "-c", f"print(open({str(gpu_val_file)!r}).read())"],
+            "gpu_probe_cmd": [sys.executable, "-c", probe_script],
             "hooks": [],
         }
         cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
@@ -157,7 +219,11 @@ def test_watchdog_reloads_dynamic_hooks_from_config_before_idle_unassign(tmp_pat
         proc = subprocess.Popen(
             [sys.executable, str(_watchdog_script()), "--config", str(cfg_file), "--unassign-url", rec.url]
         )
-        time.sleep(0.25)
+        _wait_until(
+            lambda: probe_log.exists() and len(probe_log.read_text(encoding="utf-8").splitlines()) >= 1,
+            timeout=5.0,
+            desc="watchdog startup poll with empty hooks",
+        )
         assert proc.poll() is None
 
         # Dynamically inject wind-down hook into watchdog.json (simulating deploying a [[keep]] recipe onto an existing VM)
@@ -167,7 +233,7 @@ def test_watchdog_reloads_dynamic_hooks_from_config_before_idle_unassign(tmp_pat
                 "timeout_s": 5,
             }
         ]
-        cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
+        _atomic_write_json(cfg_file, cfg)
 
         # Let GPU go idle -> watchdog must run the dynamically added hook before calling /unassign
         gpu_val_file.write_text("0.0\n", encoding="utf-8")
@@ -176,26 +242,31 @@ def test_watchdog_reloads_dynamic_hooks_from_config_before_idle_unassign(tmp_pat
         assert kept_marker.read_text(encoding="utf-8") == "archived_before_idle"
         assert rec.calls == 1
     finally:
+        _terminate_proc(proc)
         rec.close()
 
 
 def test_watchdog_final_winddown_captures_late_outputs_and_short_deadlines(tmp_path: Path) -> None:
     """Proves short deadlines (grace_s > total_span) and late renders during grace window are captured before /unassign."""
     rec = _UnassignRecorder()
+    proc: subprocess.Popen | None = None
     try:
         src_file = tmp_path / "late_render.txt"
         src_file.write_text("initial", encoding="utf-8")
         archived_file = tmp_path / "archived_snapshot.txt"
         cfg_file = tmp_path / "watchdog_short.json"
-        now = time.time()
-        # grace_s=180 exceeds total_span=0.9s; previously this triggered wind-down at T=0s and missed late writes!
-        cfg = {
-            "deadline_epoch": now + 0.9,
+        log_file = tmp_path / "wd_short.log"
+        pid_file = tmp_path / "watchdog.pid"
+        winddown_marker = tmp_path / "winddown.json"
+
+        # Start watchdog with no deadline yet so subprocess startup time never races the short deadline window
+        cfg: dict = {
+            "deadline_epoch": None,
             "idle_timeout_s": None,
             "cancelled": False,
             "poll_s": 0.1,
             "grace_s": 180.0,
-            "started_at": now,
+            "log_file": str(log_file),
             "hooks": [
                 {
                     "argv": [
@@ -212,8 +283,31 @@ def test_watchdog_final_winddown_captures_late_outputs_and_short_deadlines(tmp_p
         proc = subprocess.Popen(
             [sys.executable, str(_watchdog_script()), "--config", str(cfg_file), "--unassign-url", rec.url]
         )
+        _wait_until(
+            lambda: pid_file.exists() and log_file.exists() and "started pid=" in log_file.read_text(encoding="utf-8"),
+            timeout=5.0,
+            desc="watchdog startup before arming short deadline",
+        )
+
+        # Arm a short deadline where grace_s=180 exceeds total_span=1.2s (effective grace = 0.6s)
+        now = time.time()
+        cfg["started_at"] = now
+        cfg["deadline_epoch"] = now + 1.2
+        _atomic_write_json(cfg_file, cfg)
+
+        # Wait deterministically for the grace pass (final_pass=False) to complete before writing late render
+        _wait_until(
+            lambda: (
+                winddown_marker.exists()
+                and archived_file.exists()
+                and archived_file.read_text(encoding="utf-8") == "initial"
+            ),
+            timeout=5.0,
+            desc="grace wind-down pass completion",
+        )
+        assert json.loads(winddown_marker.read_text(encoding="utf-8"))["final_pass"] is False
+
         # Simulate ComfyUI finishing a new render right before deadline (inside the grace window)
-        time.sleep(0.55)
         src_file.write_text("final_late_render_v2", encoding="utf-8")
 
         rc = proc.wait(timeout=8)
@@ -221,6 +315,7 @@ def test_watchdog_final_winddown_captures_late_outputs_and_short_deadlines(tmp_p
         assert rec.calls == 1
         assert archived_file.read_text(encoding="utf-8") == "final_late_render_v2"
     finally:
+        _terminate_proc(proc)
         rec.close()
 
 
@@ -394,8 +489,13 @@ def test_watchdog_monotonic_relative_timers_max_runtime_and_remaining(tmp_path: 
 
 
 def test_watchdog_rejects_bool_timers_and_survives_malformed_hook_timeout(tmp_path: Path) -> None:
+    from colab_boost.vm_assets.watchdog import VmWatchdog
+
     rec = _UnassignRecorder()
+    proc: subprocess.Popen | None = None
     try:
+        bool_log = tmp_path / "wd_bool.log"
+        pid_file = tmp_path / "watchdog.pid"
         cfg_file = tmp_path / "wd_bool.json"
         cfg_file.write_text(
             json.dumps(
@@ -406,25 +506,34 @@ def test_watchdog_rejects_bool_timers_and_survives_malformed_hook_timeout(tmp_pa
                     "remaining_s": True,
                     "poll_s": True,
                     "cancelled": False,
+                    "log_file": str(bool_log),
                     "hooks": [{"argv": [sys.executable, "-c", "pass"], "timeout_s": "not-a-number"}],
                 }
             ),
             encoding="utf-8",
         )
+
+        # Deterministic unit verification that boolean timers are rejected & poll_s falls back to 15.0s
+        wd_bool = VmWatchdog(str(cfg_file))
+        wd_bool.reload_config()
+        assert wd_bool._resolve_effective_deadline(time.time(), time.monotonic()) is None
+        assert wd_bool._sleep_interval() == 15.0
+
         proc = subprocess.Popen(
             [sys.executable, str(_watchdog_script()), "--config", str(cfg_file), "--unassign-url", rec.url]
         )
-        time.sleep(0.45)
+        _wait_until(
+            lambda: pid_file.exists() and bool_log.exists() and "started pid=" in bool_log.read_text(encoding="utf-8"),
+            timeout=5.0,
+            desc="watchdog bool-timer startup",
+        )
         # Must NOT treat boolean True as 1.0s deadline/idle and prematurely unassign, and must stay alive
         assert proc.poll() is None
         assert rec.calls == 0
 
-        # Now cancel cleanly
-        cfg_file.write_text(json.dumps({"cancelled": True, "poll_s": 0.1}), encoding="utf-8")
-        # Wait long enough for default 15s poll? No — override poll_s in initial config?
-        # Since poll_s was True (ignored -> default 15s), terminate gracefully or test with numeric poll_s!
-        proc.terminate()
-        proc.wait(timeout=5)
+        # Terminate cleanly (poll_s=True fell back to default 15s)
+        _terminate_proc(proc)
+        proc = None
         assert rec.calls == 0
 
         # Also verify malformed hook timeout_s never crashes execute_winddown before release_vm
@@ -449,8 +558,6 @@ def test_watchdog_rejects_bool_timers_and_survives_malformed_hook_timeout(tmp_pa
         assert rec.calls == 1
 
         # Verify serve_forever survives an unexpected loop exception and recovers on the next iteration
-        from colab_boost.vm_assets.watchdog import VmWatchdog
-
         cfg_err = tmp_path / "wd_loop_err.json"
         cfg_err.write_text(json.dumps({"idle_timeout_s": 0.1, "poll_s": 0.1, "cancelled": False}), encoding="utf-8")
         wd_err = VmWatchdog(str(cfg_err), unassign_url_override=rec.url)
@@ -467,5 +574,6 @@ def test_watchdog_rejects_bool_timers_and_survives_malformed_hook_timeout(tmp_pa
         assert calls[0] == 2
         assert rec.calls == 2
     finally:
+        _terminate_proc(proc)
         rec.close()
 
