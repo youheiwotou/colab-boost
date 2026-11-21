@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import signal
+import site
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import urllib.request
@@ -16,6 +19,7 @@ ENV = os.environ.get
 RUN_DIR = ENV("BOOST_RUN_DIR", "/root/.colab-boost/runs/manual")
 STATUS_FILE = ENV("BOOST_STATUS_FILE", os.path.join(RUN_DIR, "status.json"))
 HEARTBEAT_FILE = ENV("BOOST_HEARTBEAT_FILE", "")
+NVIDIA_LIB_DIR = "/usr/lib64-nvidia"
 
 MODEL_SIZE = (ENV("BOOST_INPUT_MODEL_SIZE") or "large-v3-turbo").strip()
 COMPUTE_TYPE = (ENV("BOOST_INPUT_COMPUTE_TYPE") or "float16").strip()
@@ -25,7 +29,7 @@ HF_TOKEN = ENV("BOOST_HF_TOKEN") or ""
 _proc: list[subprocess.Popen | None] = [None]
 _stage = ["install"]
 
-APP_CODE = '''import os, tempfile
+APP_CODE = '''import os, re, shutil, tempfile
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
 from faster_whisper import WhisperModel
@@ -34,35 +38,51 @@ MODEL_NAME = os.environ["WHISPER_MODEL_NAME"]
 COMPUTE = os.environ["WHISPER_COMPUTE"]
 PORT = int(os.environ["WHISPER_PORT"])
 HB = os.environ.get("WHISPER_HB", "")
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 device = "cuda" if os.system("nvidia-smi >/dev/null 2>&1") == 0 else "cpu"
 ctype = COMPUTE if device == "cuda" else "int8"
 model = WhisperModel(MODEL_NAME, device=device, compute_type=ctype)
 app = FastAPI(title="Colab Boost Faster-Whisper API")
 
+
+def _safe_audio_suffix(filename: str | None) -> str:
+    leaf = os.path.basename((filename or "audio.wav").replace("\\\\", "/"))
+    ext = os.path.splitext(leaf)[1]
+    cleaned = re.sub(r"[^A-Za-z0-9.]", "", ext)
+    if not cleaned.startswith(".") or ".." in cleaned or len(cleaned) < 2:
+        return ".wav"
+    return cleaned[:16]
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model": MODEL_NAME, "device": device, "compute_type": ctype}
+
 
 @app.get("/v1/models")
 def models():
     return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model"}]}
 
+
 @app.post("/v1/audio/transcriptions")
-async def transcribe(
+def transcribe(
     file: UploadFile = File(...),
     language: str | None = Form(default=None),
     word_timestamps: bool = Form(default=True),
 ):
     if HB:
         try:
+            parent = os.path.dirname(HB)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             open(HB, "a").close()
             os.utime(HB, None)
         except OSError:
             pass
-    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    suffix = _safe_audio_suffix(file.filename)
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
+        shutil.copyfileobj(file.file, tmp, UPLOAD_CHUNK_BYTES)
         tmp_path = tmp.name
     try:
         segments, info = model.transcribe(tmp_path, language=language or None, word_timestamps=word_timestamps, vad_filter=True)
@@ -83,15 +103,68 @@ async def transcribe(
         except OSError:
             pass
 
+
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=PORT)
 '''
 
 
+def build_cuda_ld_library_path(existing: str = "", extra_site_roots: list[str] | None = None) -> str:
+    """Builds LD_LIBRARY_PATH including /usr/lib64-nvidia and pip-installed NVIDIA cuDNN/cuBLAS libs."""
+    candidates: list[str] = [NVIDIA_LIB_DIR]
+    if os.path.isdir("/usr/local/cuda/lib64"):
+        candidates.append("/usr/local/cuda/lib64")
+
+    site_roots: list[str] = list(extra_site_roots) if extra_site_roots is not None else []
+    if extra_site_roots is None:
+        try:
+            site_roots.extend(site.getsitepackages())
+        except Exception:
+            pass
+        for key in ("purelib", "platlib"):
+            p = sysconfig.get_paths().get(key)
+            if p and p not in site_roots:
+                site_roots.append(p)
+
+    for root in site_roots:
+        for lib_dir in sorted(glob.glob(os.path.join(root, "nvidia", "*", "lib"))):
+            if os.path.isdir(lib_dir):
+                candidates.append(lib_dir)
+
+    for part in existing.split(":"):
+        if part:
+            candidates.append(part)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for p in candidates:
+        if p and p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return ":".join(deduped)
+
+
+def build_server_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    src = os.environ if base_env is None else base_env
+    clean_env = {k: v for k, v in src.items() if not k.startswith("BOOST_")}
+    if HF_TOKEN:
+        clean_env["HF_TOKEN"] = HF_TOKEN
+    clean_env["LD_LIBRARY_PATH"] = build_cuda_ld_library_path(clean_env.get("LD_LIBRARY_PATH", ""))
+    clean_env.update({
+        "WHISPER_MODEL_NAME": MODEL_SIZE,
+        "WHISPER_COMPUTE": COMPUTE_TYPE,
+        "WHISPER_PORT": str(PORT),
+        "WHISPER_HB": HEARTBEAT_FILE,
+    })
+    return clean_env
+
+
 def beat() -> None:
     if HEARTBEAT_FILE:
         try:
-            os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+            parent = os.path.dirname(HEARTBEAT_FILE)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(HEARTBEAT_FILE, "a", encoding="utf-8"):
                 pass
             os.utime(HEARTBEAT_FILE, None)
@@ -162,7 +235,9 @@ def set_status(state: str, stage: str, msg: str, progress: float | None = None, 
     if outputs is not None:
         doc["outputs"] = outputs
     print(f"[{time.strftime('%H:%M:%S')}] [{state}:{stage}] {msg}", flush=True)
-    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    parent = os.path.dirname(STATUS_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = STATUS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh)
@@ -207,15 +282,7 @@ def main() -> int:
         fh.write(APP_CODE)
 
     set_status("running", "download", f"Downloading & warming up {MODEL_SIZE} ({COMPUTE_TYPE})...", progress=0.6)
-    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("BOOST_")}
-    if HF_TOKEN:
-        clean_env["HF_TOKEN"] = HF_TOKEN
-    clean_env.update({
-        "WHISPER_MODEL_NAME": MODEL_SIZE,
-        "WHISPER_COMPUTE": COMPUTE_TYPE,
-        "WHISPER_PORT": str(PORT),
-        "WHISPER_HB": HEARTBEAT_FILE,
-    })
+    clean_env = build_server_env()
 
     log_path = os.path.join(RUN_DIR, "whisper.log")
     with open(log_path, "w", encoding="utf-8") as log_fh:

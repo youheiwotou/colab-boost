@@ -6,13 +6,19 @@ import struct
 import pytest
 
 from colab_boost.gguf_planner import (
+    GgufRepoPlan,
+    build_hardware_fit_matrix,
+    estimate_vram_mib,
     extract_kv_architecture_params,
     extract_quant_label,
+    extract_sliding_window,
     fit_gguf_for_vram,
     group_gguf_files,
     parse_gguf_header_bytes,
+    parse_gguf_header_with_status,
     validate_hf_repo_id,
 )
+from colab_boost.models import ACCELERATOR_VRAM_REFERENCE_MIB
 
 GIB = 1024**3
 
@@ -135,3 +141,202 @@ def test_repo_id_validation_rejects_bad_inputs() -> None:
     for bad in ["", "just-one-part", "../etc/passwd", "owner/../repo", "a/b/c", "owner/repo;rm -rf"]:
         with pytest.raises(ValueError):
             validate_hf_repo_id(bad)
+
+
+def test_underscore_quant_names_and_subdir_disambiguation() -> None:
+    assert extract_quant_label("model_Q4_K_M.gguf") == "Q4_K_M"
+    assert extract_quant_label("model_UD_Q4_K_XL.gguf") == "UD-Q4_K_XL"
+    assert extract_quant_label("qwen2_5_7b_bf16.gguf") == "BF16"
+    assert extract_quant_label("model_Q4_K_M_00001_of_00002.gguf") == "Q4_K_M"
+    assert extract_quant_label("model_IQ4_XS.gguf") == "IQ4_XS"
+
+    # Same quant label in two distinct subdirectories must NOT merge and double size
+    variants, _ = group_gguf_files([
+        ("v1/model_Q4_K_M.gguf", 8 * GIB),
+        ("v2/model_Q4_K_M.gguf", 8 * GIB),
+        ("Q8_0/shard-Q8_0-00001-of-00002.gguf", 10 * GIB),
+        ("Q8_0/shard-Q8_0-00002-of-00002.gguf", 10 * GIB),
+    ])
+    by_q = {v.quant: v for v in variants}
+    assert set(by_q.keys()) == {"Q8_0", "v1/Q4_K_M", "v2/Q4_K_M"}
+    assert by_q["v1/Q4_K_M"].size_bytes == 8 * GIB
+    assert by_q["v2/Q4_K_M"].size_bytes == 8 * GIB
+    assert by_q["Q8_0"].size_bytes == 20 * GIB
+
+
+def test_hardware_fit_matrix_includes_g4_and_distinct_h100() -> None:
+    variants, _ = group_gguf_files([
+        ("Model-Q8_0.gguf", 30 * GIB),
+        ("Model-Q4_K_M.gguf", 16 * GIB),
+    ])
+    plan = GgufRepoPlan(
+        repo="org/model-gguf",
+        variants=variants,
+        mmproj_files=[],
+        preferred_mmproj=None,
+        architecture="qwen3",
+        model_ctx=32768,
+        kv_bytes_per_token_f16=65536,
+        has_mtp=False,
+        header_truncated=True,
+        header_warning="Header truncated at 4 MiB; conservative defaults used.",
+    )
+    rows = build_hardware_fit_matrix(plan)
+    labels = [r["gpu_label"] for r in rows]
+    assert "T4 (15 GB)" in labels
+    assert "L4 (23 GB)" in labels
+    assert "A100 (40 GB)" in labels
+    assert "A100 (80 GB)" in labels
+    assert "H100 (80 GB)" in labels
+    assert "G4 (96 GB)" in labels
+    assert not any("A100 / H100" in lbl for lbl in labels)
+
+    g4_row = next(r for r in rows if r["accelerator"] == "G4")
+    h100_row = next(r for r in rows if r["accelerator"] == "H100")
+    assert g4_row["vram_mib"] == ACCELERATOR_VRAM_REFERENCE_MIB["G4"][0]
+    assert h100_row["vram_mib"] == ACCELERATOR_VRAM_REFERENCE_MIB["H100"][0]
+    assert g4_row["header_truncated"] is True
+    assert "truncated" in g4_row["header_warning"].lower()
+
+
+def test_nested_array_gguf_header_parsing_preserves_offset() -> None:
+    # Build a nested array (elem_type == 9) containing 2 inner arrays of uint32 ([10, 20], [30, 40, 50])
+    inner1 = struct.pack("<IQ", 4, 2) + struct.pack("<II", 10, 20)
+    inner2 = struct.pack("<IQ", 4, 3) + struct.pack("<III", 30, 40, 50)
+    nested_payload = struct.pack("<IQ", 9, 2) + inner1 + inner2
+
+    blob = _build_test_gguf_v3([
+        ("custom.nested", 9, nested_payload),
+        ("general.architecture", 8, _pack_gguf_str("llama")),
+        ("llama.context_length", 4, struct.pack("<I", 131072)),
+        ("llama.block_count", 4, struct.pack("<I", 32)),
+        ("llama.attention.head_count", 4, struct.pack("<I", 32)),
+        ("llama.attention.head_count_kv", 4, struct.pack("<I", 8)),
+        ("llama.attention.key_length", 4, struct.pack("<I", 128)),
+        ("llama.attention.value_length", 4, struct.pack("<I", 128)),
+    ])
+    meta, truncated = parse_gguf_header_with_status(blob)
+    assert truncated is False
+    assert meta["custom.nested"] == [[10, 20], [30, 40, 50]]
+    arch, kv_bpt, ctx, has_mtp = extract_kv_architecture_params(meta)
+    assert arch == "llama"
+    assert ctx == 131072
+    assert has_mtp is False
+    assert kv_bpt == 32 * 8 * (128 + 128) * 2
+
+    # Truncated buffer sets truncated=True
+    _partial, was_trunc = parse_gguf_header_with_status(blob[:60])
+    assert was_trunc is True
+
+
+def test_deepseek_mla_sliding_window_interval_floor_compute_scaling_and_t4_4096() -> None:
+    # 1. DeepSeek MLA uses kv_lora_rank (+ rope dim) instead of heads * (klen + vlen)
+    mla_meta = {
+        "general.architecture": "deepseek2",
+        "deepseek2.context_length": 163840,
+        "deepseek2.block_count": 61,
+        "deepseek2.attention.head_count": 128,
+        "deepseek2.attention.head_count_kv": 128,
+        "deepseek2.attention.key_length": 192,
+        "deepseek2.attention.value_length": 128,
+        "deepseek2.attention.kv_lora_rank": 512,
+        "deepseek2.rope.dimension_count": 64,
+    }
+    arch, mla_kv_bpt, mla_ctx, _ = extract_kv_architecture_params(mla_meta)
+    assert arch == "deepseek2"
+    assert mla_ctx == 163840
+    assert mla_kv_bpt == 61 * (512 + 64) * 2  # 70,272 instead of ~5,000,000!
+    assert mla_kv_bpt < 100_000
+
+    # 2. blocks // interval == 0 must floor to 1 full layer instead of 0
+    deg_meta = {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": 2,
+        "qwen35.full_attention_interval": 4,
+        "qwen35.attention.head_count": 8,
+        "qwen35.attention.head_count_kv": 2,
+        "qwen35.attention.key_length": 128,
+        "qwen35.attention.value_length": 128,
+    }
+    _, deg_kv_bpt, _, _ = extract_kv_architecture_params(deg_meta)
+    assert deg_kv_bpt == 1 * 2 * 256 * 2
+
+    # 3. Sliding window caps KV cache tokens at min(ctx, sliding_window)
+    swa_meta = {"general.architecture": "mistral", "mistral.attention.sliding_window": 4096}
+    assert extract_sliding_window(swa_meta) == 4096
+    est_no_swa = estimate_vram_mib(8 * GIB, 0, 131072, 65536, "f16", sliding_window=None)
+    est_with_swa = estimate_vram_mib(8 * GIB, 0, 131072, 65536, "f16", sliding_window=4096)
+    assert est_with_swa < est_no_swa - 5000
+
+    # 4. Compute buffer scales with context length even when kv_bytes_per_token is 0
+    est_8k = estimate_vram_mib(8 * GIB, 0, 0, 8192, "f16")
+    est_128k = estimate_vram_mib(8 * GIB, 0, 0, 131072, "f16")
+    assert est_128k > est_8k
+
+    # 5. T4 (15360 MiB) can step down auto ctx to 4096 when 8192 exceeds budget
+    t4_variants, _ = group_gguf_files([("Tight-Q4_K_M.gguf", int(11.3 * GIB))])
+    fit_t4 = fit_gguf_for_vram(
+        t4_variants,
+        vram_mib=15360,
+        quant="auto",
+        requested_ctx=0,
+        model_ctx=32768,
+        kv_bytes_per_token=262144,
+        kv_type="f16",
+    )
+    assert fit_t4["fits"] is True
+    assert fit_t4["ctx"] == 4096
+    assert fit_t4["ctx_reduced"] is True
+
+
+async def test_inspect_hf_gguf_repo_records_header_truncation_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    from colab_boost import gguf_planner
+
+    # Build a truncated GGUF prefix (declares 2 KVs but cuts off inside the 2nd KV)
+    full_blob = _build_test_gguf_v3([
+        ("general.architecture", 8, _pack_gguf_str("llama")),
+        ("llama.context_length", 4, struct.pack("<I", 65536)),
+    ])
+    truncated_blob = full_blob[:-2]
+
+    class _FakeResp:
+        def __init__(self, status_code: int, json_data=None, content: bytes = b"") -> None:
+            self.status_code = status_code
+            self._json = json_data
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self._json
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url: str, **kwargs):
+            if "/tree/main" in url:
+                return _FakeResp(
+                    200,
+                    json_data=[
+                        {"type": "file", "path": "model_Q4_K_M.gguf", "lfs": {"size": 4 * GIB}},
+                    ],
+                )
+            return _FakeResp(206, content=truncated_blob)
+
+    monkeypatch.setattr(gguf_planner.httpx, "AsyncClient", _FakeClient)
+    plan = await gguf_planner.inspect_hf_gguf_repo("owner/truncated-gguf")
+    assert plan.architecture == "llama"
+    assert plan.header_truncated is True
+    assert plan.header_warning is not None
+    assert "4 MiB" in plan.header_warning
+
+

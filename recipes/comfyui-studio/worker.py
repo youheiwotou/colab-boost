@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -27,6 +28,8 @@ PORT = int(ENV("BOOST_INPUT_PORT") or "8188")
 HF_TOKEN = ENV("BOOST_HF_TOKEN") or ""
 CIVITAI_TOKEN = ENV("BOOST_CIVITAI_TOKEN") or ""
 SECRETS = [s for s in (HF_TOKEN, CIVITAI_TOKEN) if s and len(s) >= 4]
+_PROTECTED_TORCH_PKGS = frozenset({"torch", "torchvision", "torchaudio"})
+_REQ_PKG_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)")
 
 _proc: list[subprocess.Popen | None] = [None]
 _stage = ["setup"]
@@ -49,6 +52,42 @@ def _build_curl_auth_config(token: str) -> str:
         raise ValueError("Invalid Civitai token: contains control characters or newlines")
     escaped = token.replace("\\", "\\\\").replace('"', '\\"')
     return f'header = "Authorization: Bearer {escaped}"\n'
+
+
+def _filter_torch_requirements(req_path: str, out_path: str) -> str:
+    """Writes a copy of requirements.txt excluding torch/torchvision/torchaudio to preserve CUDA PyTorch."""
+    filtered: list[str] = []
+    with open(req_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                m = _REQ_PKG_RE.match(stripped)
+                if m and m.group(1).lower().replace("_", "-") in _PROTECTED_TORCH_PKGS:
+                    continue
+            filtered.append(line)
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.writelines(filtered)
+    return out_path
+
+
+def _download_url_with_curl(url: str, final_path: str, env: dict[str, str], civitai_token: str = "") -> str:
+    """Downloads a URL via curl with resume (-C -) into a .part file and atomically replaces final_path."""
+    parent = os.path.dirname(final_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    part_path = final_path + ".part"
+    curl_cmd = ["curl", "-fsSL", "-C", "-", "--retry", "3", "-o", part_path]
+    curl_stdin = None
+    if civitai_token and _is_trusted_civitai_url(url):
+        curl_cmd += ["-K", "-"]
+        curl_stdin = _build_curl_auth_config(civitai_token)
+    curl_cmd.append(url)
+    subprocess.run(curl_cmd, input=curl_stdin, text=True, env=env, check=True)
+    os.replace(part_path, final_path)
+    return final_path
 
 
 def _read_log_tail(log_path: str, max_lines: int = 8, max_chars: int = 360) -> str:
@@ -108,7 +147,9 @@ def set_status(state: str, stage: str, msg: str, progress: float | None = None, 
     if outputs is not None:
         doc["outputs"] = outputs
     print(f"[{time.strftime('%H:%M:%S')}] [{state}:{stage}] {msg}", flush=True)
-    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    parent = os.path.dirname(STATUS_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = STATUS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh)
@@ -165,7 +206,11 @@ def main() -> int:
     set_status("running", "setup", "Cloning ComfyUI & installing lightweight deps...", progress=0.15)
     if not os.path.isdir(COMFY_DIR):
         subprocess.run(["git", "clone", "--depth", "1", "https://github.com/comfyanonymous/ComfyUI.git", COMFY_DIR], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{COMFY_DIR}/requirements.txt", "huggingface_hub[hf_xet]"], check=True)
+    filtered_reqs = _filter_torch_requirements(
+        f"{COMFY_DIR}/requirements.txt",
+        os.path.join(RUN_DIR, "comfy_requirements_no_torch.txt"),
+    )
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", filtered_reqs, "huggingface_hub[hf_xet]"], check=True)
 
     if INSTALL_MGR:
         mgr_dir = f"{COMFY_DIR}/custom_nodes/ComfyUI-Manager"
@@ -179,13 +224,12 @@ def main() -> int:
         clean_env = {k: v for k, v in os.environ.items() if not k.startswith("BOOST_")}
         if CKPT_REPO.startswith(("http://", "https://")):
             out_name = os.path.basename(CKPT_FILE) if CKPT_FILE else "civitai_model.safetensors"
-            curl_cmd = ["curl", "-fsSL", "-L", "--retry", "3", "-o", os.path.join(dest, out_name)]
-            curl_stdin = None
-            if CIVITAI_TOKEN and _is_trusted_civitai_url(CKPT_REPO):
-                curl_cmd += ["-K", "-"]
-                curl_stdin = _build_curl_auth_config(CIVITAI_TOKEN)
-            curl_cmd.append(CKPT_REPO)
-            subprocess.run(curl_cmd, input=curl_stdin, text=True, env=clean_env, check=True)
+            _download_url_with_curl(
+                CKPT_REPO,
+                os.path.join(dest, out_name),
+                clean_env,
+                civitai_token=CIVITAI_TOKEN,
+            )
         else:
             if HF_TOKEN:
                 clean_env["HF_TOKEN"] = HF_TOKEN

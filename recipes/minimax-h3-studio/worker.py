@@ -4,9 +4,10 @@
 Eliminates sequential cold-start bottlenecks on Colab G4 Blackwell (96GB) by:
   1. Track A: Shallow single-commit ComfyUI fetch + ``uv`` isolated venv & PyTorch
      2.9.1+cu130 install + instant precompiled SageAttention 2.2 (sm120) wheel install.
-  2. Track B (concurrent with Track A): 4-way parallel download of the 39.5 GB
-     MiniMax-H3 Ref2VA + Qwen3-VL + Video VAE + CharacterSwap v1.5 LoRA via
-     ``hf_xet`` or ``aria2c``, with optional multi-core ``sha256sum`` verification.
+  2. Track B (concurrent with Track A): Parallel download of the MiniMax-H3 weights
+     (4 core files, 39.62 GB; or 5 files / 40.23 GB including default Audio VAE):
+     Ref2VA + Qwen3-VL + Video VAE + CharacterSwap v1.5 LoRA (+ optional Audio VAE)
+     via ``hf_xet`` or ``aria2c``, with optional multi-core ``sha256sum`` verification.
   3. Track C (optional): Installs ComfyUI-LatentSyncWrapper + Demucs vocal separator
      for post-swap close-up lip-sync refinement inside the same warm ComfyUI server.
   4. Warm-session fast path: Re-attaches in <2s if ComfyUI & models are already ready.
@@ -19,6 +20,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -49,6 +51,9 @@ SAGE_REPO = "https://github.com/thu-ml/SageAttention.git"
 SAGE_COMMIT = "eb615cf6cf4d221338033340ee2de1c37fbdba4a"
 PYTORCH_INDEX = "https://download.pytorch.org/whl/cu130"
 TORCH_PACKAGES = ["torch==2.9.1", "torchvision==0.24.1", "torchaudio==2.9.1"]
+_PROTECTED_TORCH_PKGS = frozenset({"torch", "torchvision", "torchaudio"})
+_REQ_PKG_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)")
+GIT_COMMIT_RE = re.compile(r"^(?:latest|[0-9a-fA-F]{7,40})$")
 
 HF_REPO = "Comfy-Org/MiniMax-H3"
 HF_REVISION = "e5eb578a89295337b8ff433a035929ce0279e0b6"
@@ -104,6 +109,31 @@ def scrub(text: str) -> str:
     for sec in SECRETS:
         text = text.replace(sec, "***")
     return text
+
+
+def validate_git_commit(commit: str) -> str:
+    cleaned = (commit or "").strip()
+    if not GIT_COMMIT_RE.match(cleaned):
+        raise ValueError(
+            f"Invalid git commit reference {commit!r}: expected 'latest' or a 7-40 character hex commit SHA"
+        )
+    return cleaned
+
+
+def _filter_torch_requirements(req_path: Path, out_path: Path) -> Path:
+    """Writes a filtered requirements file excluding torch/torchvision/torchaudio to protect cu130 PyTorch."""
+    lines = req_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    kept: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            m = _REQ_PKG_RE.match(stripped)
+            if m and m.group(1).lower().replace("_", "-") in _PROTECTED_TORCH_PKGS:
+                continue
+        kept.append(line)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("".join(kept), encoding="utf-8")
+    return out_path
 
 
 def _is_trusted_hf_url(url: str) -> bool:
@@ -195,7 +225,9 @@ def set_status(
         doc["outputs"] = outputs
     with _STATUS_LOCK:
         print(f"[{time.strftime('%H:%M:%S')}] [{state}:{stage}] {clean_msg}", flush=True)
-        os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+        parent = os.path.dirname(STATUS_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         tmp = STATUS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh)
@@ -206,7 +238,9 @@ def beat() -> None:
     if not HEARTBEAT_FILE:
         return
     try:
-        os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+        parent = os.path.dirname(HEARTBEAT_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(HEARTBEAT_FILE, "a", encoding="utf-8"):
             pass
         os.utime(HEARTBEAT_FILE, None)
@@ -266,28 +300,29 @@ def ensure_uv() -> str:
 
 def shallow_checkout_repo(repo_url: str, target_dir: Path, commit: str) -> None:
     """Fetches a single pinned commit with depth=1 (far faster than full git clone)."""
+    safe_commit = validate_git_commit(commit)
     if (target_dir / ".git").is_dir():
         cur = subprocess.run(["git", "rev-parse", "HEAD"], cwd=target_dir, capture_output=True, text=True).stdout.strip()
-        if commit.lower() == "latest" or cur == commit:
+        if safe_commit.lower() == "latest" or cur == safe_commit:
             return
     elif target_dir.exists():
         shutil.rmtree(target_dir)
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    if commit.lower() == "latest":
+    if safe_commit.lower() == "latest":
         if not (target_dir / ".git").is_dir():
-            subprocess.run(["git", "clone", "--depth", "1", repo_url, str(target_dir)], check=True)
+            subprocess.run(["git", "clone", "--depth", "1", "--", repo_url, str(target_dir)], check=True)
         return
 
     if not (target_dir / ".git").is_dir():
         subprocess.run(["git", "init", "-q", str(target_dir)], check=True)
-        subprocess.run(["git", "remote", "add", "origin", repo_url], cwd=target_dir, check=True)
-    rc = subprocess.run(["git", "fetch", "--depth", "1", "origin", commit], cwd=target_dir).returncode
+        subprocess.run(["git", "remote", "add", "origin", "--", repo_url], cwd=target_dir, check=True)
+    rc = subprocess.run(["git", "fetch", "--depth", "1", "--", "origin", safe_commit], cwd=target_dir).returncode
     if rc == 0:
-        subprocess.run(["git", "checkout", "-q", "--force", "FETCH_HEAD"], cwd=target_dir, check=True)
+        subprocess.run(["git", "checkout", "-q", "--force", "FETCH_HEAD", "--"], cwd=target_dir, check=True)
     else:
-        subprocess.run(["git", "fetch", "origin"], cwd=target_dir, check=True)
-        subprocess.run(["git", "checkout", "-q", "--force", commit], cwd=target_dir, check=True)
+        subprocess.run(["git", "fetch", "--", "origin"], cwd=target_dir, check=True)
+        subprocess.run(["git", "checkout", "-q", "--force", safe_commit, "--"], cwd=target_dir, check=True)
 
 
 def target_python() -> Path:
@@ -346,8 +381,12 @@ def track_a_install_env(hw: dict, uv_bin: str) -> dict:
         stats["install_pytorch_uv_s"] = round(time.monotonic() - t_pt, 2)
 
     t_req = time.monotonic()
+    comfy_reqs = _filter_torch_requirements(
+        COMFY_DIR / "requirements.txt",
+        WORK / "comfy_requirements_no_torch.txt",
+    )
     subprocess.run(
-        [*pip_base, "-r", str(COMFY_DIR / "requirements.txt"), "huggingface_hub[hf_xet]", "accelerate", "safetensors", "imageio-ffmpeg"],
+        [*pip_base, "-r", str(comfy_reqs), "huggingface_hub[hf_xet]", "accelerate", "safetensors", "imageio-ffmpeg"],
         check=True,
     )
     stats["install_comfy_reqs_uv_s"] = round(time.monotonic() - t_req, 2)
@@ -410,19 +449,52 @@ def track_a_install_env(hw: dict, uv_bin: str) -> dict:
                     use_sage = False
                 stats["compile_sage_s"] = round(time.monotonic() - t_sc, 2)
 
+    lipsync_installed = False
     if INSTALL_LIPSYNC:
         t_ls = time.monotonic()
         ls_dir = COMFY_DIR / "custom_nodes" / "ComfyUI-LatentSyncWrapper"
-        shallow_checkout_repo("https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper.git", ls_dir, "latest")
-        ls_reqs = ls_dir / "requirements.txt"
-        extra_pkgs = ["demucs", "soundfile"]
-        if ls_reqs.is_file():
-            subprocess.run([*pip_base, "-r", str(ls_reqs), *extra_pkgs], check=False)
-        else:
-            subprocess.run([*pip_base, *extra_pkgs], check=False)
+        try:
+            shallow_checkout_repo("https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper.git", ls_dir, "latest")
+            ls_reqs = ls_dir / "requirements.txt"
+            extra_pkgs = ["demucs", "soundfile"]
+            if ls_reqs.is_file():
+                filtered_ls_reqs = _filter_torch_requirements(ls_reqs, WORK / "lipsync_requirements_no_torch.txt")
+                ls_res = subprocess.run(
+                    [*pip_base, "-r", str(filtered_ls_reqs), *extra_pkgs],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            else:
+                ls_res = subprocess.run(
+                    [*pip_base, *extra_pkgs],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            if ls_res.returncode == 0:
+                lipsync_installed = True
+            else:
+                err_lines = [ln.strip() for ln in (ls_res.stderr or ls_res.stdout or "").splitlines() if ln.strip()]
+                err_tail = " | ".join(err_lines[-6:])[-240:] if err_lines else f"exit code {ls_res.returncode}"
+                stats["lipsync_error"] = scrub(err_tail)
+                set_status(
+                    "running",
+                    "parallel_setup",
+                    f"LatentSync lip-sync dependency install failed ({err_tail}); continuing without lip-sync nodes.",
+                )
+        except Exception as exc:
+            reason = scrub(str(exc))[:240]
+            stats["lipsync_error"] = reason
+            set_status(
+                "running",
+                "parallel_setup",
+                f"LatentSync lip-sync setup failed ({reason}); continuing without lip-sync nodes.",
+            )
         stats["install_lipsync_s"] = round(time.monotonic() - t_ls, 2)
 
     stats["use_sage"] = use_sage
+    stats["lipsync_installed"] = lipsync_installed
     stats["track_env_s"] = round(time.monotonic() - t0, 2)
     return stats
 
@@ -501,7 +573,7 @@ def _download_one_model(
 
 
 def track_b_download_models(uv_bin: str) -> dict:
-    """Track B: Download all 4 MiniMax-H3 files (39.5 GB) concurrently into isolated ``MODELS_DIR``."""
+    """Track B: Download MiniMax-H3 files concurrently (4 files / 39.62 GB, or 5 files / 40.23 GB incl. Audio VAE)."""
     t0 = time.monotonic()
     if not DOWNLOAD_MODELS:
         return {"track_models_s": 0.0, "skipped": True}
@@ -646,6 +718,12 @@ def main() -> int:
         set_status("failed", "hardware", "Port 8080 is reserved by Colab")
         return 1
 
+    try:
+        validate_git_commit(COMFY_COMMIT)
+    except ValueError as exc:
+        set_status("failed", "hardware", str(exc))
+        return 1
+
     stop_hb = threading.Event()
 
     def hb_loop() -> None:
@@ -677,10 +755,14 @@ def main() -> int:
                     set_status("failed", "server", "Warm ComfyUI server became unreachable")
                     return 1
 
+        if DOWNLOAD_MODELS:
+            model_desc = "5 files / 40.23 GB incl. Audio VAE" if DOWNLOAD_AUDIO_VAE else "4 files / 39.62 GB"
+        else:
+            model_desc = "model download skipped"
         set_status(
             "running",
             "parallel_setup",
-            f"GPU {hw['gpu_name']} ({hw['vram_total_mib']} MiB) — launching 3-track parallel setup (uv + 39.5GB models)...",
+            f"GPU {hw['gpu_name']} ({hw['vram_total_mib']} MiB) — launching 3-track parallel setup (uv + {model_desc})...",
             progress=0.2,
         )
         uv_bin = ensure_uv()
@@ -723,7 +805,7 @@ def main() -> int:
             "output_dir": str(OUTPUT_DIR),
             "wheels_dir": str(WHEELS_DIR),
             "audio_vae_ready": bool(DOWNLOAD_MODELS and DOWNLOAD_AUDIO_VAE),
-            "lipsync_installed": INSTALL_LIPSYNC,
+            "lipsync_installed": bool(env_stats.get("lipsync_installed", False)),
         }
         ENV_MARKER.write_text(json.dumps(outputs, indent=2), encoding="utf-8")
         stop_hb.set()

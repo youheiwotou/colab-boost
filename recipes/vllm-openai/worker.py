@@ -27,6 +27,7 @@ TRUST_REMOTE = (ENV("BOOST_INPUT_TRUST_REMOTE_CODE") or "1") == "1"
 API_KEY = ENV("BOOST_INPUT_API_KEY") or ""
 HF_TOKEN = ENV("BOOST_HF_TOKEN") or ""
 SECRETS = [s for s in (API_KEY, HF_TOKEN) if s and len(s) >= 4]
+_HF_TOKEN_ENV_KEYS = frozenset({"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"})
 
 _proc: list[subprocess.Popen | None] = [None]
 _stage = ["detect"]
@@ -94,7 +95,9 @@ def set_status(state: str, stage: str, message: str, progress: float | None = No
     if outputs is not None:
         doc["outputs"] = outputs
     print(f"[{time.strftime('%H:%M:%S')}] [{state}:{stage}] {doc['message']}", flush=True)
-    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    parent = os.path.dirname(STATUS_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = STATUS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh)
@@ -112,6 +115,50 @@ def beat() -> None:
             os.utime(HEARTBEAT_FILE, None)
         except OSError:
             pass
+
+
+def build_download_env(base_env: dict[str, str] | None = None, hf_token: str | None = None) -> dict[str, str]:
+    src = os.environ if base_env is None else base_env
+    dl_env = {k: v for k, v in src.items() if not k.startswith("BOOST_")}
+    token = HF_TOKEN if hf_token is None else hf_token
+    if token:
+        dl_env["HF_TOKEN"] = token
+    dl_env["DL_REPO"] = REPO
+    return dl_env
+
+
+def build_server_env(base_env: dict[str, str] | None = None, api_key: str | None = None) -> dict[str, str]:
+    """Builds the persistent vLLM server environment without HF_TOKEN and passing VLLM_API_KEY."""
+    src = os.environ if base_env is None else base_env
+    server_env = {
+        k: v
+        for k, v in src.items()
+        if not k.startswith("BOOST_") and k not in _HF_TOKEN_ENV_KEYS
+    }
+    server_env.pop("VLLM_API_KEY", None)
+    key = API_KEY if api_key is None else api_key
+    if key:
+        server_env["VLLM_API_KEY"] = key
+    return server_env
+
+
+def build_vllm_cmd(model_src: str, alias: str) -> list[str]:
+    """Builds the vLLM server command line (API key is passed via VLLM_API_KEY env, never --api-key)."""
+    cmd = [
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", model_src,
+        "--served-model-name", alias,
+        "--host", "127.0.0.1",
+        "--port", str(PORT),
+        "--dtype", DTYPE,
+        "--max-model-len", str(MAX_LEN),
+        "--gpu-memory-utilization", f"{MEM_UTIL:.2f}",
+    ]
+    if QUANT != "auto":
+        cmd += ["--quantization", QUANT]
+    if TRUST_REMOTE:
+        cmd.append("--trust-remote-code")
+    return cmd
 
 
 def on_sigterm(*_) -> None:
@@ -162,40 +209,24 @@ def main() -> int:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "vllm", "huggingface_hub[hf_xet]"], check=True)
 
     set_status("running", "download", f"Downloading {REPO}...", progress=0.45)
-    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("BOOST_")}
-    if HF_TOKEN:
-        clean_env["HF_TOKEN"] = HF_TOKEN
-    dl_env = {**clean_env, "DL_REPO": REPO}
-    subprocess.run(
-        [sys.executable, "-c", "import os; from huggingface_hub import snapshot_download; snapshot_download(os.environ['DL_REPO'])"],
+    dl_env = build_download_env()
+    snap_lines = subprocess.check_output(
+        [sys.executable, "-c", "import os; from huggingface_hub import snapshot_download; print(snapshot_download(os.environ['DL_REPO']))"],
         env=dl_env,
-        check=True,
-    )
+        text=True,
+    ).strip().splitlines()
+    model_src = snap_lines[-1].strip() if snap_lines and os.path.isdir(snap_lines[-1].strip()) else REPO
 
     alias = REPO.rsplit("/", 1)[-1].lower()
-    cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", REPO,
-        "--served-model-name", alias,
-        "--host", "127.0.0.1",
-        "--port", str(PORT),
-        "--dtype", DTYPE,
-        "--max-model-len", str(MAX_LEN),
-        "--gpu-memory-utilization", f"{MEM_UTIL:.2f}",
-    ]
-    if QUANT != "auto":
-        cmd += ["--quantization", QUANT]
-    if TRUST_REMOTE:
-        cmd.append("--trust-remote-code")
-    if API_KEY:
-        cmd += ["--api-key", API_KEY]
+    cmd = build_vllm_cmd(model_src, alias)
+    server_env = build_server_env()
 
     set_status("running", "server", f"Launching vLLM on port {PORT}...", progress=0.75)
     log_path = os.path.join(RUN_DIR, "vllm.log")
     with open(log_path, "w", encoding="utf-8") as log_fh:
         proc = subprocess.Popen(
             cmd,
-            env=clean_env,
+            env=server_env,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

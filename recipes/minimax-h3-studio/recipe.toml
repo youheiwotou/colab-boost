@@ -10,8 +10,8 @@ zh-CN = "部署 MiniMax-H3 视频人物替换极速工作台 (三轨并发)"
 en = "Deploy MiniMax-H3 Video Studio (3-Track Parallel)"
 
 [description]
-zh-CN = "面向 Colab G4 Blackwell (96GB) 优化的 MiniMax-H3 Ref2VA + CharacterSwap v1.5 极速工作台：uv 并行装环境、hf_xet/aria2c 并发拉取 39.5GB 权重、预编译 SageAttention sm120 直装、支持热实例 0 秒复用与可选 LatentSync 口型精修节点。"
-en = "High-speed MiniMax-H3 Ref2VA + CharacterSwap v1.5 ComfyUI studio for Colab G4 Blackwell: 3-track parallel uv + hf_xet/aria2c bootstrap, precompiled SageAttention sm120 wheel support, 0-second warm-session reuse, and optional LatentSync lip-sync nodes."
+zh-CN = "面向 Colab G4 Blackwell (96GB) 优化的 MiniMax-H3 Ref2VA + CharacterSwap v1.5 极速工作台：uv 并行装环境、hf_xet/aria2c 并发拉取权重（4 核心文件 39.62 GB / 含默认 Audio VAE 共 5 文件 40.23 GB）、预编译 SageAttention sm120 直装、支持热实例 0 秒复用与可选 LatentSync 口型精修节点。"
+en = "High-speed MiniMax-H3 Ref2VA + CharacterSwap v1.5 ComfyUI studio for Colab G4 Blackwell: 3-track parallel uv + hf_xet/aria2c bootstrap (4 core files 39.62 GB / 5 files 40.23 GB with default Audio VAE), precompiled SageAttention sm120 wheel support, 0-second warm-session reuse, and optional LatentSync lip-sync nodes."
 
 [provision]
 accelerator = "G4"
@@ -69,8 +69,8 @@ id = "download_h3_models"
 type = "bool"
 default = true
 [inputs.label]
-zh-CN = "并发预拉取 40.1GB MiniMax-H3 (含 Audio VAE) + CharacterSwap v1.5 权重"
-en = "Parallel Download 40.1GB MiniMax-H3 (incl. Audio VAE) + LoRA Weights"
+zh-CN = "并发预拉取 MiniMax-H3 + CharacterSwap v1.5 权重 (4 文件 39.62 GB / 含 Audio VAE 共 5 文件 40.23 GB)"
+en = "Parallel Download MiniMax-H3 + LoRA Weights (4 files 39.62 GB / 5 files 40.23 GB incl. Audio VAE)"
 
 [[inputs]]
 id = "download_audio_vae"
@@ -80,8 +80,8 @@ default = true
 zh-CN = "加载原生 Audio VAE (minimax_h3_audio_vae_fp32.safetensors)"
 en = "Download Native Audio VAE (minimax_h3_audio_vae_fp32.safetensors)"
 [inputs.help]
-zh-CN = "仅 577 MB，与大模型并发拉取零额外耗时；接入 MiniMaxH3ReferenceToVideo.audio_vae + ref_video_audios 可启用原生音画联动口型"
-en = "577 MB downloaded in parallel (0 extra time); wire into MiniMaxH3ReferenceToVideo.audio_vae + ref_video_audios for native audio-driven lip sync"
+zh-CN = "仅 605 MB（577 MiB），与大模型并发拉取零额外耗时；接入 MiniMaxH3ReferenceToVideo.audio_vae + ref_video_audios 可启用原生音画联动口型"
+en = "605 MB (577 MiB) downloaded in parallel (0 extra time); wire into MiniMaxH3ReferenceToVideo.audio_vae + ref_video_audios for native audio-driven lip sync"
 
 [[inputs]]
 id = "download_engine"
@@ -92,8 +92,8 @@ default = "hf_xet_parallel"
 zh-CN = "模型并发下载引擎"
 en = "Model Parallel Download Engine"
 [inputs.help]
-zh-CN = "hf_xet_parallel 通过 4 线程并发 + HF Xet 协议拉满 GCP 带宽；aria2c_parallel 使用多连接 16 线程并发拉取"
-en = "hf_xet_parallel uses 4-way concurrent HF Xet downloads; aria2c_parallel uses 16-connection aria2c per file"
+zh-CN = "hf_xet_parallel 通过并发线程（4 核心文件 / 含 Audio VAE 共 5 文件）+ HF Xet 协议拉满 GCP 带宽；aria2c_parallel 使用多连接 16 线程并发拉取"
+en = "hf_xet_parallel uses concurrent HF Xet downloads (4 core / 5 files with Audio VAE); aria2c_parallel uses 16-connection aria2c per file"
 
 [[inputs]]
 id = "verify_sha256"
@@ -148,8 +148,8 @@ en = "Verify GPU & VRAM"
 [[stages]]
 id = "parallel_setup"
 [stages.label]
-zh-CN = "三轨并发：环境 + 39.5GB 权重 + 加速"
-en = "3-Track Parallel: Env + 39.5GB Models + Accel"
+zh-CN = "三轨并发：环境 + 权重 (39.62–40.23 GB) + 加速"
+en = "3-Track Parallel: Env + Weights (39.62–40.23 GB) + Accel"
 
 [[stages]]
 id = "verify"

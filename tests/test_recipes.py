@@ -372,3 +372,529 @@ def test_minimax_h3_launch_comfy_timeout_terminates_proc_and_surfaces_log_tail(
 
     assert terminated == [fake_proc]
     assert mod._PROC[0] is None
+
+
+def _write_minimal_recipe(
+    base_dir: Path,
+    recipe_id: str,
+    extra_toml: str = "",
+    script_rel: str = "worker.py",
+    create_script: bool = True,
+) -> Path:
+    rdir = base_dir / recipe_id
+    rdir.mkdir(parents=True, exist_ok=True)
+    if create_script:
+        sp = rdir / script_rel
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text("print('ok')\n", encoding="utf-8")
+    (rdir / "recipe.toml").write_text(
+        f"""
+api = 1
+id = "{recipe_id}"
+version = "0.1.0"
+[name]
+en = "Recipe {recipe_id}"
+[run]
+script = "{script_rel}"
+{extra_toml}
+""",
+        encoding="utf-8",
+    )
+    return rdir
+
+
+def test_discover_all_recipes_isolates_corrupt_user_recipe_and_skips_pycache(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bundled_dir = project_root() / "recipes"
+    user_dir = tmp_path / "user_recipes"
+    user_dir.mkdir()
+
+    # Valid user recipe
+    _write_minimal_recipe(user_dir, "custom-ok")
+    # Corrupt user recipe (broken TOML)
+    bad_dir = user_dir / "broken-user"
+    bad_dir.mkdir()
+    (bad_dir / "recipe.toml").write_text("api = [unclosed", encoding="utf-8")
+    # __pycache__ and hidden directory should be skipped silently
+    (user_dir / "__pycache__").mkdir()
+    (user_dir / ".hidden-draft").mkdir()
+
+    with caplog.at_level("WARNING"):
+        recipes = discover_all_recipes(bundled_dir, user_dir)
+
+    assert "llama-cpp-gguf" in recipes
+    assert "minimax-h3-studio" in recipes
+    assert "custom-ok" in recipes
+    assert "broken-user" not in recipes
+    assert "__pycache__" not in recipes
+    assert any("broken-user" in rec.message for rec in caplog.records)
+
+
+def test_recipe_loader_checks_symlinks_before_resolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1. Symlinked worker script (simulated deterministically so Windows without symlink privilege still tests exact path)
+    rdir = _write_minimal_recipe(tmp_path, "sym-script", script_rel="sub/worker.py")
+    real_is_symlink = Path.is_symlink
+
+    def fake_script_symlink(self: Path) -> bool:
+        if self == rdir / "sub" / "worker.py":
+            return True
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_script_symlink)
+    with pytest.raises(RecipeValidationError, match="symlink"):
+        load_recipe_from_dir(rdir, bundled=False)
+
+    # 2. Symlinked intermediate parent directory in relative script path
+    def fake_parent_symlink(self: Path) -> bool:
+        if self == rdir / "sub":
+            return True
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_parent_symlink)
+    with pytest.raises(RecipeValidationError, match="symlink"):
+        load_recipe_from_dir(rdir, bundled=False)
+
+
+def test_recipe_schema_bounds_defaults_labels_and_endpoint_conflicts(tmp_path: Path) -> None:
+    # 1. min > max
+    d1 = _write_minimal_recipe(
+        tmp_path,
+        "bad-bounds",
+        """
+[[inputs]]
+id = "threads"
+type = "number"
+min = 16
+max = 4
+[inputs.label]
+en = "Threads"
+""",
+    )
+    with pytest.raises(RecipeValidationError, match="min"):
+        load_recipe_from_dir(d1, bundled=False)
+
+    # 2. Number default out of range
+    d2 = _write_minimal_recipe(
+        tmp_path,
+        "bad-default-range",
+        """
+[[inputs]]
+id = "threads"
+type = "number"
+min = 1
+max = 8
+default = 32
+[inputs.label]
+en = "Threads"
+""",
+    )
+    with pytest.raises(RecipeValidationError, match="exceeds max"):
+        load_recipe_from_dir(d2, bundled=False)
+
+    # 3. Duplicate endpoint id
+    d3 = _write_minimal_recipe(
+        tmp_path,
+        "dup-ep-id",
+        """
+[[endpoints]]
+id = "api"
+port = 8000
+[endpoints.label]
+en = "API 1"
+[[endpoints]]
+id = "api"
+port = 8001
+[endpoints.label]
+en = "API 2"
+""",
+    )
+    with pytest.raises(RecipeValidationError, match="duplicate endpoint id"):
+        load_recipe_from_dir(d3, bundled=False)
+
+    # 4. Duplicate static endpoint port
+    d4 = _write_minimal_recipe(
+        tmp_path,
+        "dup-ep-port",
+        """
+[[endpoints]]
+id = "api1"
+port = 8000
+[endpoints.label]
+en = "API 1"
+[[endpoints]]
+id = "api2"
+port = 8000
+[endpoints.label]
+en = "API 2"
+""",
+    )
+    with pytest.raises(RecipeValidationError, match="conflicts"):
+        load_recipe_from_dir(d4, bundled=False)
+
+    # 5. Missing non-empty 'en' label on stage / endpoint / keep
+    d5 = _write_minimal_recipe(
+        tmp_path,
+        "missing-stage-en",
+        """
+[[stages]]
+id = "boot"
+[stages.label]
+zh-CN = "启动"
+""",
+    )
+    with pytest.raises(RecipeValidationError, match="en"):
+        load_recipe_from_dir(d5, bundled=False)
+
+    d6 = _write_minimal_recipe(
+        tmp_path,
+        "missing-ep-en",
+        """
+[[endpoints]]
+id = "api"
+port = 8001
+[endpoints.label]
+en = "   "
+""",
+    )
+    with pytest.raises(RecipeValidationError, match="en"):
+        load_recipe_from_dir(d6, bundled=False)
+
+    d7 = _write_minimal_recipe(
+        tmp_path,
+        "missing-keep-en",
+        """
+[[keep]]
+path = "/content/out"
+[keep.label]
+zh-CN = "输出"
+""",
+    )
+    with pytest.raises(RecipeValidationError, match="en"):
+        load_recipe_from_dir(d7, bundled=False)
+
+
+def test_validate_and_build_env_rejects_float_truncation_control_chars_and_port_clash(
+    tmp_path: Path,
+) -> None:
+    d = _write_minimal_recipe(
+        tmp_path,
+        "strict-inputs",
+        """
+[[inputs]]
+id = "port_a"
+type = "number"
+default = 8001
+min = 1024
+max = 65535
+[inputs.label]
+en = "Port A"
+[[inputs]]
+id = "port_b"
+type = "number"
+default = 8002
+min = 1024
+max = 65535
+[inputs.label]
+en = "Port B"
+[[inputs]]
+id = "note"
+type = "text"
+[inputs.label]
+en = "Note"
+[[inputs]]
+id = "token"
+type = "secret"
+[inputs.label]
+en = "Token"
+[[endpoints]]
+id = "ep_a"
+port_input = "port_a"
+[endpoints.label]
+en = "Endpoint A"
+[[endpoints]]
+id = "ep_b"
+port_input = "port_b"
+[endpoints.label]
+en = "Endpoint B"
+""",
+    )
+    loaded = load_recipe_from_dir(d, bundled=False)
+
+    # Reject float silent truncation (12.9 -> 12) and float string
+    for bad_num in (8001.9, 8001.0, "8001.9", True):
+        with pytest.raises(RecipeValidationError, match="integer"):
+            validate_and_build_env(loaded.manifest, {"port_a": bad_num})
+
+    # Reject control characters in text and secret
+    for bad_str in ("abc\ndef", "abc\rdef", "abc\x00def"):
+        with pytest.raises(RecipeValidationError, match="NUL or newline"):
+            validate_and_build_env(loaded.manifest, {"note": bad_str})
+        with pytest.raises(RecipeValidationError, match="NUL or newline"):
+            validate_and_build_env(loaded.manifest, {"token": bad_str})
+
+    # Reject oversized text / secret
+    with pytest.raises(RecipeValidationError, match="maximum length"):
+        validate_and_build_env(loaded.manifest, {"note": "x" * 5000})
+    with pytest.raises(RecipeValidationError, match="maximum length"):
+        validate_and_build_env(loaded.manifest, {"token": "s" * 5000})
+
+    # Reject runtime port conflict across endpoints
+    with pytest.raises(RecipeValidationError, match="conflicts"):
+        validate_and_build_env(loaded.manifest, {"port_a": 8010, "port_b": 8010})
+
+    # Valid string-encoded int works
+    env, secrets, ports = validate_and_build_env(
+        loaded.manifest, {"port_a": "8011", "port_b": 8012, "note": "ok", "token": "sec1234"}
+    )
+    assert env["BOOST_INPUT_PORT_A"] == "8011"
+    assert ports == {"ep_a": 8011, "ep_b": 8012}
+    assert secrets == ["sec1234"]
+
+
+def test_llama_worker_env_api_key_extra_args_cache_and_cuda_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BOOST_INPUT_API_KEY", "sk-llama-secret-123")
+    mod = _load_worker_module("llama-cpp-gguf", monkeypatch, tmp_path)
+
+    # API key passed via LLAMA_API_KEY env var, NOT --api-key on command line
+    cmd = mod.build_server_cmd("/bin/llama", "/m.gguf", 8192, "qwen", "f16", 8000)
+    assert "--api-key" not in cmd
+    assert "sk-llama-secret-123" not in " ".join(cmd)
+    srv_env = mod.runtime_env("/bin/llama", include_api_key=True)
+    assert srv_env["LLAMA_API_KEY"] == "sk-llama-secret-123"
+    assert "LLAMA_API_KEY" not in mod.runtime_env("/bin/llama", include_api_key=False)
+
+    # extra_args forbids --host / --port / --api-key
+    assert mod.parse_extra_args("--temp 0.6 --top-p 0.9") == ["--temp", "0.6", "--top-p", "0.9"]
+    for bad in ("--host 0.0.0.0", "--host=0.0.0.0", "--port 8080", "--port=9999", "--api-key leak", "--api-key=leak"):
+        with pytest.raises(ValueError, match="cannot override"):
+            mod.parse_extra_args(bad)
+
+    # Cache hit works in nested subdirectories
+    nested = tmp_path / "b9999" / "build" / "bin"
+    nested.mkdir(parents=True)
+    (nested / "llama-server").write_text("#!/bin/sh\n", encoding="utf-8")
+    assert mod._find_cached_llama_server_dir(str(tmp_path / "b9999")) == str(nested)
+
+    # Dynamic CUDA version selection & fallback
+    assets = [
+        "llama-b9999-bin-ubuntu-cuda-13.0-x64.tar.gz",
+        "llama-b9999-bin-ubuntu-cuda-12.4-x64.tar.gz",
+        "cudart-llama-b9999-bin-ubuntu-cuda-12.4-x64.tar.gz",
+    ]
+    selected = mod._select_release_archives("b9999", assets)
+    assert selected[0] == [
+        "llama-b9999-bin-ubuntu-cuda-12.4-x64.tar.gz",
+        "cudart-llama-b9999-bin-ubuntu-cuda-12.4-x64.tar.gz",
+    ]
+    assert selected[1] == ["llama-b9999-bin-ubuntu-cuda-13.0-x64.tar.gz"]
+
+    # Underscore quant, non-ASCII rejection, unknown KV_FACTORS.get, and mctx <= 0 guard
+    assert mod.extract_quant("model_Q4_K_M.gguf") == "Q4_K_M"
+    assert mod.extract_quant("model_Q4_非ASCII.gguf") is None
+
+    # Nested array (elem_type == 9) and 1 MiB string limit in worker parse_gguf_meta
+    import struct as _st
+
+    def _pstr(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return _st.pack("<Q", len(b)) + b
+
+    inner = _st.pack("<IQ", 4, 2) + _st.pack("<II", 7, 9)
+    nested_arr = _st.pack("<IQ", 9, 1) + inner
+    blob = (
+        b"GGUF"
+        + _st.pack("<IQQ", 3, 1, 2)
+        + _pstr("arr.nested")
+        + _st.pack("<I", 9)
+        + nested_arr
+        + _pstr("general.architecture")
+        + _st.pack("<I", 8)
+        + _pstr("llama")
+    )
+    parsed = mod.parse_gguf_meta(blob)
+    assert parsed["arr.nested"] == [[7, 9]]
+    assert parsed["general.architecture"] == "llama"
+
+    # Oversized >1 MiB string stops cleanly without allocating
+    huge_str_blob = b"GGUF" + _st.pack("<IQQ", 3, 1, 1) + _st.pack("<Q", 2 * 1024 * 1024)
+    assert mod.parse_gguf_meta(huge_str_blob) == {}
+
+    monkeypatch.setattr(mod, "KV_PREF", "unknown_kv")
+    fit = mod.choose_fit(
+        [{"quant": "Q4_K_M", "files": ["model_Q4_K_M.gguf"], "size": 4 * (1024**3)}],
+        vram_mib=15360,
+        mm_bytes=0,
+        meta={"general.architecture": "llama", "llama.context_length": -1},
+    )
+    assert fit["ctx"] == mod.DEFAULT_CTX
+
+
+def test_vllm_worker_env_api_key_and_hf_token_scrubbed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BOOST_INPUT_API_KEY", "sk-vllm-secret-456")
+    monkeypatch.setenv("BOOST_HF_TOKEN", "hf_secret_token_999")
+    mod = _load_worker_module("vllm-openai", monkeypatch, tmp_path)
+
+    cmd = mod.build_vllm_cmd("/cache/snap", "qwen")
+    assert "--api-key" not in cmd
+    assert "sk-vllm-secret-456" not in " ".join(cmd)
+
+    srv_env = mod.build_server_env(
+        base_env={"PATH": "/usr/bin", "HF_TOKEN": "hf_secret_token_999", "HUGGING_FACE_HUB_TOKEN": "hf_old", "BOOST_X": "1"}
+    )
+    assert srv_env["VLLM_API_KEY"] == "sk-vllm-secret-456"
+    assert "HF_TOKEN" not in srv_env
+    assert "HUGGING_FACE_HUB_TOKEN" not in srv_env
+    assert "BOOST_X" not in srv_env
+
+
+def test_faster_whisper_worker_sync_endpoint_streaming_suffix_and_ld_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod = _load_worker_module("faster-whisper-api", monkeypatch, tmp_path)
+
+    assert "async def transcribe(" not in mod.APP_CODE
+    assert "def transcribe(" in mod.APP_CODE
+    assert "shutil.copyfileobj(" in mod.APP_CODE
+    assert "await file.read()" not in mod.APP_CODE
+
+    # Verify _safe_audio_suffix strips path separators & traversal
+    ns: dict = {"os": __import__("os"), "re": __import__("re")}
+    start = mod.APP_CODE.index("def _safe_audio_suffix")
+    end = mod.APP_CODE.index("@app.get")
+    exec(mod.APP_CODE[start:end], ns)
+    safe_suffix = ns["_safe_audio_suffix"]
+    assert safe_suffix("clip.mp3") == ".mp3"
+    assert safe_suffix("../../etc/passwd.flac") == ".flac"
+    assert safe_suffix(r"C:\evil\path\song.wav") == ".wav"
+    assert safe_suffix("audio.wav/../../bad") == ".wav"
+    assert safe_suffix("noext") == ".wav"
+
+    # Verify LD_LIBRARY_PATH injects /usr/lib64-nvidia and pip nvidia/*/lib
+    fake_cudnn = tmp_path / "site" / "nvidia" / "cudnn" / "lib"
+    fake_cudnn.mkdir(parents=True)
+    ld_path = mod.build_cuda_ld_library_path(existing="/existing/lib", extra_site_roots=[str(tmp_path / "site")])
+    assert "/usr/lib64-nvidia" in ld_path
+    assert str(fake_cudnn) in ld_path
+    assert "/existing/lib" in ld_path
+
+
+def test_minimax_h3_commit_guard_torch_filter_lipsync_truth_and_weight_consistency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod = _load_worker_module("minimax-h3-studio", monkeypatch, tmp_path)
+
+    # 1. COMFY_COMMIT whitelist validation
+    assert mod.validate_git_commit("latest") == "latest"
+    assert mod.validate_git_commit("fe298e4e20f1ff26d30e8639267bbd0b57811390") == "fe298e4e20f1ff26d30e8639267bbd0b57811390"
+    for bad_ref in ("--upload-pack=sh", "-f", "main;id", "../HEAD", "short"):
+        with pytest.raises(ValueError, match="Invalid git commit"):
+            mod.validate_git_commit(bad_ref)
+        with pytest.raises(ValueError, match="Invalid git commit"):
+            mod.shallow_checkout_repo("https://example.com/repo.git", tmp_path / "repo", bad_ref)
+
+    # 2. Torch filtering preserves torchsde while removing torch/torchvision/torchaudio
+    req_in = tmp_path / "requirements.txt"
+    req_in.write_text(
+        "# comment\ntorch>=2.0\ntorchvision==0.19.0\ntorchaudio\ntorchsde>=0.2.6\neinops\n",
+        encoding="utf-8",
+    )
+    req_out = mod._filter_torch_requirements(req_in, tmp_path / "filtered.txt")
+    filtered_text = req_out.read_text(encoding="utf-8")
+    assert "torchsde>=0.2.6" in filtered_text
+    assert "einops" in filtered_text
+    assert "torch>=2.0" not in filtered_text
+    assert "torchvision" not in filtered_text
+    assert "torchaudio" not in filtered_text
+
+    # 3. INSTALL_LIPSYNC failure reports lipsync_installed=False instead of hardcoded True
+    monkeypatch.setattr(mod, "WORK", tmp_path / "work")
+    monkeypatch.setattr(mod, "COMFY_DIR", tmp_path / "work" / "ComfyUI")
+    monkeypatch.setattr(mod, "VENV_DIR", tmp_path / "work" / "venv")
+    monkeypatch.setattr(mod, "WHEELS_DIR", tmp_path / "work" / "wheels")
+    monkeypatch.setattr(mod, "PYTORCH_MODE", "reuse_system")
+    monkeypatch.setattr(mod, "SAGE_MODE", "disabled")
+    monkeypatch.setattr(mod, "INSTALL_LIPSYNC", True)
+
+    def fake_shallow(_url: str, target: Path, _commit: str) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "requirements.txt").write_text("torch\neinops\n", encoding="utf-8")
+
+    def fake_run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+        if "demucs" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "error: failed to build demucs")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(mod, "shallow_checkout_repo", fake_shallow)
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    stats = mod.track_a_install_env({"compute_cap": "12.0"}, "/usr/local/bin/uv")
+    assert stats["lipsync_installed"] is False
+    assert "failed to build demucs" in stats["lipsync_error"]
+
+    # 4. Exact weight totals match documentation (4 files 39.62 GB, 5 files 40.23 GB)
+    core_bytes = sum(sz for _, sz, _ in mod.PUBLIC_MODELS) + mod.LORA_BYTES
+    full_bytes = core_bytes + mod.AUDIO_VAE_MODEL[1]
+    assert round(core_bytes / 1e9, 2) == 39.62
+    assert round(full_bytes / 1e9, 2) == 40.23
+    for rel in ("README.md", "recipes/minimax-h3-studio/recipe.toml", "recipes/minimax-h3-studio/worker.py"):
+        txt = (project_root() / rel).read_text(encoding="utf-8")
+        assert "39.62 GB" in txt
+        assert "40.23 GB" in txt
+        assert "39.5 GB" not in txt
+        assert "39.5GB" not in txt
+        assert "40.1GB" not in txt
+
+
+def test_comfyui_torch_filter_and_curl_atomic_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod = _load_worker_module("comfyui-studio", monkeypatch, tmp_path)
+
+    req_in = tmp_path / "requirements.txt"
+    req_in.write_text("torch\ntorchvision>=0.18\ntorchaudio\ntorchsde\npillow\n", encoding="utf-8")
+    out_path = mod._filter_torch_requirements(str(req_in), str(tmp_path / "no_torch.txt"))
+    txt = Path(out_path).read_text(encoding="utf-8")
+    assert "torchsde" in txt and "pillow" in txt
+    assert "\ntorch\n" not in f"\n{txt}\n"
+    assert "torchvision" not in txt and "torchaudio" not in txt
+
+    recorded: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+        recorded.append(list(cmd))
+        out_idx = cmd.index("-o") + 1
+        Path(cmd[out_idx]).write_bytes(b"weights")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    target = tmp_path / "models" / "ckpt.safetensors"
+    mod._download_url_with_curl("https://civitai.com/api/download/1", str(target), env={}, civitai_token="tok123")
+    assert len(recorded) == 1
+    assert "-C" in recorded[0] and "-" in recorded[0]
+    assert recorded[0][recorded[0].index("-o") + 1].endswith(".part")
+    assert target.read_bytes() == b"weights"
+    assert not (tmp_path / "models" / "ckpt.safetensors.part").exists()
+
+
+def test_windows_batch_scripts_guards_and_arg_forwarding() -> None:
+    root = project_root()
+    console_bat = (root / "start_console.bat").read_text(encoding="utf-8")
+    demo_bat = (root / "start_demo.bat").read_text(encoding="utf-8")
+
+    for content in (console_bat, demo_bat):
+        assert "setlocal" in content
+        assert "where uv" in content
+        assert "pause" in content
+
+    assert 'if "%~1"==""' in console_bat
+    assert "uv run colab-boost %*" in console_bat
+    assert "uv run colab-boost --open-browser %*" not in console_bat
+    assert "--open-browser %*" in demo_bat
+

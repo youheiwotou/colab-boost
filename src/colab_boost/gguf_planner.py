@@ -11,13 +11,21 @@ from urllib.parse import quote
 
 import httpx
 
+from colab_boost.models import ACCELERATOR_VRAM_REFERENCE_MIB
+
 RESERVE_MIB = 1024.0
 COMPUTE_BASE_MIB = 512.0
 COMPUTE_WEIGHT_FRACTION = 0.05
+COMPUTE_CTX_MIB_PER_32K = 256.0
 VRAM_BUDGET_FRACTION = 0.97
 FALLBACK_KV_BYTES_PER_TOKEN = 128 * 1024  # 128 KiB/token conservative fallback
 FALLBACK_MODEL_CTX = 32768
 MIN_AUTO_CTX = 8192
+MIN_LOW_VRAM_AUTO_CTX = 4096
+LOW_VRAM_THRESHOLD_MIB = 16384
+HEADER_PROBE_BYTES = 4 * 1024 * 1024
+MAX_GGUF_STR_BYTES = 1024 * 1024
+MAX_NESTED_ARRAY_DEPTH = 16
 
 KV_TYPE_FACTORS: dict[str, float] = {
     "f16": 1.0,
@@ -28,6 +36,17 @@ KV_TYPE_FACTORS: dict[str, float] = {
 FULL_PRECISION_QUANTS = frozenset({"F16", "BF16", "F32"})
 LOW_BIT_PREFIXES = ("Q3", "Q2", "Q1", "IQ3", "IQ2", "IQ1", "TQ")
 REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+SHARD_SUFFIX_RE = re.compile(r"[-_]\d{5}[-_]of[-_]\d{5}$", re.IGNORECASE | re.ASCII)
+QUANT_TOKEN_RE = re.compile(
+    r"(?:^|[-._])(?:(UD)[-_])?((?:BF16|F16|F32|MXFP4(?:_[A-Z0-9]+)*|(?:IQ|TQ|Q)\d+(?:_[A-Z0-9]+)*))(?=$|[-.])",
+    re.IGNORECASE | re.ASCII,
+)
+
+_HARDWARE_MATRIX_ORDER: tuple[str, ...] = ("T4", "L4", "A100", "H100", "G4")
+_VRAM_GB_LABEL_OVERRIDES: dict[int, int] = {
+    23034: 23,
+    97887: 96,
+}
 
 GGUF_SCALAR_FORMATS: dict[int, str] = {
     0: "<B",
@@ -65,6 +84,9 @@ class GgufRepoPlan:
     model_ctx: Optional[int]
     kv_bytes_per_token_f16: Optional[int]
     has_mtp: bool
+    sliding_window: Optional[int] = None
+    header_truncated: bool = False
+    header_warning: Optional[str] = None
 
 
 def validate_hf_repo_id(repo: str) -> str:
@@ -88,12 +110,8 @@ def is_quant_token(token: str) -> bool:
 
 
 def strip_shard_suffix(stem: str) -> str:
-    # Matches `-00001-of-00003` (15 chars)
-    if len(stem) >= 15:
-        tail = stem[-15:]
-        if tail[0] == "-" and tail[1:6].isdigit() and tail[6:10] == "-of-" and tail[10:15].isdigit():
-            return stem[:-15]
-    return stem
+    # Matches `-00001-of-00003` or `_00001_of_00003`
+    return SHARD_SUFFIX_RE.sub("", stem)
 
 
 def extract_quant_label(file_path: str) -> Optional[str]:
@@ -101,13 +119,12 @@ def extract_quant_label(file_path: str) -> Optional[str]:
     if not base.lower().endswith(".gguf"):
         return None
     stem = strip_shard_suffix(base[:-5])
-    tokens = re.split(r"[-.]", stem)
-    for idx in range(len(tokens) - 1, -1, -1):
-        if is_quant_token(tokens[idx]):
-            label = tokens[idx].upper()
-            if idx > 0 and tokens[idx - 1].lower() == "ud":
-                return f"UD-{label}"
-            return label
+    matches = list(QUANT_TOKEN_RE.finditer(stem))
+    for match in reversed(matches):
+        ud_prefix = match.group(1)
+        token = match.group(2).upper()
+        if is_quant_token(token):
+            return f"UD-{token}" if ud_prefix else token
     return None
 
 
@@ -115,9 +132,19 @@ def is_mmproj_file(file_path: str) -> bool:
     return "mmproj" in file_path.rsplit("/", 1)[-1].lower()
 
 
+def _base_quant_name(quant: str) -> str:
+    return quant.rsplit("/", 1)[-1]
+
+
 def group_gguf_files(files: list[tuple[str, int]]) -> tuple[list[GgufVariant], list[tuple[str, int]]]:
-    """Groups GGUF files into sorted variants (largest first) and separates mmproj projectors."""
-    by_quant: dict[str, GgufVariant] = {}
+    """Groups GGUF files into sorted variants (largest first) and separates mmproj projectors.
+
+    Files with the same quantization label across different subdirectories are kept
+    separate (disambiguated by subdirectory prefix) so duplicate builds are not merged
+    and double-counted.
+    """
+    by_dir_quant: dict[tuple[str, str], GgufVariant] = {}
+    subdirs_for_label: dict[str, set[str]] = {}
     mmproj: list[tuple[str, int]] = []
 
     for path, size in files:
@@ -129,13 +156,18 @@ def group_gguf_files(files: list[tuple[str, int]]) -> tuple[list[GgufVariant], l
         label = extract_quant_label(path)
         if not label:
             continue
-        variant = by_quant.setdefault(label, GgufVariant(quant=label))
+        subdir = path.rsplit("/", 1)[0] if "/" in path else ""
+        subdirs_for_label.setdefault(label, set()).add(subdir)
+        variant = by_dir_quant.setdefault((subdir, label), GgufVariant(quant=label))
         variant.files.append(path)
         variant.size_bytes += int(size)
 
-    for v in by_quant.values():
-        v.files.sort()
-    variants = sorted(by_quant.values(), key=lambda v: (-v.size_bytes, v.quant))
+    for (subdir, label), variant in by_dir_quant.items():
+        if len(subdirs_for_label.get(label, ())) > 1 and subdir:
+            variant.quant = f"{subdir}/{label}"
+        variant.files.sort()
+
+    variants = sorted(by_dir_quant.values(), key=lambda v: (-v.size_bytes, v.quant))
     mmproj.sort(
         key=lambda item: (
             0 if re.search(r"[-_]f16", item[0].lower()) else 1 if "bf16" in item[0].lower() else 2,
@@ -146,7 +178,8 @@ def group_gguf_files(files: list[tuple[str, int]]) -> tuple[list[GgufVariant], l
 
 
 def is_low_bit_quant(quant: str) -> bool:
-    core = quant[3:] if quant.startswith("UD-") else quant
+    base = _base_quant_name(quant)
+    core = base[3:] if base.startswith("UD-") else base
     return core.startswith(LOW_BIT_PREFIXES)
 
 
@@ -154,13 +187,16 @@ class _TruncatedBuffer(Exception):
     pass
 
 
-def parse_gguf_header_bytes(data: bytes) -> dict[str, Any]:
-    """Parses GGUF v2/v3 metadata key-values from a partial byte prefix."""
+def parse_gguf_header_with_status(data: bytes) -> tuple[dict[str, Any], bool]:
+    """Parses GGUF v2/v3 metadata key-values from a partial byte prefix.
+
+    Returns ``(metadata_dict, was_truncated)``.
+    """
     pos = 0
 
     def take(n: int) -> bytes:
         nonlocal pos
-        if pos + n > len(data):
+        if n < 0 or pos + n > len(data):
             raise _TruncatedBuffer
         chunk = data[pos : pos + n]
         pos += n
@@ -171,11 +207,13 @@ def parse_gguf_header_bytes(data: bytes) -> dict[str, Any]:
 
     def read_str() -> str:
         length = unpack_one("<Q")
-        if length > 1024 * 1024:
+        if length > MAX_GGUF_STR_BYTES:
             raise _TruncatedBuffer
         return take(length).decode("utf-8", errors="replace")
 
-    def read_val(vtype: int) -> Any:
+    def read_val(vtype: int, depth: int = 0) -> Any:
+        if depth > MAX_NESTED_ARRAY_DEPTH:
+            raise _TruncatedBuffer
         if vtype in GGUF_SCALAR_FORMATS:
             return unpack_one(GGUF_SCALAR_FORMATS[vtype])
         if vtype == 8:
@@ -183,24 +221,40 @@ def parse_gguf_header_bytes(data: bytes) -> dict[str, Any]:
         if vtype == 9:
             elem_type = unpack_one("<I")
             count = unpack_one("<Q")
+            remaining = len(data) - pos
             if elem_type == 8:
+                if count > remaining // 8:
+                    raise _TruncatedBuffer
                 for _ in range(count):
                     read_str()
                 return None
-            if elem_type in GGUF_SCALAR_FORMATS and count <= 4096:
-                return [read_val(elem_type) for _ in range(count)]
-            elem_size = struct.calcsize(GGUF_SCALAR_FORMATS.get(elem_type, "<B"))
-            take(count * elem_size)
-            return None
+            if elem_type == 9:
+                if count > remaining // 12:
+                    raise _TruncatedBuffer
+                if count <= 4096:
+                    return [read_val(9, depth + 1) for _ in range(count)]
+                for _ in range(count):
+                    read_val(9, depth + 1)
+                return None
+            if elem_type in GGUF_SCALAR_FORMATS:
+                elem_size = struct.calcsize(GGUF_SCALAR_FORMATS[elem_type])
+                if count > remaining // elem_size:
+                    raise _TruncatedBuffer
+                if count <= 4096:
+                    return [unpack_one(GGUF_SCALAR_FORMATS[elem_type]) for _ in range(count)]
+                take(count * elem_size)
+                return None
+            raise _TruncatedBuffer
         raise _TruncatedBuffer
 
     meta: dict[str, Any] = {}
+    truncated = False
     try:
         if take(4) != b"GGUF":
-            return meta
+            return meta, False
         version = unpack_one("<I")
         if version < 2:
-            return meta
+            return meta, False
         _tensor_count = unpack_one("<Q")
         kv_count = unpack_one("<Q")
         for _ in range(kv_count):
@@ -208,8 +262,28 @@ def parse_gguf_header_bytes(data: bytes) -> dict[str, Any]:
             vtype = unpack_one("<I")
             meta[key] = read_val(vtype)
     except _TruncatedBuffer:
-        pass
+        truncated = True
+    return meta, truncated
+
+
+def parse_gguf_header_bytes(data: bytes) -> dict[str, Any]:
+    """Parses GGUF v2/v3 metadata key-values from a partial byte prefix."""
+    meta, _truncated = parse_gguf_header_with_status(data)
     return meta
+
+
+def extract_sliding_window(meta: dict[str, Any]) -> Optional[int]:
+    """Extracts pure sliding-window size (tokens) when present without global-layer interleaving."""
+    arch = meta.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        return None
+    interval = meta.get(f"{arch}.full_attention_interval")
+    if isinstance(interval, int) and interval > 0:
+        return None
+    sw = meta.get(f"{arch}.attention.sliding_window")
+    if isinstance(sw, (int, float)) and sw > 0:
+        return int(sw)
+    return None
 
 
 def extract_kv_architecture_params(meta: dict[str, Any]) -> tuple[Optional[str], Optional[int], Optional[int], bool]:
@@ -228,24 +302,40 @@ def extract_kv_architecture_params(meta: dict[str, Any]) -> tuple[Optional[str],
     heads = get_arch("attention.head_count")
     kv_heads = get_arch("attention.head_count_kv")
     embd = get_arch("embedding_length")
+    interval = get_arch("full_attention_interval")
+
+    if not isinstance(blocks, (int, float)) or blocks <= 0:
+        return arch, None, ctx_int, has_mtp
+
+    eff_layers = max(1, int(blocks) // int(interval)) if isinstance(interval, int) and interval > 0 else int(blocks)
+
+    # DeepSeek MLA (Multi-head Latent Attention) caches compressed latent + decoupled RoPE key
+    kv_lora_rank = get_arch("attention.kv_lora_rank")
+    if isinstance(kv_lora_rank, (int, float)) and kv_lora_rank > 0:
+        rope_dim = get_arch("rope.dimension_count")
+        rope_d = int(rope_dim) if isinstance(rope_dim, (int, float)) and rope_dim > 0 else 0
+        per_token = int(eff_layers) * (int(kv_lora_rank) + rope_d) * 2
+        return arch, per_token, ctx_int, has_mtp
 
     if isinstance(heads, list):
-        heads = max(heads) if heads else None
+        valid_heads = [int(h) for h in heads if isinstance(h, (int, float)) and h > 0]
+        heads = max(valid_heads) if valid_heads else None
     key_len = get_arch("attention.key_length") or (embd // heads if embd and heads else None)
     val_len = get_arch("attention.value_length") or key_len
-    if not blocks or not key_len:
+    if not key_len or not val_len:
         return arch, None, ctx_int, has_mtp
 
     if isinstance(kv_heads, list):
-        per_token = sum(int(h) for h in kv_heads) * int(key_len + val_len) * 2
+        valid_kv_heads = [int(h) for h in kv_heads if isinstance(h, (int, float)) and h > 0]
+        if not valid_kv_heads:
+            return arch, None, ctx_int, has_mtp
+        per_token = sum(valid_kv_heads) * int(key_len + val_len) * 2
         return arch, per_token, ctx_int, has_mtp
 
     eff_kv_heads = kv_heads or heads
     if not eff_kv_heads:
         return arch, None, ctx_int, has_mtp
 
-    interval = get_arch("full_attention_interval")
-    eff_layers = int(blocks) // int(interval) if isinstance(interval, int) and interval > 0 else int(blocks)
     per_token = int(eff_layers) * int(eff_kv_heads) * int(key_len + val_len) * 2
     return arch, per_token, ctx_int, has_mtp
 
@@ -256,22 +346,38 @@ def estimate_vram_mib(
     kv_bytes_per_token_f16: int,
     ctx: int,
     kv_type: str,
+    sliding_window: Optional[int] = None,
 ) -> float:
     mib = 1024.0 * 1024.0
     w_mib = weights_bytes / mib
     mm_mib = mmproj_bytes / mib
     kv_factor = KV_TYPE_FACTORS.get(kv_type, 1.0)
-    kv_mib = (kv_bytes_per_token_f16 * kv_factor * ctx) / mib
-    return w_mib + mm_mib + kv_mib + RESERVE_MIB + COMPUTE_BASE_MIB + (COMPUTE_WEIGHT_FRACTION * w_mib)
+    effective_kv_ctx = min(ctx, sliding_window) if (sliding_window and sliding_window > 0) else ctx
+    kv_mib = (kv_bytes_per_token_f16 * kv_factor * effective_kv_ctx) / mib
+    compute_ctx_mib = COMPUTE_CTX_MIB_PER_32K * (max(0, ctx) / 32768.0)
+    return (
+        w_mib
+        + mm_mib
+        + kv_mib
+        + RESERVE_MIB
+        + COMPUTE_BASE_MIB
+        + (COMPUTE_WEIGHT_FRACTION * w_mib)
+        + compute_ctx_mib
+    )
 
 
-def build_ctx_ladder(requested_ctx: int, model_ctx: Optional[int]) -> tuple[list[int], int]:
+def build_ctx_ladder(
+    requested_ctx: int,
+    model_ctx: Optional[int],
+    *,
+    min_ctx: int = MIN_AUTO_CTX,
+) -> tuple[list[int], int]:
     if requested_ctx > 0:
         return [requested_ctx], requested_ctx
     max_ctx = model_ctx if (model_ctx and model_ctx > 0) else FALLBACK_MODEL_CTX
     ladder = [max_ctx]
     cur = max_ctx
-    while cur // 2 >= MIN_AUTO_CTX:
+    while cur // 2 >= min_ctx:
         cur //= 2
         ladder.append(cur)
     return ladder, max_ctx
@@ -285,6 +391,7 @@ def _try_fit_variant(
     mmproj_bytes: int,
     kv_bytes_per_token: Optional[int],
     forced_kv: Optional[str],
+    sliding_window: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     if vram_mib <= 0:
         return None
@@ -292,7 +399,14 @@ def _try_fit_variant(
     budget = vram_mib * VRAM_BUDGET_FRACTION
     kv_candidates = [forced_kv] if forced_kv and forced_kv != "auto" else ["f16", "q8_0"]
     for kv in kv_candidates:
-        est = estimate_vram_mib(variant.size_bytes, mmproj_bytes, kvb, ctx, kv)
+        est = estimate_vram_mib(
+            variant.size_bytes,
+            mmproj_bytes,
+            kvb,
+            ctx,
+            kv,
+            sliding_window=sliding_window,
+        )
         if est <= budget:
             return {
                 "fits": True,
@@ -319,23 +433,32 @@ def fit_gguf_for_vram(
     kv_bytes_per_token: Optional[int] = None,
     mmproj_bytes: int = 0,
     kv_type: str = "auto",
+    sliding_window: Optional[int] = None,
 ) -> dict[str, Any]:
     """Computes the best quantization/KV/context plan for a given GPU VRAM size."""
     if not variants:
         return {"fits": False, "vram_mib": vram_mib, "reason": "No GGUF files in repository"}
 
     forced_kv = None if kv_type == "auto" else kv_type
-    ladder, max_ctx = build_ctx_ladder(requested_ctx, model_ctx)
+    min_ctx = MIN_LOW_VRAM_AUTO_CTX if 0 < vram_mib <= LOW_VRAM_THRESHOLD_MIB else MIN_AUTO_CTX
+    ladder, max_ctx = build_ctx_ladder(requested_ctx, model_ctx, min_ctx=min_ctx)
 
     if quant.lower() == "auto":
-        non_fp = [v for v in variants if v.quant not in FULL_PRECISION_QUANTS]
+        non_fp = [v for v in variants if _base_quant_name(v.quant) not in FULL_PRECISION_QUANTS]
         pool = non_fp or list(variants)
         normal = [v for v in pool if not is_low_bit_quant(v.quant)]
         for tier in (normal, pool):
             for ctx in ladder:
                 for variant in tier:
                     res = _try_fit_variant(
-                        variant, vram_mib, ctx, max_ctx, mmproj_bytes, kv_bytes_per_token, forced_kv
+                        variant,
+                        vram_mib,
+                        ctx,
+                        max_ctx,
+                        mmproj_bytes,
+                        kv_bytes_per_token,
+                        forced_kv,
+                        sliding_window=sliding_window,
                     )
                     if res:
                         return res
@@ -348,6 +471,8 @@ def fit_gguf_for_vram(
 
     target = next((v for v in variants if v.quant.lower() == quant.lower()), None)
     if target is None:
+        target = next((v for v in variants if _base_quant_name(v.quant).lower() == quant.lower()), None)
+    if target is None:
         return {
             "fits": False,
             "vram_mib": vram_mib,
@@ -356,7 +481,14 @@ def fit_gguf_for_vram(
         }
     for ctx in ladder:
         res = _try_fit_variant(
-            target, vram_mib, ctx, max_ctx, mmproj_bytes, kv_bytes_per_token, forced_kv
+            target,
+            vram_mib,
+            ctx,
+            max_ctx,
+            mmproj_bytes,
+            kv_bytes_per_token,
+            forced_kv,
+            sliding_window=sliding_window,
         )
         if res:
             return res
@@ -365,7 +497,16 @@ def fit_gguf_for_vram(
         v.quant
         for v in variants
         if any(
-            _try_fit_variant(v, vram_mib, c, max_ctx, mmproj_bytes, kv_bytes_per_token, forced_kv)
+            _try_fit_variant(
+                v,
+                vram_mib,
+                c,
+                max_ctx,
+                mmproj_bytes,
+                kv_bytes_per_token,
+                forced_kv,
+                sliding_window=sliding_window,
+            )
             for c in ladder
         )
     ]
@@ -375,6 +516,18 @@ def fit_gguf_for_vram(
         "reason": f"{target.quant} exceeds {vram_mib} MiB VRAM",
         "fitting_quants": fitting_alts,
     }
+
+
+def _hardware_matrix_targets() -> list[tuple[str, str, int]]:
+    ordered_accels = list(_HARDWARE_MATRIX_ORDER) + [
+        accel for accel in ACCELERATOR_VRAM_REFERENCE_MIB if accel not in _HARDWARE_MATRIX_ORDER
+    ]
+    targets: list[tuple[str, str, int]] = []
+    for accel in ordered_accels:
+        for vram in ACCELERATOR_VRAM_REFERENCE_MIB.get(accel, []):
+            gb = _VRAM_GB_LABEL_OVERRIDES.get(vram, int(round(vram / 1024)))
+            targets.append((f"{accel} ({gb} GB)", accel, vram))
+    return targets
 
 
 def build_hardware_fit_matrix(
@@ -388,14 +541,8 @@ def build_hardware_fit_matrix(
     if use_mmproj and plan.preferred_mmproj:
         mm_bytes = dict(plan.mmproj_files).get(plan.preferred_mmproj, 0)
 
-    targets = [
-        ("T4 (15 GB)", "T4", 15360),
-        ("L4 (23 GB)", "L4", 23034),
-        ("A100 (40 GB)", "A100", 40960),
-        ("A100 / H100 (80 GB)", "A100", 81920),
-    ]
     rows: list[dict[str, Any]] = []
-    for label, accel, vram in targets:
+    for label, accel, vram in _hardware_matrix_targets():
         fit = fit_gguf_for_vram(
             plan.variants,
             vram_mib=vram,
@@ -405,12 +552,18 @@ def build_hardware_fit_matrix(
             kv_bytes_per_token=plan.kv_bytes_per_token_f16,
             mmproj_bytes=mm_bytes,
             kv_type=kv_type,
+            sliding_window=plan.sliding_window,
         )
-        rows.append({
+        row: dict[str, Any] = {
             "gpu_label": label,
             "accelerator": accel,
             **fit,
-        })
+        }
+        if plan.header_truncated:
+            row["header_truncated"] = True
+        if plan.header_warning:
+            row["header_warning"] = plan.header_warning
+        rows.append(row)
     return rows
 
 
@@ -469,17 +622,36 @@ async def inspect_hf_gguf_repo(repo: str, hf_token: Optional[str] = None) -> Ggu
         preferred_mm = mmproj[0][0] if mmproj else None
 
         arch, kv_per_tok, model_ctx, has_mtp = None, None, None, False
+        sliding_window: Optional[int] = None
+        header_truncated = False
+        header_warning: Optional[str] = None
         if variants:
             smallest_file = variants[-1].files[0]
             header_url = f"https://huggingface.co/{repo_id}/resolve/main/{quote(smallest_file)}"
-            range_headers = {"Range": "bytes=0-4194303", **headers}
+            range_headers = {"Range": f"bytes=0-{HEADER_PROBE_BYTES - 1}", **headers}
             try:
                 h_resp = await client.get(header_url, headers=range_headers, timeout=12.0)
                 if h_resp.status_code in (200, 206):
-                    meta = parse_gguf_header_bytes(h_resp.content[: 4 * 1024 * 1024])
+                    raw_prefix = h_resp.content[:HEADER_PROBE_BYTES]
+                    meta, truncated = parse_gguf_header_with_status(raw_prefix)
                     arch, kv_per_tok, model_ctx, has_mtp = extract_kv_architecture_params(meta)
-            except Exception:
-                pass
+                    sliding_window = extract_sliding_window(meta)
+                    if truncated:
+                        header_truncated = True
+                        header_warning = (
+                            "GGUF metadata header was truncated at the 4 MiB probe limit; "
+                            "missing architecture/KV fields fall back to conservative defaults."
+                        )
+                else:
+                    header_warning = (
+                        f"GGUF header probe returned HTTP {h_resp.status_code}; "
+                        "using conservative default KV/context estimates."
+                    )
+            except Exception as exc:
+                header_warning = (
+                    f"GGUF header probe failed ({type(exc).__name__}); "
+                    "using conservative default KV/context estimates."
+                )
 
     return GgufRepoPlan(
         repo=repo_id,
@@ -490,4 +662,7 @@ async def inspect_hf_gguf_repo(repo: str, hf_token: Optional[str] = None) -> Ggu
         model_ctx=model_ctx,
         kv_bytes_per_token_f16=kv_per_tok,
         has_mtp=has_mtp,
+        sliding_window=sliding_window,
+        header_truncated=header_truncated,
+        header_warning=header_warning,
     )

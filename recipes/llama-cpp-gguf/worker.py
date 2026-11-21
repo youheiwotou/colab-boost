@@ -3,10 +3,12 @@
 
 Runs detached on the Colab runtime:
   1. Probes GPU & VRAM via nvidia-smi.
-  2. Downloads prebuilt CUDA 12.8 llama-server + cudart in parallel with GGUF weights.
+  2. Downloads prebuilt CUDA llama-server + cudart (with dynamic CUDA version fallback)
+     in parallel with GGUF weights, aborting early if the binary install fails.
   3. Parses GGUF metadata via HTTP Range header and selects the optimal quantization,
      KV cache precision, and context length for the assigned GPU VRAM.
-  4. Enforces LD_LIBRARY_PATH=<bindir>:/usr/lib64-nvidia and verifies CUDA0 + VRAM usage
+  4. Passes API keys via LLAMA_API_KEY env var (never --api-key on the command line),
+     enforces LD_LIBRARY_PATH=<bindir>:/usr/lib64-nvidia, and verifies CUDA0 + VRAM usage
      so silent CPU fallback can never happen.
   5. Warms up CUDA kernels and reports measured generation tok/s.
 """
@@ -37,6 +39,8 @@ MODELS_DIR = "/content/boost-models/gguf"
 LLAMA_BIN_ROOT = "/content/boost-bin/llama-cpp"
 NVIDIA_LIB_DIR = "/usr/lib64-nvidia"
 VERIFIED_FALLBACK_TAG = "b12528"
+FALLBACK_CUDA_VERSIONS = ("12.8", "12.4", "13.0", "12.6")
+FORBIDDEN_EXTRA_FLAGS = frozenset({"--host", "--port", "--api-key", "--api-key-file"})
 
 REPO = (ENV("BOOST_INPUT_REPO") or "").strip()
 QUANT = (ENV("BOOST_INPUT_QUANT") or "auto").strip()
@@ -55,13 +59,23 @@ SECRETS = [s for s in (API_KEY, HF_TOKEN) if s and len(s) >= 4]
 RESERVE_MIB = 1024.0
 COMPUTE_MIB = 512.0
 COMPUTE_FRAC = 0.05
+COMPUTE_CTX_MIB_PER_32K = 256.0
 BUDGET_FRAC = 0.97
 DEFAULT_KV_BPT = 128 * 1024
 DEFAULT_CTX = 32768
 MIN_CTX = 8192
+MIN_LOW_VRAM_CTX = 4096
+LOW_VRAM_THRESHOLD_MIB = 16384
+MAX_GGUF_STR_BYTES = 1024 * 1024
+MAX_NESTED_ARRAY_DEPTH = 16
 KV_FACTORS = {"f16": 1.0, "q8_0": 34.0 / 64.0, "q4_0": 18.0 / 64.0}
-FP_QUANTS = ("F16", "BF16", "F32")
+FP_QUANTS = frozenset({"F16", "BF16", "F32"})
 LOW_BIT = ("Q3", "Q2", "Q1", "IQ3", "IQ2", "IQ1", "TQ")
+SHARD_SUFFIX_RE = re.compile(r"[-_]\d{5}[-_]of[-_]\d{5}$", re.IGNORECASE | re.ASCII)
+QUANT_TOKEN_RE = re.compile(
+    r"(?:^|[-._])(?:(UD)[-_])?((?:BF16|F16|F32|MXFP4(?:_[A-Z0-9]+)*|(?:IQ|TQ|Q)\d+(?:_[A-Z0-9]+)*))(?=$|[-.])",
+    re.IGNORECASE | re.ASCII,
+)
 
 _stage = ["detect"]
 _server_proc: list[subprocess.Popen | None] = [None]
@@ -88,7 +102,9 @@ def write_status(state: str, stage: str | None = None, message: str = "",
     if outputs is not None:
         payload["outputs"] = outputs
     print(f"[{time.strftime('%H:%M:%S')}] [{state}:{_stage[0]}] {payload['message']}", flush=True)
-    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    parent = os.path.dirname(STATUS_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     tmp = STATUS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
@@ -154,7 +170,9 @@ def beat() -> None:
     if not HEARTBEAT_FILE:
         return
     try:
-        os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+        parent = os.path.dirname(HEARTBEAT_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(HEARTBEAT_FILE, "a", encoding="utf-8"):
             pass
         os.utime(HEARTBEAT_FILE, None)
@@ -162,26 +180,36 @@ def beat() -> None:
         pass
 
 
+def _is_quant_token(token: str) -> bool:
+    u = token.upper()
+    if not u or not all(c.isascii() and (c.isalnum() or c == "_") for c in u):
+        return False
+    if u in FP_QUANTS or u.startswith("MXFP4"):
+        return True
+    return any(u.startswith(p) and len(u) > len(p) and u[len(p)].isdigit() for p in ("IQ", "TQ", "Q"))
+
+
 def extract_quant(path: str) -> str | None:
     base = path.rsplit("/", 1)[-1]
     if not base.lower().endswith(".gguf"):
         return None
-    stem = base[:-5]
-    if len(stem) >= 15 and stem[-15] == "-" and stem[-14:-9].isdigit() and stem[-9:-5] == "-of-" and stem[-5:].isdigit():
-        stem = stem[:-15]
-    parts = re.split(r"[-.]", stem)
-    for i in range(len(parts) - 1, -1, -1):
-        u = parts[i].upper()
-        is_q = u in FP_QUANTS or u.startswith("MXFP4") or any(
-            u.startswith(p) and len(u) > len(p) and u[len(p)].isdigit() for p in ("IQ", "TQ", "Q")
-        )
-        if is_q:
-            return f"UD-{u}" if (i > 0 and parts[i - 1].lower() == "ud") else u
+    stem = SHARD_SUFFIX_RE.sub("", base[:-5])
+    matches = list(QUANT_TOKEN_RE.finditer(stem))
+    for match in reversed(matches):
+        ud = match.group(1)
+        u = match.group(2).upper()
+        if _is_quant_token(u):
+            return f"UD-{u}" if ud else u
     return None
 
 
+def _base_quant(quant: str) -> str:
+    return quant.rsplit("/", 1)[-1]
+
+
 def group_files(files: list[tuple[str, int]]) -> tuple[list[dict], list[tuple[str, int]]]:
-    by_q: dict[str, dict] = {}
+    by_dir_q: dict[tuple[str, str], dict] = {}
+    subdirs_for_q: dict[str, set[str]] = {}
     mm: list[tuple[str, int]] = []
     for path, sz in files:
         if not path.lower().endswith(".gguf"):
@@ -192,12 +220,16 @@ def group_files(files: list[tuple[str, int]]) -> tuple[list[dict], list[tuple[st
         q = extract_quant(path)
         if not q:
             continue
-        entry = by_q.setdefault(q, {"quant": q, "files": [], "size": 0})
+        subdir = path.rsplit("/", 1)[0] if "/" in path else ""
+        subdirs_for_q.setdefault(q, set()).add(subdir)
+        entry = by_dir_q.setdefault((subdir, q), {"quant": q, "files": [], "size": 0})
         entry["files"].append(path)
         entry["size"] += sz
-    for v in by_q.values():
+    for (subdir, q), v in by_dir_q.items():
+        if len(subdirs_for_q.get(q, ())) > 1 and subdir:
+            v["quant"] = f"{subdir}/{q}"
         v["files"].sort()
-    variants = sorted(by_q.values(), key=lambda x: (-x["size"], x["quant"]))
+    variants = sorted(by_dir_q.values(), key=lambda x: (-x["size"], x["quant"]))
     mm.sort(key=lambda item: (0 if re.search(r"[-_]f16", item[0].lower()) else 1 if "bf16" in item[0].lower() else 2, item[0]))
     return variants, mm
 
@@ -207,7 +239,7 @@ def parse_gguf_meta(buf: bytes) -> dict:
     pos = [0]
 
     def take(n: int) -> bytes:
-        if pos[0] + n > len(buf):
+        if n < 0 or pos[0] + n > len(buf):
             raise EOFError
         out = buf[pos[0] : pos[0] + n]
         pos[0] += n
@@ -217,23 +249,44 @@ def parse_gguf_meta(buf: bytes) -> dict:
         return struct.unpack(fmt, take(struct.calcsize(fmt)))[0]
 
     def rstr() -> str:
-        return take(up("<Q")).decode("utf-8", "replace")
+        length = up("<Q")
+        if length > MAX_GGUF_STR_BYTES:
+            raise EOFError
+        return take(length).decode("utf-8", "replace")
 
-    def rval(t: int):
+    def rval(t: int, depth: int = 0):
+        if depth > MAX_NESTED_ARRAY_DEPTH:
+            raise EOFError
         if t in scalars:
             return up(scalars[t])
         if t == 8:
             return rstr()
         if t == 9:
             et, cnt = up("<I"), up("<Q")
+            rem = len(buf) - pos[0]
             if et == 8:
+                if cnt > rem // 8:
+                    raise EOFError
                 for _ in range(cnt):
                     rstr()
                 return None
-            if et in scalars and cnt <= 4096:
-                return [rval(et) for _ in range(cnt)]
-            take(cnt * struct.calcsize(scalars.get(et, "<B")))
-            return None
+            if et == 9:
+                if cnt > rem // 12:
+                    raise EOFError
+                if cnt <= 4096:
+                    return [rval(9, depth + 1) for _ in range(cnt)]
+                for _ in range(cnt):
+                    rval(9, depth + 1)
+                return None
+            if et in scalars:
+                esz = struct.calcsize(scalars[et])
+                if cnt > rem // esz:
+                    raise EOFError
+                if cnt <= 4096:
+                    return [up(scalars[et]) for _ in range(cnt)]
+                take(cnt * esz)
+                return None
+            raise EOFError
         raise EOFError
 
     meta = {}
@@ -249,40 +302,69 @@ def parse_gguf_meta(buf: bytes) -> dict:
     return meta
 
 
+def _sliding_window(meta: dict) -> int | None:
+    arch = meta.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        return None
+    interval = meta.get(f"{arch}.full_attention_interval")
+    if isinstance(interval, int) and interval > 0:
+        return None
+    sw = meta.get(f"{arch}.attention.sliding_window")
+    return int(sw) if isinstance(sw, (int, float)) and sw > 0 else None
+
+
 def kv_info(meta: dict) -> tuple[int | None, int | None, bool]:
     arch = meta.get("general.architecture")
     mtp = any("nextn_predict_layers" in k or "mtp_num_hidden_layers" in k for k in meta)
-    if not isinstance(arch, str):
+    if not isinstance(arch, str) or not arch:
         return None, None, mtp
-    ctx = meta.get(f"{arch}.context_length")
+    raw_ctx = meta.get(f"{arch}.context_length")
+    ctx = int(raw_ctx) if isinstance(raw_ctx, (int, float)) and raw_ctx > 0 else None
     blocks = meta.get(f"{arch}.block_count")
     heads = meta.get(f"{arch}.attention.head_count")
     kv_heads = meta.get(f"{arch}.attention.head_count_kv")
     embd = meta.get(f"{arch}.embedding_length")
+    interval = meta.get(f"{arch}.full_attention_interval")
+
+    if not isinstance(blocks, (int, float)) or blocks <= 0:
+        return None, ctx, mtp
+
+    layers = max(1, int(blocks) // int(interval)) if isinstance(interval, int) and interval > 0 else int(blocks)
+
+    kv_lora_rank = meta.get(f"{arch}.attention.kv_lora_rank")
+    if isinstance(kv_lora_rank, (int, float)) and kv_lora_rank > 0:
+        rope_dim = meta.get(f"{arch}.rope.dimension_count")
+        rope_d = int(rope_dim) if isinstance(rope_dim, (int, float)) and rope_dim > 0 else 0
+        return int(layers * (int(kv_lora_rank) + rope_d) * 2), ctx, mtp
+
     if isinstance(heads, list):
-        heads = max(heads) if heads else None
+        valid_heads = [int(h) for h in heads if isinstance(h, (int, float)) and h > 0]
+        heads = max(valid_heads) if valid_heads else None
     klen = meta.get(f"{arch}.attention.key_length") or (embd // heads if embd and heads else None)
     vlen = meta.get(f"{arch}.attention.value_length") or klen
-    if not blocks or not klen:
+    if not klen or not vlen:
         return None, ctx, mtp
     if isinstance(kv_heads, list):
-        return sum(int(h) for h in kv_heads) * (klen + vlen) * 2, ctx, mtp
+        valid_kv = [int(h) for h in kv_heads if isinstance(h, (int, float)) and h > 0]
+        if not valid_kv:
+            return None, ctx, mtp
+        return sum(valid_kv) * int(klen + vlen) * 2, ctx, mtp
     eff_kv = kv_heads or heads
     if not eff_kv:
         return None, ctx, mtp
-    interval = meta.get(f"{arch}.full_attention_interval")
-    layers = blocks // interval if isinstance(interval, int) and interval > 0 else blocks
-    return int(layers * eff_kv * (klen + vlen) * 2), ctx, mtp
+    return int(layers * int(eff_kv) * int(klen + vlen) * 2), ctx, mtp
 
 
 def choose_fit(variants: list[dict], vram_mib: int, mm_bytes: int, meta: dict) -> dict:
     kvb, mctx, _ = kv_info(meta)
     kvb_eff = kvb or DEFAULT_KV_BPT
-    max_c = CTX if CTX > 0 else (int(mctx) if mctx else DEFAULT_CTX)
+    sw = _sliding_window(meta)
+    max_c = CTX if CTX > 0 else (int(mctx) if isinstance(mctx, (int, float)) and mctx > 0 else DEFAULT_CTX)
+    min_c = MIN_LOW_VRAM_CTX if 0 < vram_mib <= LOW_VRAM_THRESHOLD_MIB else MIN_CTX
     ladder = [max_c]
     if CTX == 0:
         c = max_c
-        while c // 2 >= MIN_CTX:
+        while c // 2 >= min_c:
             c //= 2
             ladder.append(c)
     budget = vram_mib * BUDGET_FRAC
@@ -291,8 +373,11 @@ def choose_fit(variants: list[dict], vram_mib: int, mm_bytes: int, meta: dict) -
     def attempt(v: dict, ctx_val: int) -> dict | None:
         mib = 1024.0 * 1024.0
         w = v["size"] / mib
+        eff_kv_ctx = min(ctx_val, sw) if (sw and sw > 0) else ctx_val
+        compute_ctx = COMPUTE_CTX_MIB_PER_32K * (max(0, ctx_val) / 32768.0)
         for kv in kv_list:
-            est = w + (mm_bytes / mib) + (kvb_eff * KV_FACTORS[kv] * ctx_val / mib) + RESERVE_MIB + COMPUTE_MIB + COMPUTE_FRAC * w
+            kv_factor = KV_FACTORS.get(kv, 1.0)
+            est = w + (mm_bytes / mib) + (kvb_eff * kv_factor * eff_kv_ctx / mib) + RESERVE_MIB + COMPUTE_MIB + COMPUTE_FRAC * w + compute_ctx
             if est <= budget:
                 return {
                     "quant": v["quant"],
@@ -305,8 +390,16 @@ def choose_fit(variants: list[dict], vram_mib: int, mm_bytes: int, meta: dict) -
         return None
 
     if QUANT.lower() == "auto":
-        non_fp = [v for v in variants if v["quant"] not in FP_QUANTS] or variants
-        normal = [v for v in non_fp if not (v["quant"][3:] if v["quant"].startswith("UD-") else v["quant"]).startswith(LOW_BIT)]
+        non_fp = [v for v in variants if _base_quant(v["quant"]) not in FP_QUANTS] or variants
+        normal = [
+            v
+            for v in non_fp
+            if not (
+                _base_quant(v["quant"])[3:]
+                if _base_quant(v["quant"]).startswith("UD-")
+                else _base_quant(v["quant"])
+            ).startswith(LOW_BIT)
+        ]
         for pool in (normal, non_fp):
             for c_val in ladder:
                 for v in pool:
@@ -317,6 +410,8 @@ def choose_fit(variants: list[dict], vram_mib: int, mm_bytes: int, meta: dict) -
     else:
         target = next((v for v in variants if v["quant"].lower() == QUANT.lower()), None)
         if not target:
+            target = next((v for v in variants if _base_quant(v["quant"]).lower() == QUANT.lower()), None)
+        if not target:
             abort(f"{REPO} has no {QUANT} files (found: {', '.join(v['quant'] for v in variants)})")
         for c_val in ladder:
             got = attempt(target, c_val)
@@ -324,6 +419,44 @@ def choose_fit(variants: list[dict], vram_mib: int, mm_bytes: int, meta: dict) -
                 return got
         abort(f"{QUANT} exceeds {vram_mib} MiB GPU memory")
     return {}
+
+
+def parse_extra_args(raw: str) -> list[str]:
+    if not raw or not raw.strip():
+        return []
+    flags = shlex.split(raw)
+    for tok in flags:
+        name = tok.split("=", 1)[0].lower()
+        if name in FORBIDDEN_EXTRA_FLAGS:
+            raise ValueError(f"extra_args cannot override reserved server option {name!r}")
+    return flags
+
+
+def build_server_cmd(
+    bindir: str,
+    model_path: str,
+    ctx: int,
+    alias: str,
+    kv_type: str,
+    port: int,
+    *,
+    mmproj_path: str | None = None,
+    use_mtp: bool = False,
+    extra_flags: list[str] | None = None,
+) -> list[str]:
+    cmd = [
+        f"{bindir}/llama-server", "-m", model_path, "-c", str(ctx),
+        "-np", "1", "-ngl", "999", "-fa", "on", "--jinja",
+        "--alias", alias, "--cache-type-k", kv_type, "--cache-type-v", kv_type,
+        "--host", "127.0.0.1", "--port", str(port),
+    ]
+    if mmproj_path:
+        cmd += ["--mmproj", mmproj_path]
+    if use_mtp:
+        cmd += ["--spec-type", "draft-mtp"]
+    if extra_flags:
+        cmd += list(extra_flags)
+    return cmd
 
 
 def probe_gpu() -> tuple[str | None, int]:
@@ -373,39 +506,110 @@ def discover_llama_tags() -> list[str]:
     return tags
 
 
+def _find_cached_llama_server_dir(target_dir: str) -> str | None:
+    if not os.path.isdir(target_dir):
+        return None
+    if os.path.isfile(os.path.join(target_dir, "llama-server")):
+        return target_dir
+    for root, _, files in os.walk(target_dir):
+        if "llama-server" in files and os.path.isfile(os.path.join(root, "llama-server")):
+            return root
+    return None
+
+
+def _select_release_archives(tag: str, asset_names: list[str] | None = None) -> list[list[str]]:
+    """Returns prioritized candidate archive sets (llama-server + optional cudart) for a release tag."""
+    if asset_names is not None:
+        asset_set = set(asset_names)
+        pat = re.compile(rf"^llama-{re.escape(tag)}-bin-ubuntu-cuda-(\d+\.\d+)-x64\.tar\.gz$")
+        found_versions: list[str] = []
+        for name in asset_names:
+            m = pat.match(name)
+            if m:
+                found_versions.append(m.group(1))
+        if found_versions:
+            pref_rank = {ver: i for i, ver in enumerate(FALLBACK_CUDA_VERSIONS)}
+
+            def _ver_key(ver: str) -> tuple[int, tuple[int, ...]]:
+                nums = tuple(-int(p) for p in ver.split("."))
+                return (pref_rank.get(ver, len(pref_rank)), nums)
+
+            candidates: list[list[str]] = []
+            for ver in sorted(set(found_versions), key=_ver_key):
+                main_arc = f"llama-{tag}-bin-ubuntu-cuda-{ver}-x64.tar.gz"
+                cudart_arc = f"cudart-llama-{tag}-bin-ubuntu-cuda-{ver}-x64.tar.gz"
+                if cudart_arc in asset_set:
+                    candidates.append([main_arc, cudart_arc])
+                else:
+                    candidates.append([main_arc])
+            return candidates
+
+    return [
+        [
+            f"llama-{tag}-bin-ubuntu-cuda-{ver}-x64.tar.gz",
+            f"cudart-llama-{tag}-bin-ubuntu-cuda-{ver}-x64.tar.gz",
+        ]
+        for ver in FALLBACK_CUDA_VERSIONS
+    ]
+
+
+def _fetch_release_asset_names(tag: str) -> list[str] | None:
+    try:
+        rel = http_get_json(
+            f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{tag}",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "colab-boost-worker"},
+            timeout=15,
+        )
+        assets = rel.get("assets") if isinstance(rel, dict) else None
+        if isinstance(assets, list):
+            return [str(a["name"]) for a in assets if isinstance(a, dict) and a.get("name")]
+    except Exception:
+        pass
+    return None
+
+
 def install_prebuilt_llama(holder: dict) -> None:
     try:
         os.makedirs(LLAMA_BIN_ROOT, exist_ok=True)
         chosen = None
         for tag in discover_llama_tags():
             target_dir = os.path.join(LLAMA_BIN_ROOT, tag)
-            if os.path.isfile(os.path.join(target_dir, "llama-server")):
-                chosen = (tag, target_dir)
+            cached_dir = _find_cached_llama_server_dir(target_dir)
+            if cached_dir is not None:
+                chosen = (tag, cached_dir)
                 break
             os.makedirs(target_dir, exist_ok=True)
             base = f"https://github.com/ggml-org/llama.cpp/releases/download/{tag}"
-            archives = [
-                f"llama-{tag}-bin-ubuntu-cuda-12.8-x64.tar.gz",
-                f"cudart-llama-{tag}-bin-ubuntu-cuda-12.8-x64.tar.gz",
-            ]
-            ok = True
-            for arc in archives:
-                dst = os.path.join(target_dir, arc)
-                rc = subprocess.run(["curl", "-fsSL", "--retry", "3", "-o", dst, f"{base}/{arc}"]).returncode
-                if rc != 0:
-                    ok = False
+            asset_names = _fetch_release_asset_names(tag)
+            candidate_sets = _select_release_archives(tag, asset_names)
+            downloaded_archives: list[str] | None = None
+            for archives in candidate_sets:
+                ok = True
+                fetched: list[str] = []
+                for arc in archives:
+                    dst = os.path.join(target_dir, arc)
+                    rc = subprocess.run(["curl", "-fsSL", "--retry", "3", "-o", dst, f"{base}/{arc}"]).returncode
+                    if rc != 0:
+                        ok = False
+                        break
+                    fetched.append(arc)
+                if ok:
+                    downloaded_archives = fetched
                     break
-            if not ok:
+                for arc in archives:
+                    dst = os.path.join(target_dir, arc)
+                    if os.path.exists(dst):
+                        try:
+                            os.remove(dst)
+                        except OSError:
+                            pass
+            if not downloaded_archives:
                 continue
-            for arc in archives:
+            for arc in downloaded_archives:
                 dst = os.path.join(target_dir, arc)
                 subprocess.run(["tar", "xzf", dst, "-C", target_dir], check=True)
                 os.remove(dst)
-            server_dir = None
-            for root, _, fs in os.walk(target_dir):
-                if "llama-server" in fs:
-                    server_dir = root
-                    break
+            server_dir = _find_cached_llama_server_dir(target_dir)
             if not server_dir:
                 continue
             for root, _, fs in os.walk(target_dir):
@@ -422,10 +626,13 @@ def install_prebuilt_llama(holder: dict) -> None:
         holder["error"] = str(exc)
 
 
-def runtime_env(bindir: str) -> dict[str, str]:
+def runtime_env(bindir: str, *, include_api_key: bool = False) -> dict[str, str]:
     clean = {k: v for k, v in os.environ.items() if not k.startswith("BOOST_")}
+    clean.pop("LLAMA_API_KEY", None)
     ld_parts = [bindir, NVIDIA_LIB_DIR, clean.get("LD_LIBRARY_PATH", "")]
     clean["LD_LIBRARY_PATH"] = ":".join(p for p in ld_parts if p)
+    if include_api_key and API_KEY:
+        clean["LLAMA_API_KEY"] = API_KEY
     return clean
 
 
@@ -450,6 +657,11 @@ def main() -> int:
         abort("Missing model repository")
     if PORT == 8080:
         abort("Port 8080 is reserved by Colab; pick another port (e.g. 8000)")
+
+    try:
+        extra_flags = parse_extra_args(EXTRA_ARGS)
+    except ValueError as exc:
+        abort(f"Invalid extra_args: {exc}")
 
     stop_hb = threading.Event()
 
@@ -506,12 +718,21 @@ def main() -> int:
 
     write_status("running", "plan", f"Selected {plan['quant']} | KV={plan['kv']} | ctx={plan['ctx']}")
 
+    if "error" in llama_box:
+        stop_hb.set()
+        abort(f"llama.cpp install error: {llama_box['error']}")
+
     target_files = list(plan["files"]) + ([mm_file] if mm_file else [])
     size_map = dict(raw_files)
     total_bytes = sum(size_map.get(f, 0) for f in target_files)
 
     write_status("running", "download", f"Downloading {total_bytes / 1e9:.2f} GB via hf_xet...", progress=0.02)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub[hf_xet]"], check=True)
+
+    if "error" in llama_box:
+        stop_hb.set()
+        abort(f"llama.cpp install error: {llama_box['error']}")
+
     os.makedirs(MODELS_DIR, exist_ok=True)
     dl_env = {k: v for k, v in os.environ.items() if not k.startswith("BOOST_")}
     if HF_TOKEN:
@@ -525,9 +746,20 @@ def main() -> int:
         "for fn in json.loads(os.environ['DL_FILES_JSON']):\n"
         "    hf_hub_download(repo_id=os.environ['DL_REPO'], filename=fn, local_dir=os.environ['DL_DIR'])\n"
     )
-    subprocess.run([sys.executable, "-c", dl_code], env=dl_env, check=True)
+    dl_proc = subprocess.Popen([sys.executable, "-c", dl_code], env=dl_env, start_new_session=True)
+    while dl_proc.poll() is None:
+        if "error" in llama_box:
+            _terminate_proc(dl_proc)
+            stop_hb.set()
+            abort(f"llama.cpp install error: {llama_box['error']}")
+        time.sleep(1.0)
+    if dl_proc.returncode != 0:
+        stop_hb.set()
+        abort(f"GGUF download failed (exit code {dl_proc.returncode})")
+
     dl_thread.join()
     if "error" in llama_box:
+        stop_hb.set()
         abort(f"llama.cpp install error: {llama_box['error']}")
 
     bindir = llama_box["bindir"]
@@ -538,6 +770,7 @@ def main() -> int:
 
     alias = ALIAS or re.sub(r"[-_]gguf$", "", REPO.rsplit("/", 1)[-1], flags=re.I).lower()
     model_path = os.path.join(MODELS_DIR, plan["files"][0])
+    mmproj_path = os.path.join(MODELS_DIR, mm_file) if mm_file else None
     want_mtp = MTP_PREF == "on" or (MTP_PREF == "auto" and kv_info(header_meta)[2])
 
     # Build startup fallback ladder (KV f16 -> q8_0, MTP on -> off) for OOM/flag resilience
@@ -554,29 +787,19 @@ def main() -> int:
     with open(log_path, "w", encoding="utf-8"):
         pass
 
-    extra_flags: list[str] = []
-    if EXTRA_ARGS.strip():
-        try:
-            extra_flags = shlex.split(EXTRA_ARGS)
-        except ValueError as exc:
-            abort(f"Invalid extra_args: {exc}")
-
     for idx, (kv_try, mtp_try) in enumerate(launch_attempts):
         plan["kv"] = kv_try
-        cmd = [
-            f"{bindir}/llama-server", "-m", model_path, "-c", str(plan["ctx"]),
-            "-np", "1", "-ngl", "999", "-fa", "on", "--jinja",
-            "--alias", alias, "--cache-type-k", kv_try, "--cache-type-v", kv_try,
-            "--host", "127.0.0.1", "--port", str(PORT),
-        ]
-        if mm_file:
-            cmd += ["--mmproj", os.path.join(MODELS_DIR, mm_file)]
-        if mtp_try:
-            cmd += ["--spec-type", "draft-mtp"]
-        if API_KEY:
-            cmd += ["--api-key", API_KEY]
-        if extra_flags:
-            cmd += extra_flags
+        cmd = build_server_cmd(
+            bindir,
+            model_path,
+            plan["ctx"],
+            alias,
+            kv_try,
+            PORT,
+            mmproj_path=mmproj_path,
+            use_mtp=mtp_try,
+            extra_flags=extra_flags,
+        )
 
         suffix = f" (fallback #{idx}: KV={kv_try}, MTP={'on' if mtp_try else 'off'})" if idx > 0 else ""
         write_status("running", "server", f"Starting llama-server on 127.0.0.1:{PORT}{suffix}...")
@@ -585,7 +808,7 @@ def main() -> int:
             srv_log.flush()
             proc = subprocess.Popen(
                 cmd,
-                env=runtime_env(bindir),
+                env=runtime_env(bindir, include_api_key=True),
                 stdout=srv_log,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
