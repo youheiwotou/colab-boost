@@ -19,7 +19,7 @@
       </div>
       <span class="crumb-sep">/</span>
       <span class="crumb-current" id="crumb-current">总览看板</span>
-      <button class="mode-badge mock" id="btn-toggle-mode" title="点击切换演示沙盒与真实 Colab 模式">
+      <button class="mode-badge mock" id="btn-toggle-mode" type="button" title="点击切换演示沙盒与真实 Colab 模式">
         演示沙盒模式 · 0 计费
       </button>
     </div>
@@ -39,13 +39,21 @@
         <div class="hud-pill" id="hud-burn">消耗 <strong>--</strong></div>
       </div>
 
-      <button class="btn btn-danger btn-sm" id="btn-stop-all" style="display:none;">
-        停止全部
-      </button>
-      <button class="btn btn-icon-text btn-sm" id="btn-lang" type="button">EN</button>
-      <button class="btn btn-icon btn-sm" id="btn-theme" type="button" title="Toggle Theme">L</button>
+      <div class="topbar-danger-zone" id="stop-all-group" style="display:none;">
+        <button class="btn btn-danger btn-sm" id="btn-stop-all" type="button" style="display:none;">
+          停止全部
+        </button>
+        <span class="topbar-sep" aria-hidden="true"></span>
+      </div>
+      <div class="topbar-util-group">
+        <button class="btn btn-icon-text btn-sm" id="btn-lang" type="button" aria-label="Switch Language">EN</button>
+        <button class="btn btn-icon btn-sm" id="btn-theme" type="button" title="Toggle Theme" aria-label="Toggle Theme">L</button>
+      </div>
     </div>
   </header>
+
+  <!-- Persistent High-Priority Zero-Burn / Unassign Verification Alert Banner -->
+  <div class="global-alert-host hidden" id="global-alert-banner" role="alert" aria-live="assertive"></div>
 
   <div class="workspace">
     <!-- Left Navigation Rail -->
@@ -97,9 +105,9 @@
       </nav>
 
       <div class="sidebar-footer">
-        <div class="ws-status-row">
-          <span class="dot dot-emerald" id="ws-dot"></span>
-          <span id="ws-indicator">实时状态流已连接</span>
+        <div class="ws-status-row" role="status">
+          <span class="dot dot-amber" id="ws-dot"></span>
+          <span id="ws-indicator">正在连接状态流...</span>
         </div>
         <div class="footer-sub" data-i18n="footer_native">Windows 原生免 WSL 直连引擎</div>
         <div class="footer-sub" data-i18n="footer_receipts">自动保存 Unassign 关闭回执</div>
@@ -114,11 +122,11 @@
 
   <!-- Reusable Modal -->
   <div class="modal-backdrop hidden" id="modal-backdrop">
-    <div class="modal" id="modal-body"></div>
+    <div class="modal" id="modal-body" role="dialog" aria-modal="true"></div>
   </div>
 
   <!-- Toast Notifications -->
-  <div class="toast-stack" id="toast-stack"></div>
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 
   <script src="/static/app.js"></script>
 </body>

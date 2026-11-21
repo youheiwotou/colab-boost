@@ -41,6 +41,10 @@
   --danger-soft: rgba(239, 68, 68, 0.1);
   --danger-border: rgba(239, 68, 68, 0.28);
 
+  --sandbox: #38bdf8;
+  --sandbox-soft: rgba(56, 189, 248, 0.1);
+  --sandbox-border: rgba(56, 189, 248, 0.28);
+
   --shadow-card: none;
   --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.65);
   --radius-sm: 6px;
@@ -87,6 +91,10 @@
   --danger: #dc2626;
   --danger-soft: #fef2f2;
   --danger-border: rgba(220, 38, 38, 0.25);
+
+  --sandbox: #0369a1;
+  --sandbox-soft: #f0f9ff;
+  --sandbox-border: rgba(2, 132, 199, 0.28);
 
   --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.035);
   --shadow-modal: 0 20px 56px rgba(15, 23, 42, 0.18);
@@ -238,6 +246,27 @@ code {
   flex-wrap: nowrap;
 }
 
+.topbar-danger-zone {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: 8px;
+}
+
+.topbar-sep {
+  width: 1px;
+  height: 20px;
+  background: var(--border-strong);
+  flex-shrink: 0;
+}
+
+.topbar-util-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+}
+
 .mode-badge {
   display: inline-flex;
   align-items: center;
@@ -264,15 +293,16 @@ code {
 }
 
 .mode-badge.mock {
-  border-color: var(--warning-border);
-  background: var(--warning-soft);
-  color: var(--warning);
+  border-color: var(--sandbox-border);
+  background: var(--sandbox-soft);
+  color: var(--sandbox);
 }
 
 .mode-badge.real {
-  border-color: var(--success-border);
-  background: var(--success-soft);
-  color: var(--success);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .cmd-trigger {
@@ -860,6 +890,76 @@ code {
   background: var(--warning-soft);
   border: 1px solid var(--warning-border);
   color: var(--text-primary);
+}
+
+.banner.danger {
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-border);
+  color: var(--text-primary);
+}
+
+.global-alert-host {
+  background: var(--danger-soft);
+  border-bottom: 1px solid var(--danger-border);
+  padding: 10px 18px;
+  flex-shrink: 0;
+}
+
+.global-alert-host.hidden {
+  display: none;
+}
+
+.global-alert-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.global-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.global-alert-details {
+  font-size: 12px;
+  color: var(--text-primary);
+  margin-top: 3px;
+}
+
+.confirm-body {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.confirm-cost-box {
+  background: var(--bg-input);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.confirm-cost-box.danger {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+}
+
+.btn.is-busy {
+  opacity: 0.6;
+  cursor: progress;
 }
 
 .banner.info {

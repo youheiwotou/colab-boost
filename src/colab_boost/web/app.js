@@ -24,6 +24,7 @@
     L4: 2.82,
     T4: 1.17,
     V5E1: 2.11,
+    V6E1: 3.55,
     NONE: 0.07,
   };
 
@@ -53,6 +54,9 @@
     chatApiKey: "",
     selectedChatTunnelId: "",
     activeModal: null,
+    pendingConfirm: null,
+    zeroBurnAlert: null,
+    busy: {},
     cmdQuery: "",
   };
 
@@ -117,7 +121,83 @@
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function safeHttpUrl(url) {
+    const raw = String(url ?? "").trim();
+    if (!raw) return "#";
+    if (typeof URL === "function") {
+      try {
+        const parsed = new URL(raw);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          return parsed.href;
+        }
+        return "#";
+      } catch (_) {
+        return "#";
+      }
+    }
+    return /^https?:\/\/[^\s"'<>]+$/i.test(raw) ? raw : "#";
+  }
+
+  function formatApiDetail(detail, status) {
+    if (detail === null || detail === undefined) {
+      return `HTTP ${status}`;
+    }
+    if (typeof detail === "string") {
+      return detail.trim() || `HTTP ${status}`;
+    }
+    if (Array.isArray(detail)) {
+      const parts = detail
+        .map((item) => {
+          if (typeof item === "string") return item;
+          if (!item || typeof item !== "object") return "";
+          const loc = Array.isArray(item.loc)
+            ? item.loc.filter((seg) => seg !== "body" && seg !== "query").join(".")
+            : "";
+          const msg = item.msg || item.message || "";
+          if (loc && msg) return `${loc}: ${msg}`;
+          return msg || loc || "";
+        })
+        .filter(Boolean);
+      return parts.length > 0 ? parts.join("; ") : `HTTP ${status}`;
+    }
+    if (typeof detail === "object") {
+      return detail.message || detail.msg || detail.error || JSON.stringify(detail) || `HTTP ${status}`;
+    }
+    return String(detail) || `HTTP ${status}`;
+  }
+
+  function isBusy(key) {
+    return !!state.busy[key];
+  }
+
+  async function runLocked(key, triggerEl, fn, rerenderChrome = false) {
+    if (state.busy[key]) return;
+    state.busy[key] = true;
+    if (triggerEl) {
+      triggerEl.disabled = true;
+      if (triggerEl.classList && typeof triggerEl.classList.add === "function") {
+        triggerEl.classList.add("is-busy");
+      }
+    }
+    if (rerenderChrome) renderChrome();
+    else renderMain();
+    try {
+      return await fn();
+    } finally {
+      delete state.busy[key];
+      if (triggerEl) {
+        triggerEl.disabled = false;
+        if (triggerEl.classList && typeof triggerEl.classList.remove === "function") {
+          triggerEl.classList.remove("is-busy");
+        }
+      }
+      if (rerenderChrome) renderChrome();
+      else renderMain();
+    }
   }
 
   function toast(msg, kind = "info") {
@@ -136,9 +216,7 @@
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      const detail = data?.detail;
-      const errMsg = typeof detail === "object" ? detail.message : (detail || `HTTP ${resp.status}`);
-      throw new Error(errMsg);
+      throw new Error(formatApiDetail(data?.detail, resp.status));
     }
     return data;
   }
@@ -153,7 +231,106 @@
 
   function closeModal() {
     state.activeModal = null;
-    document.getElementById("modal-backdrop").classList.add("hidden");
+    state.pendingConfirm = null;
+    const bd = document.getElementById("modal-backdrop");
+    const body = document.getElementById("modal-body");
+    if (bd) bd.classList.add("hidden");
+    if (body) body.innerHTML = "";
+  }
+
+  function openConfirmModal(meta, onConfirm) {
+    state.pendingConfirm = onConfirm;
+    const isDanger = meta.tone !== "primary";
+    const title = typeof meta.title === "function" ? meta.title() : meta.title;
+    const bodyHtml = typeof meta.bodyHtml === "function" ? meta.bodyHtml() : meta.bodyHtml;
+    const confirmLabel = typeof meta.confirmLabel === "function" ? meta.confirmLabel() : meta.confirmLabel;
+    openModal(`
+      <h3 style="font-size:15px;font-weight:600;margin-bottom:10px;">${esc(title)}</h3>
+      <div class="confirm-body">${bodyHtml}</div>
+      <div class="row-actions" style="justify-content:flex-end;margin-top:16px;">
+        <button class="btn" type="button" data-action="close-modal">${tr("取消", "Cancel")}</button>
+        <button class="btn ${isDanger ? "btn-danger" : "btn-primary"}" type="button" data-action="confirm-ok">${esc(confirmLabel)}</button>
+      </div>
+    `, { type: "confirm", meta });
+  }
+
+  function renderGlobalAlert() {
+    const host = document.getElementById("global-alert-banner");
+    if (!host) return;
+    const alert = state.zeroBurnAlert;
+    if (!alert) {
+      host.innerHTML = "";
+      host.classList.add("hidden");
+      return;
+    }
+
+    let title = "";
+    let detailHtml = "";
+    if (alert.kind === "stop_all_unverified") {
+      title = tr(
+        "零燃费核验未通过：仍有实例或账号未确认停止计费！",
+        "Zero-Burn Verification Failed: Active or Unverified Billing Detected!"
+      );
+      const parts = [];
+      parts.push(
+        tr(
+          `已发送释放 ${alert.stoppedCount} 个实例，但残留活跃会话: ${alert.remaining}`,
+          `Stopped ${alert.stoppedCount} session(s), but remaining active sessions: ${alert.remaining}`
+        )
+      );
+      if (alert.failedAccounts.length > 0) {
+        const accList = alert.failedAccounts
+          .map((item) => (typeof item === "string" ? item : (item?.email || item?.account_id || JSON.stringify(item))))
+          .join(", ");
+        parts.push(tr(`查询失败账号 (${alert.failedAccounts.length}): ${accList}`, `Failed account checks (${alert.failedAccounts.length}): ${accList}`));
+      }
+      if (alert.stopErrors.length > 0) {
+        const errList = alert.stopErrors
+          .map((item) => (typeof item === "string" ? item : (item?.error || item?.message || JSON.stringify(item))))
+          .join("; ");
+        parts.push(tr(`停机异常 (${alert.stopErrors.length}): ${errList}`, `Stop errors (${alert.stopErrors.length}): ${errList}`));
+      }
+      detailHtml = parts.map((p) => `<div>${esc(p)}</div>`).join("");
+    } else if (alert.kind === "session_unverified") {
+      title = tr(
+        `单实例释放未通过核验：${alert.sessionName} 可能仍在云端计费！`,
+        `Unassign Not Verified: ${alert.sessionName} May Still Be Billing!`
+      );
+      detailHtml = `<div>${esc(
+        tr(
+          `Endpoint: ${alert.endpoint}${alert.receiptId ? ` · 回执 #${alert.receiptId}` : ""}。请立即重试停止或在 Google Colab 页面人工核验。`,
+          `Endpoint: ${alert.endpoint}${alert.receiptId ? ` · Receipt #${alert.receiptId}` : ""}. Retry stopping immediately or verify in Google Colab.`
+        )
+      )}</div>`;
+    } else {
+      title = tr(
+        "紧急停止全部实例请求失败：云端实例可能仍在计费！",
+        "Emergency Stop-All Request Failed: Cloud Runtimes May Still Be Billing!"
+      );
+      detailHtml = `<div>${esc(alert.message || tr("未知错误", "Unknown error"))}</div>`;
+    }
+
+    const busyStopAll = isBusy("sessions:stop-all");
+    host.innerHTML = `
+      <div class="global-alert-inner">
+        <div>
+          <div class="global-alert-title">
+            <span class="dot dot-danger"></span>
+            <span>${esc(title)}</span>
+          </div>
+          <div class="global-alert-details">${detailHtml}</div>
+        </div>
+        <div class="row-actions">
+          <button class="btn btn-danger btn-sm${busyStopAll ? " is-busy" : ""}" type="button" data-action="retry-stop-all" ${busyStopAll ? "disabled" : ""}>
+            ${IC.stop} <span>${busyStopAll ? tr("正在重试停止...", "Retrying Stop All...") : tr("一键重试停止全部", "Retry Stop All")}</span>
+          </button>
+          <button class="btn btn-sm" type="button" data-action="dismiss-alert">
+            ${tr("关闭提示", "Dismiss")}
+          </button>
+        </div>
+      </div>
+    `;
+    host.classList.remove("hidden");
   }
 
   function renderActiveModal() {
@@ -170,6 +347,7 @@
     else if (active.type === "login" && active.flow) window._app.renderLoginModalWithFlow(active.flow);
     else if (active.type === "toggle_mode") openToggleModeModal(active.nextMode);
     else if (active.type === "cmd_palette") openCommandPalette();
+    else if (active.type === "confirm" && active.meta && state.pendingConfirm) openConfirmModal(active.meta, state.pendingConfirm);
     for (const [fid, val] of Object.entries(saved)) {
       const restored = document.getElementById(fid);
       if (restored) restored.value = val;
@@ -273,11 +451,19 @@
     }
 
     const stopAllBtn = document.getElementById("btn-stop-all");
+    const stopAllGroup = document.getElementById("stop-all-group");
+    const stopAllBusy = isBusy("sessions:stop-all");
     if (state.sessions.length > 0) {
+      if (stopAllGroup) stopAllGroup.style.display = "inline-flex";
       stopAllBtn.style.display = "inline-flex";
-      stopAllBtn.textContent = tr(`停止全部 (${state.sessions.length})`, `Stop All (${state.sessions.length})`);
+      stopAllBtn.disabled = stopAllBusy;
+      stopAllBtn.textContent = stopAllBusy
+        ? tr("正在停止全部...", "Stopping All...")
+        : tr(`停止全部 (${state.sessions.length})`, `Stop All (${state.sessions.length})`);
     } else {
+      if (stopAllGroup) stopAllGroup.style.display = "none";
       stopAllBtn.style.display = "none";
+      stopAllBtn.disabled = false;
     }
 
     document.getElementById("btn-lang").textContent = state.settings.language === "en" ? "中文" : "EN";
@@ -300,6 +486,7 @@
     document.getElementById("badge-tunnels").textContent = state.tunnels.length;
     document.getElementById("badge-receipts").textContent = state.receipts.length;
     renderWsIndicator();
+    renderGlobalAlert();
   }
 
   /* ========================== Views ========================== */
@@ -321,8 +508,8 @@
           <p class="page-subtitle">${tr("实时掌握多账号 CCU 消耗、未受管实例预警、声明式模型部署与即用即关回执。", "Live CCU telemetry, untracked runtime guardrails, declarative model deployment, and verified unassign receipts.")}</p>
         </div>
         <div class="row-actions">
-          <button class="btn" type="button" onclick="window._app.refreshUsage()">${IC.refresh} <span>${tr("刷新余额", "Refresh CCU")}</span></button>
-          <button class="btn btn-primary" type="button" onclick="window._app.go('deploy')"><span>${tr("部署新模型", "Deploy Model")}</span> ${IC.arrowRight}</button>
+          <button class="btn" type="button" data-action="refresh-usage">${IC.refresh} <span>${tr("刷新余额", "Refresh CCU")}</span></button>
+          <button class="btn btn-primary" type="button" data-action="go" data-route="deploy"><span>${tr("部署新模型", "Deploy Model")}</span> ${IC.arrowRight}</button>
         </div>
       </div>
     `;
@@ -340,7 +527,10 @@
             </div>
           </div>
           <div class="row-actions">
-            ${orphans.map((o) => `<button class="btn btn-danger btn-sm" type="button" onclick="window._app.stopSession('${esc(o.endpoint)}', '${esc(o.account_id)}')">${tr("释放", "Release")} ${esc(o.accelerator)} (${esc(o.name)})</button>`).join("")}
+            ${orphans.map((o) => {
+              const busy = isBusy(`session:stop:${o.endpoint}`);
+              return `<button class="btn btn-danger btn-sm${busy ? " is-busy" : ""}" type="button" data-action="stop-session" data-endpoint="${esc(o.endpoint)}" data-account-id="${esc(o.account_id)}" data-session-name="${esc(o.name)}" data-accelerator="${esc(o.gpu_name || o.accelerator)}" ${busy ? "disabled" : ""}>${tr("释放", "Release")} ${esc(o.accelerator)} (${esc(o.name)})</button>`;
+            }).join("")}
           </div>
         </div>
       `;
@@ -389,7 +579,7 @@
               </div>
             </div>
             <div class="row-actions" style="justify-content:flex-end;">
-              <button class="btn btn-sm" type="button" onclick="window._app.pickRecipe('${esc(r.id)}')">
+              <button class="btn btn-sm" type="button" data-action="pick-recipe" data-recipe-id="${esc(r.id)}">
                 <span>${tr("配置并部署", "Configure & Deploy")}</span> ${IC.arrowRight}
               </button>
             </div>
@@ -419,7 +609,7 @@
                   <td>${esc(locObj(r.recipe_name))}</td>
                   <td class="mono">${esc(r.session_name)}</td>
                   <td><span class="tag ${r.state === "ready" ? "ok" : r.state === "failed" ? "err" : "accent"}">${esc(r.state)}</span></td>
-                  <td>${esc(r.message)} ${r.endpoints?.[0] ? `— <a href="${esc(r.endpoints[0].local_url)}" target="_blank" style="color:var(--text-primary);text-decoration:underline;"><code>${esc(r.endpoints[0].local_url)}</code></a>` : ""}</td>
+                  <td>${esc(r.message)} ${r.endpoints?.[0] ? `— <a href="${esc(safeHttpUrl(r.endpoints[0].local_url))}" target="_blank" rel="noopener noreferrer" style="color:var(--text-primary);text-decoration:underline;"><code>${esc(r.endpoints[0].local_url)}</code></a>` : ""}</td>
                 </tr>
               `).join("")}
             </tbody>
@@ -466,7 +656,7 @@
           <div class="metric-big">
             <div class="kpi-label">${tr("预计可用续航", "Estimated Runway")}</div>
             <div class="metric-val mono">${esc(estHours)} <small>hours</small></div>
-            <div class="kpi-foot">${tr(`按当前余额与 ${accel} 约 ${estBurn.toFixed(2)} CCU/h 估算`, `Based on balance & ${accel} (~${estBurn.toFixed(2)} CCU/h)`)}</div>
+            <div class="kpi-foot">${tr(`按当前余额与 ${esc(accel)} 约 ${estBurn.toFixed(2)} CCU/h 估算`, `Based on balance & ${esc(accel)} (~${estBurn.toFixed(2)} CCU/h)`)}</div>
           </div>
           <div class="kv-list">
             <div class="kv-row">
@@ -521,16 +711,19 @@
               </div>
             `;
           }).join("")}
-          ${orphans.slice(0, 2).map((o) => `
+          ${orphans.slice(0, 2).map((o) => {
+            const busy = isBusy(`session:stop:${o.endpoint}`);
+            return `
             <div class="orphan-box">
               <div class="orphan-head">
                 <span class="dot dot-amber"></span>
                 <span>${tr("发现未受管浏览器实例", "Untracked Browser Runtime")}</span>
               </div>
               <div class="mono" style="font-size:11px;color:var(--text-secondary);">${esc(o.name)} · ${esc(o.gpu_name || o.accelerator)}</div>
-              <button class="btn btn-sm" type="button" style="align-self:flex-start;" onclick="window._app.stopSession('${esc(o.endpoint)}', '${esc(o.account_id)}')">${tr("立即释放并生成回执", "Release & Archive Receipt")}</button>
+              <button class="btn btn-sm${busy ? " is-busy" : ""}" type="button" style="align-self:flex-start;" data-action="stop-session" data-endpoint="${esc(o.endpoint)}" data-account-id="${esc(o.account_id)}" data-session-name="${esc(o.name)}" data-accelerator="${esc(o.gpu_name || o.accelerator)}" ${busy ? "disabled" : ""}>${tr("立即释放并生成回执", "Release & Archive Receipt")}</button>
             </div>
-          `).join("")}
+          `;
+          }).join("")}
         </div>
 
         ${(recipe.keep || []).length > 0 ? `
@@ -574,7 +767,7 @@
     let leftHtml = `
       <div class="recipe-strip">
         ${state.recipes.map((r) => `
-          <button type="button" class="recipe-pill ${r.id === recipe.id ? "active" : ""}" onclick="window._app.pickRecipe('${esc(r.id)}')">
+          <button type="button" class="recipe-pill ${r.id === recipe.id ? "active" : ""}" data-action="pick-recipe" data-recipe-id="${esc(r.id)}">
             <span class="rp-title">${esc(locObj(r.name))}</span>
             <span class="rp-meta mono">${esc(r.provision.accelerator)} · ${esc((r.tags || [])[0] || r.category)}</span>
           </button>
@@ -589,7 +782,7 @@
           </div>
         </div>
 
-        <form id="deploy-form" onsubmit="window._app.submitDeploy(event)">
+        <form id="deploy-form" data-submit="deploy">
           <div class="card-head" style="margin-top:6px;margin-bottom:8px;">
             <span class="card-title">${tr("目标算力规格", "Target Compute Tier")}</span>
             <span class="mono card-hint">${tr("自动显存校验 · 不达标秒级退回", "Auto VRAM check · Instant release if unmet")}</span>
@@ -599,7 +792,7 @@
             ${gpuTiers.map((g) => {
               const isSel = draft._sessionMode === "new" && draft._accelerator === g.id;
               return `
-                <button type="button" class="gpu-card ${isSel ? "selected" : ""}" onclick="window._app.pickGpuTier('${esc(recipe.id)}', '${g.id}', ${g.minVram}, ${g.highMem})">
+                <button type="button" class="gpu-card ${isSel ? "selected" : ""}" data-action="pick-gpu-tier" data-recipe-id="${esc(recipe.id)}" data-accel="${esc(g.id)}" data-min-vram="${g.minVram}" data-high-mem="${g.highMem ? "1" : "0"}">
                   <div class="gpu-top">
                     <span class="gpu-name">${esc(g.name)}</span>
                     ${g.tag ? `<span class="tag">${esc(g.tag)}</span>` : ""}
@@ -613,7 +806,7 @@
               `;
             }).join("")}
             ${firstWarm ? `
-              <button type="button" class="gpu-card ${draft._sessionMode !== "new" ? "selected" : ""}" onclick="window._app.updateDraft('${esc(recipe.id)}', '_sessionMode', '${esc(firstWarm.name)}', true)">
+              <button type="button" class="gpu-card ${draft._sessionMode !== "new" ? "selected" : ""}" data-action="update-draft-click" data-recipe-id="${esc(recipe.id)}" data-key="_sessionMode" data-val="${esc(firstWarm.name)}" data-rerender="1">
                 <div class="gpu-top">
                   <span class="gpu-name">${tr("复用热实例", "Reuse Warm VM")}</span>
                   <span class="dot dot-emerald"></span>
@@ -636,7 +829,7 @@
           ${recipe.id === "llama-cpp-gguf" ? renderGgufPlannerBox(draft) : ""}
 
           ${advancedInputs.length > 0 || true ? `
-            <button type="button" class="disclosure-btn" onclick="window._app.toggleAdvanced('${esc(recipe.id)}')">
+            <button type="button" class="disclosure-btn" data-action="toggle-advanced" data-recipe-id="${esc(recipe.id)}">
               <span>${tr("高级参数与精细显存保底设置", "Advanced Recipe Inputs & Hardware Fine-Tuning")}</span>
               <span class="mono row-actions" style="gap:5px;">
                 <span>${advOpen ? tr("收起", "Hide") : tr(`展开 ${advancedInputs.length + 3} 项`, `Show ${advancedInputs.length + 3}`)}</span>
@@ -651,7 +844,7 @@
                 ${advancedInputs.map((inp) => renderRecipeInputField(recipe.id, inp, draft[inp.id])).join("")}
                 <div class="field">
                   <label>${tr("运行位置", "Target Session")}</label>
-                  <select name="_sessionMode" onchange="window._app.updateDraft('${esc(recipe.id)}', '_sessionMode', this.value, true)">
+                  <select name="_sessionMode" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_sessionMode" data-rerender="1">
                     <option value="new" ${draft._sessionMode === "new" ? "selected" : ""}>${tr("新建专属 GPU 实例（失败自动释放）", "Create Fresh GPU Session")}</option>
                     ${state.sessions.map((s) => `
                       <option value="${esc(s.name)}" ${draft._sessionMode === s.name ? "selected" : ""}>
@@ -663,7 +856,7 @@
                 ${draft._sessionMode === "new" ? `
                   <div class="field">
                     <label>${tr("加速器型号", "Accelerator")}</label>
-                    <select name="_accelerator" onchange="window._app.updateDraft('${esc(recipe.id)}', '_accelerator', this.value, true)">
+                    <select name="_accelerator" data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_accelerator" data-rerender="1">
                       ${["G4", "A100", "H100", "L4", "T4", "NONE"].map((acc) => `
                         <option value="${acc}" ${draft._accelerator === acc ? "selected" : ""}>${acc === "NONE" ? "CPU (NONE)" : acc}</option>
                       `).join("")}
@@ -672,11 +865,11 @@
                   <div class="field">
                     <label>${tr("最低显存保底 (MiB，不达标自动重抽)", "Min VRAM MiB (Auto-Retry)")}</label>
                     <input type="number" min="0" max="163840" step="1024" value="${esc(draft._minVram)}"
-                      onchange="window._app.updateDraft('${esc(recipe.id)}', '_minVram', Number(this.value))" />
+                      data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_minVram" data-val-type="number" />
                   </div>
                   <div class="field">
                     <label>${tr("高内存机型 (High-RAM)", "High-RAM Shape")}</label>
-                    <select onchange="window._app.updateDraft('${esc(recipe.id)}', '_highMem', this.value === '1')">
+                    <select data-change="draft" data-recipe-id="${esc(recipe.id)}" data-key="_highMem" data-val-type="bool">
                       <option value="0" ${!draft._highMem ? "selected" : ""}>Standard RAM</option>
                       <option value="1" ${draft._highMem ? "selected" : ""}>High-RAM</option>
                     </select>
@@ -687,8 +880,8 @@
           ` : ""}
 
           <div class="row-actions" style="justify-content:flex-end;margin-top:16px;">
-            <button type="submit" class="btn btn-primary">
-              <span>${tr("一键启动部署并自动映射", "Launch Deployment & Auto-Forward")}</span>
+            <button type="submit" class="btn btn-primary${isBusy("deploy:submit") ? " is-busy" : ""}" ${isBusy("deploy:submit") ? "disabled" : ""}>
+              <span>${isBusy("deploy:submit") ? tr("正在启动部署...", "Launching...") : tr("一键启动部署并自动映射", "Launch Deployment & Auto-Forward")}</span>
               ${IC.arrowRight}
             </button>
           </div>
@@ -703,6 +896,8 @@
         const stages = rManifest?.stages || [];
         const curIdx = stages.findIndex((s) => s.id === r.stage);
         const pct = r.progress !== null && r.progress !== undefined ? Math.round(r.progress * 100) : (r.state === "ready" ? 100 : 15);
+        const cancelBusy = isBusy(`run:cancel:${r.run_id}`);
+        const syncBusy = isBusy(`run:sync:${r.run_id}`);
         leftHtml += `
           <div class="card">
             <div class="card-head">
@@ -715,10 +910,10 @@
               </div>
               <div class="row-actions">
                 ${["provisioning", "starting", "running"].includes(r.state) ? `
-                  <button class="btn btn-danger btn-sm" type="button" onclick="window._app.cancelRun('${esc(r.run_id)}')">${tr("取消并回收", "Cancel & Release")}</button>
+                  <button class="btn btn-danger btn-sm${cancelBusy ? " is-busy" : ""}" type="button" data-action="cancel-run" data-run-id="${esc(r.run_id)}" data-session-name="${esc(r.session_name)}" ${cancelBusy ? "disabled" : ""}>${tr("取消并回收", "Cancel & Release")}</button>
                 ` : ""}
                 ${r.state === "ready" && r.endpoints?.length ? `
-                  <button class="btn btn-primary btn-sm" type="button" onclick="window._app.go('tunnels')">${tr("前往对话测试", "Open Playground")}</button>
+                  <button class="btn btn-primary btn-sm" type="button" data-action="go" data-route="tunnels">${tr("前往对话测试", "Open Playground")}</button>
                 ` : ""}
               </div>
             </div>
@@ -751,7 +946,7 @@
                   <strong>${esc(tunLabel(ep))}</strong>
                   <code>${esc(ep.local_url)}</code>
                 </div>
-                <button class="btn btn-sm" type="button" onclick="window._app.copyText('${esc(ep.local_url)}')">${IC.copy} <span>${tr("复制 URL", "Copy URL")}</span></button>
+                <button class="btn btn-sm" type="button" data-action="copy-text" data-text="${esc(ep.local_url)}">${IC.copy} <span>${tr("复制 URL", "Copy URL")}</span></button>
               </div>
             `).join("")}
 
@@ -767,7 +962,7 @@
                   `).join("")}
                 </div>
                 <div class="row-actions">
-                  <button class="btn btn-sm" type="button" onclick="window._app.syncKeep('${esc(r.run_id)}')">${IC.refresh} <span>${tr("同步到本地", "Sync Locally")}</span></button>
+                  <button class="btn btn-sm${syncBusy ? " is-busy" : ""}" type="button" data-action="sync-keep" data-run-id="${esc(r.run_id)}" ${syncBusy ? "disabled" : ""}>${IC.refresh} <span>${tr("同步到本地", "Sync Locally")}</span></button>
                   ${r.keep_paths.map((kp, idx) => kp.local_archive ? `<a class="btn btn-primary btn-sm" href="/api/deployments/${encodeURIComponent(r.run_id)}/keep/download?index=${idx}">${IC.download} <span>${tr("下载归档", "Download Archive")}</span></a>` : "").join("")}
                 </div>
               </div>
@@ -800,40 +995,37 @@
     let control = "";
     if (inp.type === "select") {
       control = `
-        <select data-field-key="${esc(fkey)}" onchange="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)">
+        <select data-field-key="${esc(fkey)}" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}">
           ${(inp.options || []).map((opt) => `<option value="${esc(opt)}" ${String(val) === String(opt) ? "selected" : ""}>${esc(opt)}</option>`).join("")}
         </select>
       `;
     } else if (inp.type === "bool") {
       const checked = val === true || val === "1" || val === "true";
       control = `
-        <select data-field-key="${esc(fkey)}" onchange="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value === '1')">
+        <select data-field-key="${esc(fkey)}" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" data-val-type="bool">
           <option value="1" ${checked ? "selected" : ""}>${tr("是 (Enabled)", "Enabled")}</option>
           <option value="0" ${!checked ? "selected" : ""}>${tr("否 (Disabled)", "Disabled")}</option>
         </select>
       `;
     } else if (inp.type === "number") {
       control = `
-        <input type="number" data-field-key="${esc(fkey)}" value="${esc(val)}" ${inp.min !== null ? `min="${inp.min}"` : ""} ${inp.max !== null ? `max="${inp.max}"` : ""}
-          oninput="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value === '' ? '' : Number(this.value))"
-          onchange="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', Number(this.value))" />
+        <input type="number" data-field-key="${esc(fkey)}" value="${esc(val)}" ${inp.min != null ? `min="${inp.min}"` : ""} ${inp.max != null ? `max="${inp.max}"` : ""}
+          data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" data-val-type="number-optional" />
       `;
     } else if (inp.type === "secret") {
       control = `
-        <input type="password" data-field-key="${esc(fkey)}" value="${esc(val)}" placeholder="${tr("留空表示不启用密钥验证", "Leave blank if no API key required")}"
-          oninput="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)"
-          onchange="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)" />
+        <input type="password" autocomplete="off" data-field-key="${esc(fkey)}" value="${esc(val)}" placeholder="${tr("留空表示不启用密钥验证", "Leave blank if no API key required")}"
+          data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
       `;
     } else if (inp.type === "hf-gguf") {
       control = `
         <div class="row-actions" style="width:100%;">
           <input type="text" data-field-key="${esc(fkey)}" style="flex:1;" value="${esc(val)}" placeholder="owner/repo-GGUF"
-            oninput="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)"
-            onchange="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)" />
-          <button type="button" class="btn btn-sm" onclick="window._app.analyzeGguf()">${IC.search} <span>${tr("测算显存适配", "Analyze VRAM Fit")}</span></button>
+            data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
+          <button type="button" class="btn btn-sm" data-action="analyze-gguf">${IC.search} <span>${tr("测算显存适配", "Analyze VRAM Fit")}</span></button>
         </div>
         <div class="preset-chips">
-          ${state.curatedRepos.map((repo) => `<span class="chip mono" onclick="window._app.pickCuratedRepo('${esc(repo)}')">${esc(repo)}</span>`).join("")}
+          ${state.curatedRepos.map((repo) => `<button type="button" class="chip mono" data-action="pick-curated-repo" data-repo="${esc(repo)}">${esc(repo)}</button>`).join("")}
         </div>
       `;
     } else if (recipeId === "llama-cpp-gguf" && inp.id === "quant") {
@@ -841,8 +1033,7 @@
       const suggestions = Array.from(new Set(["auto", ...discovered, "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "UD-Q4_K_XL", "IQ4_XS", "Q3_K_M", "BF16"]));
       control = `
         <input type="text" list="quant-datalist" data-field-key="${esc(fkey)}" value="${esc(val)}"
-          oninput="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)"
-          onchange="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)" />
+          data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
         <datalist id="quant-datalist">
           ${suggestions.map((q) => `<option value="${esc(q)}"></option>`).join("")}
         </datalist>
@@ -850,8 +1041,7 @@
     } else {
       control = `
         <input type="text" data-field-key="${esc(fkey)}" value="${esc(val)}"
-          oninput="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)"
-          onchange="window._app.updateDraft('${esc(recipeId)}', '${esc(inp.id)}', this.value)" />
+          data-input="draft" data-change="draft" data-recipe-id="${esc(recipeId)}" data-key="${esc(inp.id)}" />
       `;
     }
 
@@ -898,7 +1088,7 @@
                   <td class="mono">${row.fits ? `${row.estimate_mib} / ${row.budget_mib} MiB` : esc(row.reason || "")}</td>
                   <td>
                     ${row.fits ? `
-                      <button type="button" class="btn btn-sm" onclick="window._app.applyHardwareRow('${esc(row.accelerator)}', ${row.vram_mib >= 70000 ? 70000 : 0})">
+                      <button type="button" class="btn btn-sm" data-action="apply-hw-row" data-accel="${esc(row.accelerator)}" data-min-vram="${row.vram_mib >= 70000 ? 70000 : 0}">
                         ${tr("选用此卡", "Select GPU")}
                       </button>
                     ` : ""}
@@ -921,31 +1111,36 @@
           <p class="page-subtitle">${tr("统一管理全部账号下的受管实例与未受管孤儿实例，支持延长看门狗、端口转发与核验释放。", "Manage all runtimes across accounts, including untracked browser sessions, VM watchdogs, and instant unassign.")}</p>
         </div>
         <div class="row-actions">
-          <button class="btn" type="button" onclick="window._app.refreshBootstrap()">${IC.refresh} <span>${tr("刷新列表", "Refresh")}</span></button>
-          <button class="btn btn-primary" type="button" onclick="window._app.openNewSessionModal()">${IC.plus} <span>${tr("新建纯净实例", "New GPU Session")}</span></button>
+          <button class="btn" type="button" data-action="refresh-bootstrap">${IC.refresh} <span>${tr("刷新列表", "Refresh")}</span></button>
+          <button class="btn btn-primary" type="button" data-action="open-new-session">${IC.plus} <span>${tr("新建纯净实例", "New GPU Session")}</span></button>
         </div>
       </div>
 
-      ${activeOps.map((op) => `
+      ${activeOps.map((op) => {
+        const cancelProvBusy = isBusy(`provision:cancel:${op.op_id}`);
+        return `
         <div class="banner info">
           <div>
             <strong>${tr("正在分配实例", "Provisioning")} <code>${esc(op.session_name)}</code> (${esc(op.accelerator)} · ${op.attempt}/${op.max_attempts})</strong>
             <div style="font-size:12px;color:var(--text-secondary);">${esc(op.message)}</div>
           </div>
-          <button class="btn btn-danger btn-sm" type="button" onclick="window._app.cancelProvision('${esc(op.op_id)}')">${tr("取消分配 (0 残留)", "Cancel & Release")}</button>
+          <button class="btn btn-danger btn-sm${cancelProvBusy ? " is-busy" : ""}" type="button" data-action="cancel-provision" data-op-id="${esc(op.op_id)}" ${cancelProvBusy ? "disabled" : ""}>${tr("取消分配 (0 残留)", "Cancel & Release")}</button>
         </div>
-      `).join("")}
+      `;
+      }).join("")}
 
       ${state.sessions.length === 0 ? `
         <div class="card" style="text-align:center;padding:42px;">
           <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${tr("当前没有任何运行中的 Colab 实例（0 计费消耗）", "No active Colab runtimes (0 CCU billing)")}</div>
           <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:18px;">${tr("可直接前往「极速部署模型」一键拉起推理服务，或点击右上角单独申请 GPU 实例。", "Head to Quick Deploy to launch a model server in one click, or allocate a standalone GPU session.")}</div>
-          <button class="btn btn-primary" type="button" onclick="window._app.go('deploy')"><span>${tr("前往部署模型", "Deploy a Model")}</span> ${IC.arrowRight}</button>
+          <button class="btn btn-primary" type="button" data-action="go" data-route="deploy"><span>${tr("前往部署模型", "Deploy a Model")}</span> ${IC.arrowRight}</button>
         </div>
       ` : `
         <div class="grid-2">
           ${state.sessions.map((s) => {
             const vramPct = s.vram_total_mib ? Math.min(100, Math.round(((s.vram_used_mib || 0) / s.vram_total_mib) * 100)) : 0;
+            const extBusy = isBusy(`session:extend:${s.name}`);
+            const stopBusy = isBusy(`session:stop:${s.endpoint}`);
             return `
               <div class="card" style="display:flex;flex-direction:column;gap:12px;">
                 <div class="row-actions" style="justify-content:space-between;">
@@ -979,9 +1174,9 @@
                 ${s.watchdog?.warning ? `<div style="font-size:12px;color:var(--warning);">${esc(s.watchdog.warning)}</div>` : ""}
 
                 <div class="row-actions" style="justify-content:flex-end;">
-                  <button class="btn btn-sm" type="button" onclick="window._app.extendSession('${esc(s.name)}')">${IC.clock} <span>${tr("延长 +2h", "Extend +2h")}</span></button>
-                  <button class="btn btn-sm" type="button" onclick="window._app.openForwardModal('${esc(s.name)}')">${IC.link} <span>${tr("映射端口", "Forward Port")}</span></button>
-                  <button class="btn btn-danger btn-sm" type="button" onclick="window._app.stopSession('${esc(s.endpoint)}', '${esc(s.account_id)}')">${IC.stop} <span>${tr("停止并结束计费", "Stop & End Billing")}</span></button>
+                  <button class="btn btn-sm${extBusy ? " is-busy" : ""}" type="button" data-action="extend-session" data-session-name="${esc(s.name)}" ${extBusy ? "disabled" : ""}>${IC.clock} <span>${tr("延长 +2h", "Extend +2h")}</span></button>
+                  <button class="btn btn-sm" type="button" data-action="open-forward" data-session-name="${esc(s.name)}">${IC.link} <span>${tr("映射端口", "Forward Port")}</span></button>
+                  <button class="btn btn-danger btn-sm${stopBusy ? " is-busy" : ""}" type="button" data-action="stop-session" data-endpoint="${esc(s.endpoint)}" data-account-id="${esc(s.account_id)}" data-session-name="${esc(s.name)}" data-accelerator="${esc(s.gpu_name || s.accelerator)}" ${stopBusy ? "disabled" : ""}>${IC.stop} <span>${tr("停止并结束计费", "Stop & End Billing")}</span></button>
                 </div>
               </div>
             `;
@@ -1010,7 +1205,7 @@
           <h1 class="page-title">${tr("本地端口映射与对话演练场", "Localhost Port Forwards & API Playground")}</h1>
           <p class="page-subtitle">${tr("通过原生 OpenSSH + Colab WebSocket 多路复用将云端端口安全映射至 127.0.0.1（不修改 ~/.ssh/config）。", "Multiplexes Colab VM ports to 127.0.0.1 via native OpenSSH over WebSocket without editing ~/.ssh/config.")}</p>
         </div>
-        ${state.sessions.length > 0 ? `<button class="btn btn-primary" type="button" onclick="window._app.openForwardModal('${esc(state.sessions[0].name)}')">${IC.plus} <span>${tr("新建端口映射", "New Port Forward")}</span></button>` : ""}
+        ${state.sessions.length > 0 ? `<button class="btn btn-primary" type="button" data-action="open-forward" data-session-name="${esc(state.sessions[0].name)}">${IC.plus} <span>${tr("新建端口映射", "New Port Forward")}</span></button>` : ""}
       </div>
 
       <div class="banner warning">
@@ -1041,11 +1236,11 @@
                 <tr>
                   <td class="mono"><strong>${esc(t.session_name)}</strong></td>
                   <td>${esc(tunLabel(t))}</td>
-                  <td><code>VM:${t.remote_port}</code> -> <a href="${esc(t.local_url)}" target="_blank" style="color:var(--text-primary);text-decoration:underline;"><code>${esc(t.local_url)}</code></a></td>
+                  <td><code>VM:${t.remote_port}</code> -> <a href="${esc(safeHttpUrl(t.local_url))}" target="_blank" rel="noopener noreferrer" style="color:var(--text-primary);text-decoration:underline;"><code>${esc(t.local_url)}</code></a></td>
                   <td><span class="tag ${t.status === "open" ? "ok" : "err"}">${esc(t.status)}</span></td>
                   <td class="row-actions">
-                    <button class="btn btn-sm" type="button" onclick="window._app.copyText('${esc(t.local_url)}')">${IC.copy} <span>${tr("复制", "Copy")}</span></button>
-                    <button class="btn btn-danger btn-sm" type="button" onclick="window._app.closeTunnel('${esc(t.id)}')">${tr("断开", "Disconnect")}</button>
+                    <button class="btn btn-sm" type="button" data-action="copy-text" data-text="${esc(t.local_url)}">${IC.copy} <span>${tr("复制", "Copy")}</span></button>
+                    <button class="btn btn-danger btn-sm" type="button" data-action="close-tunnel" data-tunnel-id="${esc(t.id)}">${tr("断开", "Disconnect")}</button>
                   </td>
                 </tr>
               `).join("")}
@@ -1058,15 +1253,15 @@
         <div class="card-head" style="flex-wrap:wrap;">
           <span class="card-title">${tr("OpenAI 兼容推理对话测速 (Chat Playground)", "OpenAI-Compatible Chat & Speed Playground")}</span>
           <div class="row-actions" style="flex-wrap:wrap;">
-            <select id="chat-tunnel-select" onchange="window._app.setChatTunnel(this.value)" style="padding:6px 10px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;">
+            <select id="chat-tunnel-select" data-change="chat-tunnel" style="padding:6px 10px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;">
               ${openTunnels.length > 0
                 ? openTunnels.map((t) => `<option value="${esc(t.id)}" ${t.id === activeTunnelId ? "selected" : ""}>${esc(t.session_name)} — ${esc(t.local_url)}</option>`).join("")
                 : `<option value="">${tr("默认沙盒端点 (127.0.0.1:8000/v1)", "Default Sandbox (127.0.0.1:8000/v1)")}</option>`}
             </select>
-            <input type="text" id="chat-model-input" value="${esc(state.chatModel)}" oninput="window._app.setChatMeta('chatModel', this.value)"
+            <input type="text" id="chat-model-input" value="${esc(state.chatModel)}" data-input="chat-meta" data-meta-field="chatModel"
               placeholder="model (auto)" title="${tr("模型名，auto 自动识别已部署模型", "Model ID; 'auto' detects active model")}"
               style="width:130px;padding:6px 9px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;" />
-            <input type="password" id="chat-apikey-input" value="${esc(state.chatApiKey)}" oninput="window._app.setChatMeta('chatApiKey', this.value)"
+            <input type="password" autocomplete="off" id="chat-apikey-input" value="${esc(state.chatApiKey)}" data-input="chat-meta" data-meta-field="chatApiKey"
               placeholder="${tr("API Key (可选)", "API Key (optional)")}"
               style="width:135px;padding:6px 9px;border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-subtle);font-size:12px;" />
           </div>
@@ -1074,8 +1269,8 @@
         <div class="chat-box" id="chat-box">
           ${state.chatMessages.map((m) => `<div class="chat-msg ${esc(m.role)}">${esc(m._welcome ? welcomeText : m.content)}</div>`).join("")}
         </div>
-        <form class="row-actions" onsubmit="window._app.sendChat(event)">
-          <input type="text" id="chat-input" value="${esc(state.chatDraft)}" oninput="window._app.setChatMeta('chatDraft', this.value)"
+        <form class="row-actions" data-submit="chat">
+          <input type="text" id="chat-input" value="${esc(state.chatDraft)}" data-input="chat-meta" data-meta-field="chatDraft"
             style="flex:1;padding:9px 11px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);background:var(--bg-input);color:var(--text-primary);font-size:13px;"
             placeholder="${tr("输入测试提示词以实测延迟与 tok/s...", "Enter a test prompt to measure latency & tok/s...")}" ${state.chatBusy ? "disabled" : ""} />
           <button type="submit" class="btn btn-primary" ${state.chatBusy ? "disabled" : ""}>${IC.send} <span>${state.chatBusy ? tr("生成中...", "Generating...") : tr("发送测试", "Send")}</span></button>
@@ -1092,8 +1287,8 @@
           <p class="page-subtitle">${tr("每个 Google 账号凭证在 OS Keyring 中独立隔离保存，同屏实时观测全部账号余额与落盘关闭回执。", "Per-account OAuth tokens isolated in OS Credential Manager; view all balances and verifiable unassign receipts.")}</p>
         </div>
         <div class="row-actions">
-          ${state.settings.backend_mode === "real" ? `<button class="btn" type="button" onclick="window._app.importCliAccount()">${IC.download} <span>${tr("导入 colab-cli 登录态", "Import colab-cli Token")}</span></button>` : ""}
-          <button class="btn btn-primary" type="button" onclick="window._app.openLoginModal()">${IC.plus} <span>${tr("添加 Google 账号", "Add Google Account")}</span></button>
+          ${state.settings.backend_mode === "real" ? `<button class="btn" type="button" data-action="import-cli-account">${IC.download} <span>${tr("导入 colab-cli 登录态", "Import colab-cli Token")}</span></button>` : ""}
+          <button class="btn btn-primary" type="button" data-action="open-login">${IC.plus} <span>${tr("添加 Google 账号", "Add Google Account")}</span></button>
         </div>
       </div>
 
@@ -1115,7 +1310,10 @@
               </tr>
             </thead>
             <tbody>
-              ${state.accounts.map((a) => `
+              ${state.accounts.map((a) => {
+                const remBusy = isBusy(`account:remove:${a.id}`);
+                const swBusy = isBusy(`account:switch:${a.id}`);
+                return `
                 <tr>
                   <td><strong>${esc(a.email)}</strong> <div style="font-size:11.5px;color:var(--text-muted);">${esc(a.display_name)}</div></td>
                   <td>${a.is_active ? `<span class="tag ok">${tr("当前激活", "Active")}</span>` : `<span class="tag">${tr("备用", "Standby")}</span>`}</td>
@@ -1123,11 +1321,12 @@
                   <td class="mono">${a.usage?.burn_rate_hourly !== null && a.usage?.burn_rate_hourly !== undefined ? `${a.usage.burn_rate_hourly.toFixed(2)} /h` : "--"}</td>
                   <td class="mono">${a.usage?.assignments_count ?? "--"}</td>
                   <td class="row-actions">
-                    ${!a.is_active ? `<button class="btn btn-sm" type="button" onclick="window._app.switchAccount('${esc(a.id)}')">${tr("切换至此账号", "Switch Active")}</button>` : ""}
-                    <button class="btn btn-danger btn-sm" type="button" onclick="window._app.removeAccount('${esc(a.id)}')">${tr("移除", "Remove")}</button>
+                    ${!a.is_active ? `<button class="btn btn-sm${swBusy ? " is-busy" : ""}" type="button" data-action="switch-account" data-account-id="${esc(a.id)}" ${swBusy ? "disabled" : ""}>${tr("切换至此账号", "Switch Active")}</button>` : ""}
+                    <button class="btn btn-danger btn-sm${remBusy ? " is-busy" : ""}" type="button" data-action="remove-account" data-account-id="${esc(a.id)}" data-email="${esc(a.email)}" ${remBusy ? "disabled" : ""}>${tr("移除", "Remove")}</button>
                   </td>
                 </tr>
-              `).join("")}
+              `;
+              }).join("")}
             </tbody>
           </table>
         `}
@@ -1185,7 +1384,7 @@
           <div class="card-head">
             <span class="card-title">${tr("算力成本护栏策略", "Compute Cost Guard Policies")}</span>
           </div>
-          <form onsubmit="window._app.saveGuardSettings(event)" class="form-grid">
+          <form data-submit="guard-settings" class="form-grid">
             <div class="field">
               <label>${tr("默认 VM 自动关机限时 (分钟，0=不限时)", "Default VM Auto-Stop (minutes, 0=unlimited)")}</label>
               <input type="number" id="set-autostop" min="0" max="1440" value="${g.auto_stop_minutes ?? 120}" />
@@ -1214,7 +1413,7 @@
               <input type="number" min="1" max="5" id="set-maxsess" value="${g.max_managed_sessions ?? 3}" />
             </div>
             <div class="field full" style="align-items:flex-end;">
-              <button type="submit" class="btn btn-primary">${tr("保存护栏配置", "Save Guard Settings")}</button>
+              <button type="submit" class="btn btn-primary${isBusy("settings:guards") ? " is-busy" : ""}" ${isBusy("settings:guards") ? "disabled" : ""}>${tr("保存护栏配置", "Save Guard Settings")}</button>
             </div>
           </form>
         </div>
@@ -1229,18 +1428,18 @@
           <div class="field" style="margin-bottom:14px;">
             <label>Hugging Face Token — ${state.secrets.hf_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
             <div class="row-actions">
-              <input type="password" id="inp-hf-token" style="flex:1;" placeholder="hf_xxxxxxxxxxxxxxxxxxxx" />
-              <button class="btn btn-sm btn-primary" type="button" onclick="window._app.saveSecret('hf_token', 'inp-hf-token')">${tr("保存", "Save")}</button>
-              ${state.secrets.hf_token ? `<button class="btn btn-sm btn-danger" type="button" onclick="window._app.deleteSecret('hf_token')">${tr("清除", "Clear")}</button>` : ""}
+              <input type="password" autocomplete="off" id="inp-hf-token" style="flex:1;" placeholder="hf_xxxxxxxxxxxxxxxxxxxx" />
+              <button class="btn btn-sm btn-primary${isBusy("secret:save:hf_token") ? " is-busy" : ""}" type="button" data-action="save-secret" data-slot="hf_token" data-input-id="inp-hf-token" ${isBusy("secret:save:hf_token") ? "disabled" : ""}>${tr("保存", "Save")}</button>
+              ${state.secrets.hf_token ? `<button class="btn btn-sm btn-danger${isBusy("secret:delete:hf_token") ? " is-busy" : ""}" type="button" data-action="delete-secret" data-slot="hf_token" ${isBusy("secret:delete:hf_token") ? "disabled" : ""}>${tr("清除", "Clear")}</button>` : ""}
             </div>
           </div>
 
           <div class="field" style="margin-bottom:18px;">
             <label>Civitai API Token — ${state.secrets.civitai_token ? `<span class="tag ok">${tr("已保存", "Saved")}</span>` : `<span class="tag">${tr("未配置", "Not set")}</span>`}</label>
             <div class="row-actions">
-              <input type="password" id="inp-civ-token" style="flex:1;" placeholder="Civitai API Token" />
-              <button class="btn btn-sm btn-primary" type="button" onclick="window._app.saveSecret('civitai_token', 'inp-civ-token')">${tr("保存", "Save")}</button>
-              ${state.secrets.civitai_token ? `<button class="btn btn-sm btn-danger" type="button" onclick="window._app.deleteSecret('civitai_token')">${tr("清除", "Clear")}</button>` : ""}
+              <input type="password" autocomplete="off" id="inp-civ-token" style="flex:1;" placeholder="Civitai API Token" />
+              <button class="btn btn-sm btn-primary${isBusy("secret:save:civitai_token") ? " is-busy" : ""}" type="button" data-action="save-secret" data-slot="civitai_token" data-input-id="inp-civ-token" ${isBusy("secret:save:civitai_token") ? "disabled" : ""}>${tr("保存", "Save")}</button>
+              ${state.secrets.civitai_token ? `<button class="btn btn-sm btn-danger${isBusy("secret:delete:civitai_token") ? " is-busy" : ""}" type="button" data-action="delete-secret" data-slot="civitai_token" ${isBusy("secret:delete:civitai_token") ? "disabled" : ""}>${tr("清除", "Clear")}</button>` : ""}
             </div>
           </div>
 
@@ -1250,7 +1449,7 @@
             <div class="row-actions" style="margin-top:8px;">
               ${["demo", "single", "signed_out"].map((sc) => `
                 <button class="btn btn-sm ${state.settings.mock_scenario === sc ? "btn-primary" : ""}" type="button"
-                  onclick="window._app.setMockScenario('${sc}')">${sc}</button>
+                  data-action="set-mock-scenario" data-scenario="${esc(sc)}">${esc(sc)}</button>
               `).join("")}
             </div>
           ` : ""}
@@ -1295,36 +1494,41 @@
     }
   }
 
-  function openCommandPalette() {
+  function renderCommandPaletteItems() {
     const q = (state.cmdQuery || "").trim().toLowerCase();
     const actions = [
-      { label: tr("前往：总览看板", "Go to: Overview"), sub: "overview", run: "window._app.closeModal();window._app.go('overview')" },
-      { label: tr("前往：模型极速部署", "Go to: Quick Deploy"), sub: "deploy", run: "window._app.closeModal();window._app.go('deploy')" },
-      { label: tr("前往：算力实例管理", "Go to: GPU Sessions"), sub: "sessions", run: "window._app.closeModal();window._app.go('sessions')" },
-      { label: tr("前往：端口映射与对话", "Go to: Tunnels & Chat"), sub: "tunnels", run: "window._app.closeModal();window._app.go('tunnels')" },
-      { label: tr("前往：多账号与关闭回执", "Go to: Accounts & Receipts"), sub: "accounts", run: "window._app.closeModal();window._app.go('accounts')" },
-      { label: tr("前往：成本护栏与密钥", "Go to: Guards & Vault"), sub: "settings", run: "window._app.closeModal();window._app.go('settings')" },
-      { label: tr("新建纯净 GPU 实例", "Allocate New GPU Session"), sub: "session", run: "window._app.openNewSessionModal()" },
-      { label: tr("刷新全部账号 CCU 余额", "Refresh All Account CCU Balances"), sub: "usage", run: "window._app.closeModal();window._app.refreshUsage()" },
+      { label: tr("前往：总览看板", "Go to: Overview"), sub: "overview", kind: "go", arg: "overview" },
+      { label: tr("前往：模型极速部署", "Go to: Quick Deploy"), sub: "deploy", kind: "go", arg: "deploy" },
+      { label: tr("前往：算力实例管理", "Go to: GPU Sessions"), sub: "sessions", kind: "go", arg: "sessions" },
+      { label: tr("前往：端口映射与对话", "Go to: Tunnels & Chat"), sub: "tunnels", kind: "go", arg: "tunnels" },
+      { label: tr("前往：多账号与关闭回执", "Go to: Accounts & Receipts"), sub: "accounts", kind: "go", arg: "accounts" },
+      { label: tr("前往：成本护栏与密钥", "Go to: Guards & Vault"), sub: "settings", kind: "go", arg: "settings" },
+      { label: tr("新建纯净 GPU 实例", "Allocate New GPU Session"), sub: "session", kind: "new-session", arg: "" },
+      { label: tr("刷新全部账号 CCU 余额", "Refresh All Account CCU Balances"), sub: "usage", kind: "refresh-usage", arg: "" },
       ...state.recipes.map((r) => ({
         label: `${tr("部署配方", "Recipe")}: ${locObj(r.name)}`,
         sub: r.id,
-        run: `window._app.closeModal();window._app.pickRecipe('${esc(r.id)}')`,
+        kind: "pick-recipe",
+        arg: r.id,
       })),
     ].filter((a) => !q || a.label.toLowerCase().includes(q) || a.sub.toLowerCase().includes(q));
 
+    return actions.map((a) => `
+      <button type="button" class="cmd-item" data-action="cmd-exec" data-cmd-kind="${esc(a.kind)}" data-cmd-arg="${esc(a.arg)}">
+        <span>${esc(a.label)}</span>
+        <span class="cmd-sub mono">${esc(a.sub)}</span>
+      </button>
+    `).join("") || `<div class="kpi-foot" style="padding:12px;text-align:center;">${tr("无匹配命令", "No matching commands")}</div>`;
+  }
+
+  function openCommandPalette() {
     openModal(`
       <div class="field">
         <input type="text" id="cmd-search" value="${esc(state.cmdQuery)}" placeholder="${tr("输入命令、页面或配方名快速跳转 (Esc 关闭)...", "Type a command, page, or recipe name (Esc to close)...")}"
-          oninput="window._app.filterCmdPalette(this.value)" />
+          data-input="cmd-filter" />
       </div>
-      <div class="cmd-list">
-        ${actions.map((a) => `
-          <button type="button" class="cmd-item" onclick="${a.run}">
-            <span>${esc(a.label)}</span>
-            <span class="cmd-sub mono">${esc(a.sub)}</span>
-          </button>
-        `).join("") || `<div class="kpi-foot" style="padding:12px;text-align:center;">${tr("无匹配命令", "No matching commands")}</div>`}
+      <div class="cmd-list" id="cmd-list">
+        ${renderCommandPaletteItems()}
       </div>
     `, { type: "cmd_palette" });
     const inp = document.getElementById("cmd-search");
@@ -1333,6 +1537,90 @@
 
   /* ========================== Actions ========================== */
 
+  async function executeStopAll(triggerEl = null) {
+    return runLocked("sessions:stop-all", triggerEl, async () => {
+      try {
+        const res = await api("/api/sessions/stop-all", { method: "POST" });
+        const remaining = Number(res.remaining_sessions || 0);
+        const failedAccounts = Array.isArray(res.failed_accounts) ? res.failed_accounts : [];
+        const stopErrors = Array.isArray(res.stop_errors) ? res.stop_errors : [];
+        const verified =
+          res.zero_burn_verified === true &&
+          remaining === 0 &&
+          failedAccounts.length === 0 &&
+          stopErrors.length === 0;
+
+        if (verified) {
+          state.zeroBurnAlert = null;
+          renderGlobalAlert();
+          toast(
+            tr(
+              `已全部释放 ${res.stopped_count} 个实例（零残留核验通过）`,
+              `Released ${res.stopped_count} runtime(s) (Zero-burn verified)`
+            ),
+            "ok"
+          );
+        } else {
+          state.zeroBurnAlert = {
+            kind: "stop_all_unverified",
+            stoppedCount: res.stopped_count ?? 0,
+            remaining,
+            failedAccounts,
+            stopErrors,
+          };
+          renderGlobalAlert();
+          toast(
+            tr(
+              `零燃费核验失败：残留 ${remaining} 个实例或存在未确认异常，请查看顶部告警并重试！`,
+              `Zero-burn verification failed: ${remaining} remaining session(s) or unverified errors — check alert banner and retry!`
+            ),
+            "err"
+          );
+        }
+        await refreshBootstrap();
+      } catch (err) {
+        state.zeroBurnAlert = {
+          kind: "stop_all_error",
+          message: err.message,
+        };
+        renderGlobalAlert();
+        toast(err.message, "err");
+      }
+    }, true);
+  }
+
+  function requestStopAll(triggerEl = null) {
+    const count = state.sessions.length;
+    openConfirmModal(
+      {
+        tone: "danger",
+        title: () => tr("确认紧急停止全部实例", "Confirm Emergency Stop All"),
+        bodyHtml: () => `
+          <p>${tr(
+            `即将立即释放全部账号下的 <strong>${count}</strong> 个活跃 Colab 实例并断开本地映射。`,
+            `This will immediately unassign all <strong>${count}</strong> active Colab runtime(s) across all accounts and close local tunnels.`
+          )}</p>
+          <div class="confirm-cost-box danger">
+            <span>${tr("注意：紧急停机优先止损，不会等待 [[keep]] 成品同步，VM 内未保存文件将丢失。", "Note: Emergency stop prioritizes immediate zero-burn and skips [[keep]] sync; unsaved VM files will be lost.")}</span>
+          </div>
+        `,
+        confirmLabel: () => tr(`确认停止全部 (${count})`, `Confirm Stop All (${count})`),
+      },
+      async () => {
+        closeModal();
+        await executeStopAll(triggerEl);
+      }
+    );
+  }
+
+  function parseDraftFieldValue(el) {
+    const valType = el.dataset.valType || "";
+    if (valType === "bool") return el.value === "1";
+    if (valType === "number") return Number(el.value);
+    if (valType === "number-optional") return el.value === "" ? "" : Number(el.value);
+    return el.value;
+  }
+
   window._app = {
     toast,
     closeModal,
@@ -1340,11 +1628,21 @@
     openCommandPalette,
     filterCmdPalette(val) {
       state.cmdQuery = val;
-      openCommandPalette();
+      const list = document.getElementById("cmd-list");
+      if (list) list.innerHTML = renderCommandPaletteItems();
+      else openCommandPalette();
     },
-    copyText(text) {
-      try { navigator.clipboard.writeText(text); } catch (_) {}
-      toast(tr("已复制地址", "Copied URL"), "ok");
+    async copyText(text) {
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          await navigator.clipboard.writeText(text);
+          toast(tr("已复制地址", "Copied URL"), "ok");
+        } else {
+          toast(tr("当前环境不支持剪贴板写入", "Clipboard unavailable in this context"), "err");
+        }
+      } catch (_) {
+        toast(tr("复制失败，请手动复制", "Failed to copy; please copy manually"), "err");
+      }
     },
     go(route) {
       state.route = route;
@@ -1415,8 +1713,9 @@
         renderMain();
       }
     },
-    async submitDeploy(ev) {
+    async submitDeploy(ev, triggerEl = null) {
       ev.preventDefault();
+      if (isBusy("deploy:submit")) return;
       const recipe = state.recipes.find((r) => r.id === state.selectedRecipeId);
       if (!recipe) return;
       const draft = ensureDeployDraft(recipe);
@@ -1425,41 +1724,101 @@
         const v = draft[inp.id];
         if (v !== "" && v !== null && v !== undefined) inputs[inp.id] = v;
       }
+      const accel = draft._accelerator || recipe.provision.accelerator;
+      const minVram = Number(draft._minVram || 0);
       const body = {
         recipe_id: recipe.id,
         inputs,
         session_name: draft._sessionMode === "new" ? null : draft._sessionMode,
         provision: draft._sessionMode === "new" ? {
-          accelerator: draft._accelerator || recipe.provision.accelerator,
-          min_vram_mib: Number(draft._minVram || 0),
+          accelerator: accel,
+          min_vram_mib: minVram,
           high_mem: !!draft._highMem,
         } : null,
       };
-      try {
-        await api("/api/deployments", { method: "POST", body: JSON.stringify(body) });
-        toast(tr("部署任务已启动，正在实时追踪进度...", "Deployment started; streaming live progress..."), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
+
+      const executeDeploy = () => runLocked("deploy:submit", triggerEl, async () => {
+        try {
+          await api("/api/deployments", { method: "POST", body: JSON.stringify(body) });
+          toast(tr("部署任务已启动，正在实时追踪进度...", "Deployment started; streaming live progress..."), "ok");
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
+
+      if (state.settings.backend_mode === "real" && draft._sessionMode === "new") {
+        const estBurn = APPROX_BURN[accel] ?? 2.0;
+        const bal = state.activeAccount?.usage?.balance_ccu;
+        const autoStop = state.settings.guards?.auto_stop_minutes ?? 120;
+        openConfirmModal(
+          {
+            tone: "danger",
+            title: () => tr("确认启动真实计费部署", "Confirm Live Billing Deployment"),
+            bodyHtml: () => `
+              <p>${tr(
+                "当前处于 <strong>真实 Google Colab 模式</strong>，本次部署将新建云端 GPU 实例并真实消耗账号 Compute Units (CCU)。",
+                "You are in <strong>Real Google Colab Mode</strong>. Launching this deployment allocates a live GPU VM and spends real Compute Units (CCU)."
+              )}</p>
+              <div class="confirm-cost-box">
+                <div class="kv-row"><span>${tr("部署模板", "Recipe")}</span><span class="strong">${esc(locObj(recipe.name))}</span></div>
+                <div class="kv-row"><span>${tr("目标算力", "Target Accelerator")}</span><span class="mono strong">${esc(accel)}${minVram > 0 ? ` (>= ${minVram} MiB)` : ""}${draft._highMem ? " · High-RAM" : ""}</span></div>
+                <div class="kv-row"><span>${tr("预估消耗速率", "Estimated Burn Rate")}</span><span class="mono strong">~${estBurn.toFixed(2)} CCU/h</span></div>
+                <div class="kv-row"><span>${tr("当前账号余额", "Account Balance")}</span><span class="mono strong">${bal !== null && bal !== undefined ? `${bal.toFixed(2)} CCU` : tr("未知", "Unknown")}</span></div>
+                <div class="kv-row"><span>${tr("VM 看门狗限时", "VM Auto-Stop Limit")}</span><span class="mono strong">${autoStop > 0 ? `${autoStop} min` : tr("不限时 (高风险)", "Unlimited (High Risk)")}</span></div>
+              </div>
+            `,
+            confirmLabel: () => tr("确认启动真实计费部署", "Confirm & Launch Live Deployment"),
+          },
+          async () => {
+            closeModal();
+            await executeDeploy();
+          }
+        );
+        return;
       }
+
+      await executeDeploy();
     },
-    async cancelRun(runId) {
-      try {
-        await api(`/api/deployments/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
-        toast(tr("已发送取消指令并回收新建实例", "Cancellation requested; releasing provisioned runtime"), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async cancelRun(runId, meta = {}, triggerEl = null) {
+      if (isBusy(`run:cancel:${runId}`)) return;
+      const sessName = meta.sessionName || "";
+      openConfirmModal(
+        {
+          tone: "danger",
+          title: () => tr("确认取消部署并回收实例", "Confirm Cancel Deployment & Release"),
+          bodyHtml: () => `
+            <p>${tr(
+              `确定要取消部署任务 <code>${esc(runId)}</code>${sessName ? `（会话 <code>${esc(sessName)}</code>）` : ""} 吗？若本次任务新建了实例，将自动释放以停止计费。`,
+              `Cancel deployment <code>${esc(runId)}</code>${sessName ? ` (session <code>${esc(sessName)}</code>)` : ""}? Any newly provisioned runtime will be unassigned immediately.`
+            )}</p>
+          `,
+          confirmLabel: () => tr("确认取消并回收", "Confirm Cancel & Release"),
+        },
+        async () => {
+          closeModal();
+          await runLocked(`run:cancel:${runId}`, triggerEl, async () => {
+            try {
+              await api(`/api/deployments/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+              toast(tr("已发送取消指令并回收新建实例", "Cancellation requested; releasing provisioned runtime"), "ok");
+              await refreshBootstrap();
+            } catch (err) {
+              toast(err.message, "err");
+            }
+          });
+        }
+      );
     },
-    async syncKeep(runId) {
-      try {
-        await api(`/api/deployments/${encodeURIComponent(runId)}/keep/sync`, { method: "POST" });
-        toast(tr("已同步并打包保留成品目录至本地 data/keep/", "Synced keep artifacts locally to data/keep/"), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async syncKeep(runId, triggerEl = null) {
+      return runLocked(`run:sync:${runId}`, triggerEl, async () => {
+        try {
+          await api(`/api/deployments/${encodeURIComponent(runId)}/keep/sync`, { method: "POST" });
+          toast(tr("已同步并打包保留成品目录至本地 data/keep/", "Synced keep artifacts locally to data/keep/"), "ok");
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
     },
     async refreshUsage() {
       try {
@@ -1470,38 +1829,79 @@
         toast(err.message, "err");
       }
     },
-    async stopSession(identifier, accountId) {
-      try {
-        const q = accountId ? `?account_id=${encodeURIComponent(accountId)}` : "";
-        const rc = await api(`/api/sessions/${encodeURIComponent(identifier)}/stop${q}`, { method: "POST" });
-        toast(
-          tr(
-            `已释放实例 ${rc.session_name} 并生成关闭回执 #${rc.receipt_id}`,
-            `Released ${rc.session_name} (Unassign Receipt #${rc.receipt_id})`
-          ),
-          "ok"
-        );
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async stopSession(identifier, accountId, meta = {}, triggerEl = null) {
+      if (isBusy(`session:stop:${identifier}`)) return;
+      const dispName = meta.sessionName || identifier;
+      const dispAccel = meta.accelerator || "";
+      openConfirmModal(
+        {
+          tone: "danger",
+          title: () => tr("确认停止实例并结束计费", "Confirm Stop & End Billing"),
+          bodyHtml: () => `
+            <p>${tr(
+              `确定要释放实例 <strong>${esc(dispName)}</strong>${dispAccel ? ` (${esc(dispAccel)})` : ""} 吗？释放后将立即结束该实例的 Colab 算力计费，VM 内未同步到本地的文件会丢失。`,
+              `Unassign runtime <strong>${esc(dispName)}</strong>${dispAccel ? ` (${esc(dispAccel)})` : ""}? Billing stops immediately and unsynced files inside the VM will be lost.`
+            )}</p>
+            <div class="mono" style="font-size:11.5px;color:var(--text-muted);">Endpoint: <code>${esc(identifier)}</code></div>
+          `,
+          confirmLabel: () => tr("确认停止并结束计费", "Confirm Stop & End Billing"),
+        },
+        async () => {
+          closeModal();
+          await runLocked(`session:stop:${identifier}`, triggerEl, async () => {
+            try {
+              const q = accountId ? `?account_id=${encodeURIComponent(accountId)}` : "";
+              const rc = await api(`/api/sessions/${encodeURIComponent(identifier)}/stop${q}`, { method: "POST" });
+              if (rc.verified_unassigned === false) {
+                state.zeroBurnAlert = {
+                  kind: "session_unverified",
+                  sessionName: rc.session_name || dispName,
+                  endpoint: rc.endpoint || identifier,
+                  receiptId: rc.receipt_id || "",
+                };
+                renderGlobalAlert();
+                toast(
+                  tr(
+                    `警告：实例 ${rc.session_name || dispName} 释放未通过核验，云端可能仍在计费（回执 #${rc.receipt_id || "--"}）！`,
+                    `WARNING: Unassign of ${rc.session_name || dispName} was NOT verified — billing may still be active (Receipt #${rc.receipt_id || "--"})!`
+                  ),
+                  "err"
+                );
+              } else {
+                toast(
+                  tr(
+                    `已释放实例 ${rc.session_name} 并生成关闭回执 #${rc.receipt_id}`,
+                    `Released ${rc.session_name} (Unassign Receipt #${rc.receipt_id})`
+                  ),
+                  "ok"
+                );
+              }
+              await refreshBootstrap();
+            } catch (err) {
+              toast(err.message, "err");
+            }
+          });
+        }
+      );
     },
-    async extendSession(name) {
-      try {
-        await api(`/api/sessions/${encodeURIComponent(name)}/extend`, {
-          method: "POST",
-          body: JSON.stringify({ add_minutes: 120 }),
-        });
-        toast(tr(`已将 ${name} 自动关机时间延长 2 小时`, `Extended ${name} auto-stop deadline by 2 hours`), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async extendSession(name, triggerEl = null) {
+      return runLocked(`session:extend:${name}`, triggerEl, async () => {
+        try {
+          await api(`/api/sessions/${encodeURIComponent(name)}/extend`, {
+            method: "POST",
+            body: JSON.stringify({ add_minutes: 120 }),
+          });
+          toast(tr(`已将 ${name} 自动关机时间延长 2 小时`, `Extended ${name} auto-stop deadline by 2 hours`), "ok");
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
     },
     openNewSessionModal() {
       openModal(`
         <h3 style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("新建 Colab 算力实例", "New Colab GPU Session")}</h3>
-        <form onsubmit="window._app.submitNewSession(event)" class="form-grid">
+        <form data-submit="new-session" class="form-grid">
           <div class="field">
             <label>${tr("加速器型号", "Accelerator")}</label>
             <select id="m-accel">
@@ -1531,42 +1931,83 @@
             </select>
           </div>
           <div class="field full row-actions" style="justify-content:flex-end;margin-top:8px;">
-            <button type="button" class="btn" onclick="window._app.closeModal()">${tr("取消", "Cancel")}</button>
-            <button type="submit" class="btn btn-primary">${tr("立即申请实例", "Allocate Session")}</button>
+            <button type="button" class="btn" data-action="close-modal">${tr("取消", "Cancel")}</button>
+            <button type="submit" class="btn btn-primary${isBusy("session:create") ? " is-busy" : ""}" ${isBusy("session:create") ? "disabled" : ""}>${tr("立即申请实例", "Allocate Session")}</button>
           </div>
         </form>
       `, { type: "new_session" });
     },
-    async submitNewSession(ev) {
+    async submitNewSession(ev, triggerEl = null) {
       ev.preventDefault();
+      if (isBusy("session:create")) return;
+      const accelEl = document.getElementById("m-accel");
+      const vramEl = document.getElementById("m-vram");
+      const autoEl = document.getElementById("m-autostop");
+      const highEl = document.getElementById("m-highmem");
       const body = {
-        accelerator: document.getElementById("m-accel").value,
-        min_vram_mib: Number(document.getElementById("m-vram").value || 0),
-        auto_stop_minutes: Number(document.getElementById("m-autostop").value || 120),
-        high_mem: document.getElementById("m-highmem").value === "1",
+        accelerator: accelEl ? accelEl.value : "G4",
+        min_vram_mib: Number((vramEl && vramEl.value) || 0),
+        auto_stop_minutes: autoEl && autoEl.value !== "" ? Number(autoEl.value) : 120,
+        high_mem: highEl ? highEl.value === "1" : false,
       };
+
+      const executeProvision = () => runLocked("session:create", triggerEl, async () => {
+        try {
+          await api("/api/sessions?async_mode=true", { method: "POST", body: JSON.stringify(body) });
+          toast(tr("已发起实例分配请求", "Session provisioning started"), "ok");
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
+
+      if (state.settings.backend_mode === "real") {
+        const estBurn = APPROX_BURN[body.accelerator] ?? 2.0;
+        const bal = state.activeAccount?.usage?.balance_ccu;
+        openConfirmModal(
+          {
+            tone: "danger",
+            title: () => tr("确认申请真实计费 GPU 实例", "Confirm Live Billing GPU Allocation"),
+            bodyHtml: () => `
+              <p>${tr(
+                "当前处于 <strong>真实 Google Colab 模式</strong>，申请成功后将按小时真实消耗你的 Compute Units (CCU)。",
+                "You are in <strong>Real Google Colab Mode</strong>. Once assigned, this runtime will continuously spend real Compute Units (CCU)."
+              )}</p>
+              <div class="confirm-cost-box">
+                <div class="kv-row"><span>${tr("加速器型号", "Accelerator")}</span><span class="mono strong">${esc(body.accelerator)}${body.min_vram_mib > 0 ? ` (>= ${body.min_vram_mib} MiB)` : ""}${body.high_mem ? " · High-RAM" : ""}</span></div>
+                <div class="kv-row"><span>${tr("预估消耗速率", "Estimated Burn Rate")}</span><span class="mono strong">~${estBurn.toFixed(2)} CCU/h</span></div>
+                <div class="kv-row"><span>${tr("当前账号余额", "Account Balance")}</span><span class="mono strong">${bal !== null && bal !== undefined ? `${bal.toFixed(2)} CCU` : tr("未知", "Unknown")}</span></div>
+                <div class="kv-row"><span>${tr("自动关机限时", "Auto-Stop Limit")}</span><span class="mono strong">${body.auto_stop_minutes > 0 ? `${body.auto_stop_minutes} min` : tr("不限时 (高风险)", "Unlimited (High Risk)")}</span></div>
+              </div>
+            `,
+            confirmLabel: () => tr("确认申请真实计费实例", "Confirm & Allocate Live GPU"),
+          },
+          async () => {
+            closeModal();
+            await executeProvision();
+          }
+        );
+        return;
+      }
+
       closeModal();
-      try {
-        await api("/api/sessions?async_mode=true", { method: "POST", body: JSON.stringify(body) });
-        toast(tr("已发起实例分配请求", "Session provisioning started"), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+      await executeProvision();
     },
-    async cancelProvision(opId) {
-      try {
-        await api(`/api/provision/${encodeURIComponent(opId)}/cancel`, { method: "POST" });
-        toast(tr("正在取消分配并清理任何在途实例...", "Cancelling allocation & cleaning up any in-flight VM..."), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async cancelProvision(opId, triggerEl = null) {
+      return runLocked(`provision:cancel:${opId}`, triggerEl, async () => {
+        try {
+          await api(`/api/provision/${encodeURIComponent(opId)}/cancel`, { method: "POST" });
+          toast(tr("正在取消分配并清理任何在途实例...", "Cancelling allocation & cleaning up any in-flight VM..."), "ok");
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
     },
     openForwardModal(sessionName) {
       openModal(`
         <h3 style="font-size:15px;font-weight:600;margin-bottom:14px;">${tr("映射云端端口至本机 127.0.0.1", "Forward Colab VM Port to 127.0.0.1")}</h3>
-        <form onsubmit="window._app.submitForward(event, '${esc(sessionName)}')" class="form-grid">
+        <form data-submit="forward" data-session-name="${esc(sessionName)}" class="form-grid">
           <div class="field">
             <label>${tr("云端 VM 端口 (禁填 8080)", "Colab VM Port (avoid 8080)")}</label>
             <input type="number" id="f-rport" min="1024" max="65535" value="8000" required />
@@ -1580,7 +2021,7 @@
             <input type="text" id="f-label" value="Custom Service" />
           </div>
           <div class="field full row-actions" style="justify-content:flex-end;margin-top:8px;">
-            <button type="button" class="btn" onclick="window._app.closeModal()">${tr("取消", "Cancel")}</button>
+            <button type="button" class="btn" data-action="close-modal">${tr("取消", "Cancel")}</button>
             <button type="submit" class="btn btn-primary">${tr("开启映射", "Start Forward")}</button>
           </div>
         </form>
@@ -1626,6 +2067,7 @@
     },
     async sendChat(ev) {
       ev.preventDefault();
+      if (state.chatBusy) return;
       const inp = document.getElementById("chat-input");
       const text = (inp?.value ?? state.chatDraft ?? "").trim();
       if (!text) return;
@@ -1676,14 +2118,14 @@
                 "1. Open the link below to authorize your Google account in the browser;<br/>2. Paste the returned Authorization Code below:"
               )}
         </p>
-        ${!isMock ? `<div style="margin-bottom:12px;"><a href="${esc(flow.auth_url)}" target="_blank" class="btn btn-sm btn-primary">${tr("打开 Google 官方授权页面", "Open Google Authorization Page")}</a></div>` : ""}
-        <form onsubmit="window._app.completeLogin(event, '${esc(flow.flow_id)}')" class="form-grid">
+        ${!isMock ? `<div style="margin-bottom:12px;"><a href="${esc(safeHttpUrl(flow.auth_url))}" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-primary">${tr("打开 Google 官方授权页面", "Open Google Authorization Page")}</a></div>` : ""}
+        <form data-submit="complete-login" data-flow-id="${esc(flow.flow_id)}" class="form-grid">
           <div class="field full">
             <label>${isMock ? tr("模拟邮箱或任意授权码", "Simulated Email or Auth Code") : tr("Google 授权码 (Authorization Code)", "Google Authorization Code")}</label>
-            <input type="text" id="oauth-code" required placeholder="${isMock ? "researcher@gmail.com" : "4/0AeanS0..."}" />
+            <input type="text" id="oauth-code" autocomplete="off" required placeholder="${isMock ? "researcher@gmail.com" : "4/0AeanS0..."}" />
           </div>
           <div class="field full row-actions" style="justify-content:flex-end;">
-            <button type="button" class="btn" onclick="window._app.closeModal()">${tr("取消", "Cancel")}</button>
+            <button type="button" class="btn" data-action="close-modal">${tr("取消", "Cancel")}</button>
             <button type="submit" class="btn btn-primary">${tr("完成验证并保存", "Verify & Save Account")}</button>
           </div>
         </form>
@@ -1721,31 +2163,56 @@
         toast(err.message, "err");
       }
     },
-    async switchAccount(id) {
-      try {
-        const res = await api(`/api/accounts/${encodeURIComponent(id)}/switch`, { method: "POST" });
-        toast(
-          tr(
-            `已切换主操作账号${res.closed_tunnels ? `（自动关闭旧账号 ${res.closed_tunnels} 条本地隧道）` : ""}`,
-            `Switched active account${res.closed_tunnels ? ` (closed ${res.closed_tunnels} tunnel(s) from previous account)` : ""}`
-          ),
-          "ok"
-        );
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async switchAccount(id, triggerEl = null) {
+      return runLocked(`account:switch:${id}`, triggerEl, async () => {
+        try {
+          const res = await api(`/api/accounts/${encodeURIComponent(id)}/switch`, { method: "POST" });
+          toast(
+            tr(
+              `已切换主操作账号${res.closed_tunnels ? `（自动关闭旧账号 ${res.closed_tunnels} 条本地隧道）` : ""}`,
+              `Switched active account${res.closed_tunnels ? ` (closed ${res.closed_tunnels} tunnel(s) from previous account)` : ""}`
+            ),
+            "ok"
+          );
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
     },
-    async removeAccount(id) {
-      try {
-        await api(`/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
-        toast(tr("账号已从控制台移除", "Account removed from console"), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async removeAccount(id, meta = {}, triggerEl = null) {
+      if (isBusy(`account:remove:${id}`)) return;
+      const dispEmail = meta.email || id;
+      openConfirmModal(
+        {
+          tone: "danger",
+          title: () => tr("确认移除 Google 账号", "Confirm Remove Google Account"),
+          bodyHtml: () => `
+            <p>${tr(
+              `确定要从本机控制台移除账号 <strong>${esc(dispEmail)}</strong> 并清除其保存在系统凭据管理器中的 OAuth 凭证吗？`,
+              `Remove account <strong>${esc(dispEmail)}</strong> and delete its saved OAuth credentials from OS Keyring?`
+            )}</p>
+            <div class="confirm-cost-box">
+              <span>${tr("注意：移除账号不会自动停止该账号上仍在运行的云端 Colab 实例，请先确认已停止计费。", "Note: Removing an account does not stop active cloud Colab runtimes on that account. Stop billing first.")}</span>
+            </div>
+          `,
+          confirmLabel: () => tr("确认移除账号", "Confirm Remove Account"),
+        },
+        async () => {
+          closeModal();
+          await runLocked(`account:remove:${id}`, triggerEl, async () => {
+            try {
+              await api(`/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
+              toast(tr("账号已从控制台移除", "Account removed from console"), "ok");
+              await refreshBootstrap();
+            } catch (err) {
+              toast(err.message, "err");
+            }
+          });
+        }
+      );
     },
-    async saveGuardSettings(ev) {
+    async saveGuardSettings(ev, triggerEl = null) {
       ev.preventDefault();
       const guards = {
         auto_stop_minutes: Number(document.getElementById("set-autostop").value),
@@ -1755,37 +2222,61 @@
         max_vram_retries: Number(document.getElementById("set-retries").value),
         max_managed_sessions: Number(document.getElementById("set-maxsess").value),
       };
-      try {
-        await api("/api/settings", { method: "PATCH", body: JSON.stringify({ guards }) });
-        toast(tr("成本护栏配置已保存", "Cost guard settings saved"), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+      return runLocked("settings:guards", triggerEl, async () => {
+        try {
+          await api("/api/settings", { method: "PATCH", body: JSON.stringify({ guards }) });
+          toast(tr("成本护栏配置已保存", "Cost guard settings saved"), "ok");
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
     },
-    async saveSecret(slot, inputId) {
-      const val = document.getElementById(inputId).value.trim();
+    async saveSecret(slot, inputId, triggerEl = null) {
+      const inp = document.getElementById(inputId);
+      const val = inp ? inp.value.trim() : "";
       if (!val) return toast(tr("请输入有效 Token", "Please enter a valid token"), "err");
-      try {
-        await api(`/api/secrets/${encodeURIComponent(slot)}`, {
-          method: "PUT",
-          body: JSON.stringify({ value: val }),
-        });
-        document.getElementById(inputId).value = "";
-        toast(tr(`${slot} 已安全存入系统凭据管理器`, `${slot} saved to OS credential vault`), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+      return runLocked(`secret:save:${slot}`, triggerEl, async () => {
+        try {
+          await api(`/api/secrets/${encodeURIComponent(slot)}`, {
+            method: "PUT",
+            body: JSON.stringify({ value: val }),
+          });
+          if (inp) inp.value = "";
+          toast(tr(`${slot} 已安全存入系统凭据管理器`, `${slot} saved to OS credential vault`), "ok");
+          await refreshBootstrap();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
     },
-    async deleteSecret(slot) {
-      try {
-        await api(`/api/secrets/${encodeURIComponent(slot)}`, { method: "DELETE" });
-        toast(tr(`${slot} 已清除`, `${slot} cleared`), "ok");
-        await refreshBootstrap();
-      } catch (err) {
-        toast(err.message, "err");
-      }
+    async deleteSecret(slot, triggerEl = null) {
+      if (isBusy(`secret:delete:${slot}`)) return;
+      openConfirmModal(
+        {
+          tone: "danger",
+          title: () => tr("确认清除访问令牌", "Confirm Clear Secret Token"),
+          bodyHtml: () => `
+            <p>${tr(
+              `确定要从系统凭据管理器中清除 <code>${esc(slot)}</code> 吗？清除后需要受保护模型权重的部署模板将无法自动注入该令牌。`,
+              `Clear <code>${esc(slot)}</code> from OS Credential Manager? Recipes requiring this token will no longer receive it automatically.`
+            )}</p>
+          `,
+          confirmLabel: () => tr("确认清除密钥", "Confirm Clear Token"),
+        },
+        async () => {
+          closeModal();
+          await runLocked(`secret:delete:${slot}`, triggerEl, async () => {
+            try {
+              await api(`/api/secrets/${encodeURIComponent(slot)}`, { method: "DELETE" });
+              toast(tr(`${slot} 已清除`, `${slot} cleared`), "ok");
+              await refreshBootstrap();
+            } catch (err) {
+              toast(err.message, "err");
+            }
+          });
+        }
+      );
     },
     async setMockScenario(sc) {
       try {
@@ -1797,6 +2288,186 @@
       }
     },
   };
+
+  /* ========================== Delegated Event Handlers ========================== */
+
+  async function handleActionClick(ev) {
+    if (!ev.target || typeof ev.target.closest !== "function") return;
+    const el = ev.target.closest("[data-action]");
+    if (!el || el.disabled) return;
+    const action = el.dataset.action;
+    if (action === "close-modal") {
+      closeModal();
+    } else if (action === "confirm-ok") {
+      const fn = state.pendingConfirm;
+      state.pendingConfirm = null;
+      if (typeof fn === "function") await fn();
+    } else if (action === "confirm-mode-switch") {
+      const nextMode = el.dataset.nextMode || "mock";
+      closeModal();
+      try {
+        await api("/api/settings", { method: "PATCH", body: JSON.stringify({ backend_mode: nextMode }) });
+        toast(
+          nextMode === "real"
+            ? tr("已切换至真实 Colab 模式", "Switched to Real Colab Mode")
+            : tr("已切换至演示沙盒模式", "Switched to Sandbox Demo Mode"),
+          "ok"
+        );
+        await refreshBootstrap();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    } else if (action === "retry-stop-all") {
+      await executeStopAll(el);
+    } else if (action === "dismiss-alert") {
+      state.zeroBurnAlert = null;
+      renderGlobalAlert();
+    } else if (action === "go") {
+      window._app.go(el.dataset.route || "overview");
+    } else if (action === "refresh-usage") {
+      await window._app.refreshUsage();
+    } else if (action === "refresh-bootstrap") {
+      try {
+        await refreshBootstrap();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    } else if (action === "pick-recipe") {
+      window._app.pickRecipe(el.dataset.recipeId || "");
+    } else if (action === "pick-gpu-tier") {
+      window._app.pickGpuTier(
+        el.dataset.recipeId || "",
+        el.dataset.accel || "G4",
+        Number(el.dataset.minVram || 0),
+        el.dataset.highMem === "1"
+      );
+    } else if (action === "update-draft-click") {
+      window._app.updateDraft(
+        el.dataset.recipeId || "",
+        el.dataset.key || "",
+        el.dataset.val || "",
+        el.dataset.rerender === "1"
+      );
+    } else if (action === "toggle-advanced") {
+      window._app.toggleAdvanced(el.dataset.recipeId || "");
+    } else if (action === "analyze-gguf") {
+      await window._app.analyzeGguf();
+    } else if (action === "pick-curated-repo") {
+      window._app.pickCuratedRepo(el.dataset.repo || "");
+    } else if (action === "apply-hw-row") {
+      window._app.applyHardwareRow(el.dataset.accel || "A100", Number(el.dataset.minVram || 0));
+    } else if (action === "cancel-run") {
+      await window._app.cancelRun(el.dataset.runId || "", { sessionName: el.dataset.sessionName || "" }, el);
+    } else if (action === "sync-keep") {
+      await window._app.syncKeep(el.dataset.runId || "", el);
+    } else if (action === "copy-text") {
+      await window._app.copyText(el.dataset.text || "");
+    } else if (action === "open-new-session") {
+      window._app.openNewSessionModal();
+    } else if (action === "cancel-provision") {
+      await window._app.cancelProvision(el.dataset.opId || "", el);
+    } else if (action === "extend-session") {
+      await window._app.extendSession(el.dataset.sessionName || "", el);
+    } else if (action === "open-forward") {
+      window._app.openForwardModal(el.dataset.sessionName || "");
+    } else if (action === "stop-session") {
+      await window._app.stopSession(
+        el.dataset.endpoint || "",
+        el.dataset.accountId || "",
+        { sessionName: el.dataset.sessionName || "", accelerator: el.dataset.accelerator || "" },
+        el
+      );
+    } else if (action === "close-tunnel") {
+      await window._app.closeTunnel(el.dataset.tunnelId || "");
+    } else if (action === "import-cli-account") {
+      await window._app.importCliAccount();
+    } else if (action === "open-login") {
+      await window._app.openLoginModal();
+    } else if (action === "switch-account") {
+      await window._app.switchAccount(el.dataset.accountId || "", el);
+    } else if (action === "remove-account") {
+      await window._app.removeAccount(el.dataset.accountId || "", { email: el.dataset.email || "" }, el);
+    } else if (action === "save-secret") {
+      await window._app.saveSecret(el.dataset.slot || "", el.dataset.inputId || "", el);
+    } else if (action === "delete-secret") {
+      await window._app.deleteSecret(el.dataset.slot || "", el);
+    } else if (action === "set-mock-scenario") {
+      await window._app.setMockScenario(el.dataset.scenario || "demo");
+    } else if (action === "cmd-exec") {
+      const kind = el.dataset.cmdKind || "";
+      const arg = el.dataset.cmdArg || "";
+      if (kind === "go") {
+        closeModal();
+        window._app.go(arg);
+      } else if (kind === "new-session") {
+        window._app.openNewSessionModal();
+      } else if (kind === "refresh-usage") {
+        closeModal();
+        await window._app.refreshUsage();
+      } else if (kind === "pick-recipe") {
+        closeModal();
+        window._app.pickRecipe(arg);
+      }
+    }
+  }
+
+  function handleFieldInput(ev) {
+    const el = ev.target;
+    if (!el || !el.dataset) return;
+    const mode = el.dataset.input;
+    if (mode === "draft") {
+      window._app.updateDraft(el.dataset.recipeId || "", el.dataset.key || "", parseDraftFieldValue(el), false);
+    } else if (mode === "chat-meta") {
+      window._app.setChatMeta(el.dataset.metaField || "", el.value);
+    } else if (mode === "cmd-filter") {
+      window._app.filterCmdPalette(el.value);
+    }
+  }
+
+  function handleFieldChange(ev) {
+    const el = ev.target;
+    if (!el || !el.dataset) return;
+    const mode = el.dataset.change;
+    if (mode === "draft") {
+      window._app.updateDraft(
+        el.dataset.recipeId || "",
+        el.dataset.key || "",
+        parseDraftFieldValue(el),
+        el.dataset.rerender === "1"
+      );
+    } else if (mode === "chat-tunnel") {
+      window._app.setChatTunnel(el.value);
+    }
+  }
+
+  async function handleFormSubmit(ev) {
+    const form = ev.target && typeof ev.target.closest === "function" ? ev.target.closest("form[data-submit]") : ev.target;
+    if (!form || !form.dataset || !form.dataset.submit) return;
+    const kind = form.dataset.submit;
+    const submitBtn = typeof form.querySelector === "function" ? form.querySelector('button[type="submit"]') : null;
+    if (kind === "deploy") {
+      await window._app.submitDeploy(ev, submitBtn);
+    } else if (kind === "chat") {
+      await window._app.sendChat(ev);
+    } else if (kind === "guard-settings") {
+      await window._app.saveGuardSettings(ev, submitBtn);
+    } else if (kind === "new-session") {
+      await window._app.submitNewSession(ev, submitBtn);
+    } else if (kind === "forward") {
+      await window._app.submitForward(ev, form.dataset.sessionName || "");
+    } else if (kind === "complete-login") {
+      await window._app.completeLogin(ev, form.dataset.flowId || "");
+    }
+  }
+
+  ["main-view", "modal-body", "global-alert-banner"].forEach((cid) => {
+    const container = document.getElementById(cid);
+    if (!container || typeof container.addEventListener !== "function") return;
+    container.addEventListener("click", handleActionClick);
+    container.addEventListener("input", handleFieldInput);
+    container.addEventListener("change", handleFieldChange);
+    container.addEventListener("submit", handleFormSubmit);
+  });
 
   /* ========================== Topbar Bindings, Hotkeys & WebSocket ========================== */
 
@@ -1840,21 +2511,10 @@
             )}
       </p>
       <div class="row-actions" style="justify-content:flex-end;">
-        <button class="btn" type="button" onclick="window._app.closeModal()">${tr("取消", "Cancel")}</button>
-        <button class="btn btn-primary" type="button" id="confirm-mode-switch">${nextMode === "real" ? tr("确认切换至真实模式", "Switch to Real Mode") : tr("确认切换至演示沙盒", "Switch to Sandbox Demo")}</button>
+        <button class="btn" type="button" data-action="close-modal">${tr("取消", "Cancel")}</button>
+        <button class="btn ${nextMode === "real" ? "btn-danger" : "btn-primary"}" type="button" id="confirm-mode-switch" data-action="confirm-mode-switch" data-next-mode="${esc(nextMode)}">${nextMode === "real" ? tr("确认切换至真实模式", "Switch to Real Mode") : tr("确认切换至演示沙盒", "Switch to Sandbox Demo")}</button>
       </div>
     `, { type: "toggle_mode", nextMode });
-    document.getElementById("confirm-mode-switch").onclick = async () => {
-      closeModal();
-      await api("/api/settings", { method: "PATCH", body: JSON.stringify({ backend_mode: nextMode }) });
-      toast(
-        nextMode === "real"
-          ? tr("已切换至真实 Colab 模式", "Switched to Real Colab Mode")
-          : tr("已切换至演示沙盒模式", "Switched to Sandbox Demo Mode"),
-        "ok"
-      );
-      await refreshBootstrap();
-    };
   }
 
   document.getElementById("btn-toggle-mode").addEventListener("click", async () => {
@@ -1862,32 +2522,37 @@
     openToggleModeModal(nextMode);
   });
 
-  document.getElementById("btn-stop-all").addEventListener("click", async () => {
-    try {
-      const res = await api("/api/sessions/stop-all", { method: "POST" });
-      toast(
-        tr(
-          `已全部释放 ${res.stopped_count} 个实例（零残留核验: ${res.zero_burn_verified ? "通过" : "请检查"}）`,
-          `Released ${res.stopped_count} runtime(s) (Zero-burn check: ${res.zero_burn_verified ? "Verified" : "Check sessions"})`
-        ),
-        "ok"
-      );
-      await refreshBootstrap();
-    } catch (err) {
-      toast(err.message, "err");
-    }
+  document.getElementById("btn-stop-all").addEventListener("click", async (ev) => {
+    if (isBusy("sessions:stop-all")) return;
+    requestStopAll(ev.currentTarget || document.getElementById("btn-stop-all"));
   });
 
   document.getElementById("btn-lang").addEventListener("click", async () => {
-    const next = state.settings.language === "en" ? "zh-CN" : "en";
-    await api("/api/settings", { method: "PATCH", body: JSON.stringify({ language: next }) });
-    await refreshBootstrap();
+    if (state.busy["settings:lang"]) return;
+    state.busy["settings:lang"] = true;
+    try {
+      const next = state.settings.language === "en" ? "zh-CN" : "en";
+      await api("/api/settings", { method: "PATCH", body: JSON.stringify({ language: next }) });
+      await refreshBootstrap();
+    } catch (err) {
+      toast(err.message, "err");
+    } finally {
+      delete state.busy["settings:lang"];
+    }
   });
 
   document.getElementById("btn-theme").addEventListener("click", async () => {
-    const next = state.settings.theme === "light" ? "dark" : "light";
-    await api("/api/settings", { method: "PATCH", body: JSON.stringify({ theme: next }) });
-    await refreshBootstrap();
+    if (state.busy["settings:theme"]) return;
+    state.busy["settings:theme"] = true;
+    try {
+      const next = state.settings.theme === "light" ? "dark" : "light";
+      await api("/api/settings", { method: "PATCH", body: JSON.stringify({ theme: next }) });
+      await refreshBootstrap();
+    } catch (err) {
+      toast(err.message, "err");
+    } finally {
+      delete state.busy["settings:theme"];
+    }
   });
 
   function connectEventsWs() {
