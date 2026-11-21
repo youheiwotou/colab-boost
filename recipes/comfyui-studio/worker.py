@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 ENV = os.environ.get
@@ -28,11 +29,79 @@ CIVITAI_TOKEN = ENV("BOOST_CIVITAI_TOKEN") or ""
 SECRETS = [s for s in (HF_TOKEN, CIVITAI_TOKEN) if s and len(s) >= 4]
 
 _proc: list[subprocess.Popen | None] = [None]
+_stage = ["setup"]
+
+
+def _scrub(text: str) -> str:
+    for sec in SECRETS:
+        text = text.replace(sec, "***")
+    return text
+
+
+def _is_trusted_civitai_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme.lower() == "https" and (host == "civitai.com" or host.endswith(".civitai.com"))
+
+
+def _build_curl_auth_config(token: str) -> str:
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in token):
+        raise ValueError("Invalid Civitai token: contains control characters or newlines")
+    escaped = token.replace("\\", "\\\\").replace('"', '\\"')
+    return f'header = "Authorization: Bearer {escaped}"\n'
+
+
+def _read_log_tail(log_path: str, max_lines: int = 8, max_chars: int = 360) -> str:
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()[-max_lines:]
+        tail = " | ".join(line.strip() for line in lines if line.strip())
+        return _scrub(tail)[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _terminate_proc(proc: subprocess.Popen | None, grace_s: float = 5.0) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        pass
+    if proc.poll() is None:
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sigkill)
+            else:
+                proc.kill()
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
 
 
 def set_status(state: str, stage: str, msg: str, progress: float | None = None, outputs: dict | None = None) -> None:
-    for sec in SECRETS:
-        msg = msg.replace(sec, "***")
+    _stage[0] = stage
+    msg = _scrub(msg)
     doc: dict = {"state": state, "stage": stage, "message": msg, "updated_at": time.time()}
     if progress is not None:
         doc["progress"] = progress
@@ -49,6 +118,9 @@ def set_status(state: str, stage: str, msg: str, progress: float | None = None, 
 def beat() -> None:
     if HEARTBEAT_FILE:
         try:
+            parent = os.path.dirname(HEARTBEAT_FILE)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(HEARTBEAT_FILE, "a", encoding="utf-8"):
                 pass
             os.utime(HEARTBEAT_FILE, None)
@@ -60,10 +132,13 @@ def on_sigterm(*_) -> None:
     p = _proc[0]
     if p and p.poll() is None:
         try:
-            os.killpg(p.pid, signal.SIGTERM)
+            if hasattr(os, "killpg"):
+                os.killpg(p.pid, signal.SIGTERM)
+            else:
+                p.terminate()
         except OSError:
             pass
-    set_status("failed", "server", "Cancelled")
+    set_status("failed", _stage[0], "Cancelled")
     os._exit(143)
 
 
@@ -106,9 +181,9 @@ def main() -> int:
             out_name = os.path.basename(CKPT_FILE) if CKPT_FILE else "civitai_model.safetensors"
             curl_cmd = ["curl", "-fsSL", "-L", "--retry", "3", "-o", os.path.join(dest, out_name)]
             curl_stdin = None
-            if CIVITAI_TOKEN and "civitai.com" in CKPT_REPO.lower():
+            if CIVITAI_TOKEN and _is_trusted_civitai_url(CKPT_REPO):
                 curl_cmd += ["-K", "-"]
-                curl_stdin = f'header = "Authorization: Bearer {CIVITAI_TOKEN}"\n'
+                curl_stdin = _build_curl_auth_config(CIVITAI_TOKEN)
             curl_cmd.append(CKPT_REPO)
             subprocess.run(curl_cmd, input=curl_stdin, text=True, env=clean_env, check=True)
         else:
@@ -130,16 +205,17 @@ def main() -> int:
 
     set_status("running", "server", f"Starting ComfyUI on 127.0.0.1:{PORT}...", progress=0.8)
     clean_env = {k: v for k, v in os.environ.items() if not k.startswith("BOOST_")}
-    log_fh = open(os.path.join(RUN_DIR, "comfyui.log"), "w", encoding="utf-8")
-    proc = subprocess.Popen(
-        [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(PORT)],
-        cwd=COMFY_DIR,
-        env=clean_env,
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    log_path = os.path.join(RUN_DIR, "comfyui.log")
+    with open(log_path, "w", encoding="utf-8") as log_fh:
+        proc = subprocess.Popen(
+            [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(PORT)],
+            cwd=COMFY_DIR,
+            env=clean_env,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     _proc[0] = proc
 
     t0 = time.time()
@@ -159,7 +235,14 @@ def main() -> int:
 
     if not up:
         stop_hb.set()
-        set_status("failed", "server", "ComfyUI failed to pass /system_stats check")
+        _terminate_proc(proc)
+        _proc[0] = None
+        tail = _read_log_tail(log_path)
+        set_status(
+            "failed",
+            "server",
+            f"ComfyUI failed to pass /system_stats check{': ' + tail if tail else ''}",
+        )
         return 1
 
     stop_hb.set()
@@ -167,13 +250,18 @@ def main() -> int:
     while True:
         time.sleep(30)
         if proc.poll() is not None:
-            set_status("failed", "server", "ComfyUI server stopped")
+            tail = _read_log_tail(log_path)
+            set_status("failed", "server", f"ComfyUI server stopped{': ' + tail if tail else ''}")
             return 1
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except SystemExit:
+        raise
     except Exception as _exc:
-        set_status("failed", "setup", f"Worker failed: {_exc}")
+        _terminate_proc(_proc[0])
+        _proc[0] = None
+        set_status("failed", _stage[0], f"Worker failed: {_exc}")
         sys.exit(1)

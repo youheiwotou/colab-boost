@@ -15,6 +15,7 @@ Eliminates sequential cold-start bottlenecks on Colab G4 Blackwell (96GB) by:
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -96,12 +97,86 @@ HF_TOKEN = ENV("BOOST_HF_TOKEN") or ""
 SECRETS = [s for s in (HF_TOKEN,) if s and len(s) >= 4]
 _PROC: list[subprocess.Popen | None] = [None]
 _STATUS_LOCK = threading.Lock()
+_STAGE = ["hardware"]
 
 
 def scrub(text: str) -> str:
     for sec in SECRETS:
         text = text.replace(sec, "***")
     return text
+
+
+def _is_trusted_hf_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme.lower() == "https" and (host == "huggingface.co" or host.endswith(".huggingface.co"))
+
+
+def _read_log_tail(log_path: str | Path, max_lines: int = 8, max_chars: int = 360) -> str:
+    try:
+        lines = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
+        tail = " | ".join(line.strip() for line in lines if line.strip())
+        return scrub(tail)[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _terminate_proc(proc: subprocess.Popen | None, grace_s: float = 5.0) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        pass
+    if proc.poll() is None:
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sigkill)
+            else:
+                proc.kill()
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+
+
+def _write_status_lockfree(state: str, stage: str, msg: str) -> None:
+    """Signal-safe atomic status write that never acquires ``_STATUS_LOCK``."""
+    payload = json.dumps(
+        {"state": state, "stage": stage, "message": scrub(msg), "updated_at": time.time()}
+    ).encode("utf-8")
+    tmp = f"{STATUS_FILE}.sig.{os.getpid()}.tmp"
+    try:
+        parent = os.path.dirname(STATUS_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        os.replace(tmp, STATUS_FILE)
+    except OSError:
+        pass
 
 
 def set_status(
@@ -111,6 +186,7 @@ def set_status(
     progress: float | None = None,
     outputs: dict | None = None,
 ) -> None:
+    _STAGE[0] = stage
     clean_msg = scrub(msg)
     doc: dict = {"state": state, "stage": stage, "message": clean_msg, "updated_at": time.time()}
     if progress is not None:
@@ -149,10 +225,13 @@ def on_sigterm(*_) -> None:
     proc = _PROC[0]
     if proc is not None and proc.poll() is None:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
         except OSError:
             pass
-    set_status("failed", "server", "Cancelled by user")
+    _write_status_lockfree("failed", _STAGE[0], "Cancelled by user")
     os._exit(143)
 
 
@@ -234,7 +313,7 @@ def download_sage_wheel_from_spec(spec: str, dest_dir: Path) -> Path:
     if not fname.endswith(".whl"):
         fname += ".whl"
     out_path = dest_dir / fname
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if (HF_TOKEN and "huggingface.co" in parsed.netloc.lower()) else {}
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if (HF_TOKEN and _is_trusted_hf_url(spec)) else {}
     req = urllib.request.Request(spec, headers=headers)
     tmp = out_path.with_suffix(".whl.part")
     with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as fh:
@@ -254,7 +333,7 @@ def track_a_install_env(hw: dict, uv_bin: str) -> dict:
 
     py_bin = target_python()
     if PYTORCH_MODE != "reuse_system" and not py_bin.is_file():
-        subprocess.run([uv_bin, "venv", "--python", sys.executable, str(VENV_DIR)], check=True)
+        subprocess.run([uv_bin, "venv", "--seed", "--python", sys.executable, str(VENV_DIR)], check=True)
 
     pip_base = [uv_bin, "pip", "install", "--python", str(py_bin)]
     has_torch = subprocess.run(
@@ -294,7 +373,7 @@ def track_a_install_env(hw: dict, uv_bin: str) -> dict:
                 try:
                     sage_dir = WORK / "SageAttention"
                     shallow_checkout_repo(SAGE_REPO, sage_dir, SAGE_COMMIT)
-                    subprocess.run([*pip_base, "ninja", "packaging", "wheel", "setuptools"], check=True)
+                    subprocess.run([*pip_base, "pip", "ninja", "packaging", "wheel", "setuptools"], check=True)
                     build_env = clean_child_env()
                     build_env.update({
                         "TORCH_CUDA_ARCH_LIST": hw["compute_cap"],
@@ -303,18 +382,31 @@ def track_a_install_env(hw: dict, uv_bin: str) -> dict:
                         "MAX_JOBS": "4",
                     })
                     WHEELS_DIR.mkdir(parents=True, exist_ok=True)
-                    subprocess.run(
+                    build_res = subprocess.run(
                         [str(py_bin), "-m", "pip", "wheel", "--no-build-isolation", "--no-deps", "-w", str(WHEELS_DIR), str(sage_dir)],
                         env=build_env,
-                        check=True,
+                        capture_output=True,
+                        text=True,
                     )
+                    if build_res.returncode != 0:
+                        err_lines = [ln.strip() for ln in (build_res.stderr or build_res.stdout or "").splitlines() if ln.strip()]
+                        err_tail = " | ".join(err_lines[-6:])[-240:] if err_lines else f"exit code {build_res.returncode}"
+                        raise RuntimeError(f"pip wheel failed ({err_tail})")
                     built = sorted(WHEELS_DIR.glob("sageattention*.whl"))
                     if built:
                         subprocess.run([*pip_base, "--no-deps", str(built[0])], check=True)
                         stats["compiled_sage_wheel"] = built[0].name
                         use_sage = True
+                    else:
+                        raise RuntimeError("pip wheel succeeded but produced no sageattention*.whl")
                 except Exception as exc:
-                    stats["sage_fallback_reason"] = str(exc)[:180]
+                    reason = scrub(str(exc))[:240]
+                    stats["sage_fallback_reason"] = reason
+                    set_status(
+                        "running",
+                        "parallel_setup",
+                        f"SageAttention compile failed ({reason}); falling back to PyTorch attention.",
+                    )
                     use_sage = False
                 stats["compile_sage_s"] = round(time.monotonic() - t_sc, 2)
 
@@ -343,6 +435,19 @@ def _ensure_aria2c() -> str | None:
     if rc == 0:
         subprocess.run(["apt-get", "install", "-y", "-qq", "aria2"], capture_output=True)
     return shutil.which("aria2c")
+
+
+def _build_hf_download_env(repo_id: str, revision: str, remote_path: str, dl_root: Path) -> dict[str, str]:
+    dl_env = {
+        **clean_child_env(include_hf=True),
+        "DL_REPO": repo_id,
+        "DL_REV": revision,
+        "DL_FILE": remote_path,
+        "DL_ROOT": str(dl_root),
+    }
+    if importlib.util.find_spec("hf_transfer") is not None:
+        dl_env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    return dl_env
 
 
 def _download_one_model(
@@ -376,14 +481,12 @@ def _download_one_model(
         ]
         subprocess.run(cmd, env=clean_child_env(), check=True)
     else:
-        dl_env = {
-            **clean_child_env(include_hf=True),
-            "HF_HUB_ENABLE_HF_TRANSFER": "1",
-            "DL_REPO": repo_id,
-            "DL_REV": revision,
-            "DL_FILE": remote_path,
-            "DL_ROOT": str(MODELS_DIR if "/" in remote_path else local_dest.parent),
-        }
+        dl_env = _build_hf_download_env(
+            repo_id,
+            revision,
+            remote_path,
+            MODELS_DIR if "/" in remote_path else local_dest.parent,
+        )
         code = (
             "import os; from huggingface_hub import hf_hub_download; "
             "hf_hub_download(repo_id=os.environ['DL_REPO'], filename=os.environ['DL_FILE'], "
@@ -505,7 +608,8 @@ def launch_comfy(use_sage: bool) -> float:
         attn_flag,
     ]
     t0 = time.monotonic()
-    with open(os.path.join(RUN_DIR, "comfyui_h3.log"), "w", encoding="utf-8") as log_fh:
+    log_path = os.path.join(RUN_DIR, "comfyui_h3.log")
+    with open(log_path, "w", encoding="utf-8") as log_fh:
         proc = subprocess.Popen(
             cmd,
             cwd=str(COMFY_DIR),
@@ -525,7 +629,13 @@ def launch_comfy(use_sage: bool) -> float:
             return round(time.monotonic() - t0, 2)
         beat()
         time.sleep(2.0)
-    raise RuntimeError(f"MiniMax-H3 ComfyUI failed to pass /system_stats on port {PORT}")
+
+    _terminate_proc(proc)
+    _PROC[0] = None
+    tail = _read_log_tail(log_path)
+    raise RuntimeError(
+        f"MiniMax-H3 ComfyUI failed to pass /system_stats on port {PORT}{': ' + tail if tail else ''}"
+    )
 
 
 def main() -> int:
@@ -626,14 +736,22 @@ def main() -> int:
         )
 
         proc = _PROC[0]
+        log_path = os.path.join(RUN_DIR, "comfyui_h3.log")
         while True:
             time.sleep(30)
             if proc is not None and proc.poll() is not None:
-                set_status("failed", "server", "MiniMax-H3 ComfyUI server exited unexpectedly")
+                tail = _read_log_tail(log_path)
+                set_status(
+                    "failed",
+                    "server",
+                    f"MiniMax-H3 ComfyUI server exited unexpectedly{': ' + tail if tail else ''}",
+                )
                 return 1
     except Exception as exc:
         stop_hb.set()
-        set_status("failed", "parallel_setup", f"MiniMax-H3 setup failed: {exc}")
+        _terminate_proc(_PROC[0])
+        _PROC[0] = None
+        set_status("failed", _STAGE[0], f"MiniMax-H3 setup failed: {exc}")
         return 1
 
 

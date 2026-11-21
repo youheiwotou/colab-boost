@@ -95,7 +95,57 @@ def write_status(state: str, stage: str | None = None, message: str = "",
     os.replace(tmp, STATUS_FILE)
 
 
+def _read_log_tail(log_path: str, max_lines: int = 8, max_chars: int = 360) -> str:
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()[-max_lines:]
+        tail = " | ".join(x.strip() for x in lines if x.strip())
+        return scrub(tail)[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _terminate_proc(proc: subprocess.Popen | None, grace_s: float = 5.0) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        pass
+    if proc.poll() is None:
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sigkill)
+            else:
+                proc.kill()
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+
+
 def abort(msg: str) -> None:
+    _terminate_proc(_server_proc[0])
+    _server_proc[0] = None
     write_status("failed", message=msg)
     sys.exit(1)
 
@@ -383,7 +433,10 @@ def on_terminate(*_) -> None:
     proc = _server_proc[0]
     if proc is not None and proc.poll() is None:
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
         except OSError:
             pass
     write_status("failed", message="Cancelled by user")
@@ -498,6 +551,16 @@ def main() -> int:
     healthy = False
     proc = None
     log_path = os.path.join(RUN_DIR, "server.log")
+    with open(log_path, "w", encoding="utf-8"):
+        pass
+
+    extra_flags: list[str] = []
+    if EXTRA_ARGS.strip():
+        try:
+            extra_flags = shlex.split(EXTRA_ARGS)
+        except ValueError as exc:
+            abort(f"Invalid extra_args: {exc}")
+
     for idx, (kv_try, mtp_try) in enumerate(launch_attempts):
         plan["kv"] = kv_try
         cmd = [
@@ -512,13 +575,22 @@ def main() -> int:
             cmd += ["--spec-type", "draft-mtp"]
         if API_KEY:
             cmd += ["--api-key", API_KEY]
-        if EXTRA_ARGS.strip():
-            cmd += shlex.split(EXTRA_ARGS)
+        if extra_flags:
+            cmd += extra_flags
 
         suffix = f" (fallback #{idx}: KV={kv_try}, MTP={'on' if mtp_try else 'off'})" if idx > 0 else ""
         write_status("running", "server", f"Starting llama-server on 127.0.0.1:{PORT}{suffix}...")
-        srv_log = open(log_path, "w", encoding="utf-8")
-        proc = subprocess.Popen(cmd, env=runtime_env(bindir), stdout=srv_log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+        with open(log_path, "a", encoding="utf-8") as srv_log:
+            srv_log.write(f"\n===== Attempt #{idx + 1} (KV={kv_try}, MTP={'on' if mtp_try else 'off'}) =====\n")
+            srv_log.flush()
+            proc = subprocess.Popen(
+                cmd,
+                env=runtime_env(bindir),
+                stdout=srv_log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         _server_proc[0] = proc
 
         t0 = time.time()
@@ -534,27 +606,34 @@ def main() -> int:
             time.sleep(2.5)
         if healthy:
             break
+        _terminate_proc(proc)
+        _server_proc[0] = None
+        proc = None
 
     if not healthy or proc is None:
-        tail = ""
-        try:
-            lines = open(log_path, encoding="utf-8", errors="replace").read().splitlines()[-6:]
-            tail = " | ".join(x.strip() for x in lines if x.strip())[-220:]
-        except OSError:
-            pass
+        stop_hb.set()
+        _terminate_proc(_server_proc[0])
+        _server_proc[0] = None
+        tail = _read_log_tail(log_path)
         abort(f"llama-server failed to pass /health check{': ' + tail if tail else ''}")
 
     if gpu_name and gpu_used_mib() < 512:
+        stop_hb.set()
         abort("GPU VRAM usage < 512 MiB after model load; aborting suspected CPU fallback")
 
     write_status("running", "warmup", "Running CUDA kernel JIT warm-up & tok/s benchmark...")
     auth_hdr = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
-    res = http_get_json(
-        f"http://127.0.0.1:{PORT}/v1/chat/completions",
-        headers=auth_hdr,
-        data={"messages": [{"role": "user", "content": "Say hello in one short sentence."}], "max_tokens": 48},
-        timeout=300,
-    )
+    try:
+        res = http_get_json(
+            f"http://127.0.0.1:{PORT}/v1/chat/completions",
+            headers=auth_hdr,
+            data={"messages": [{"role": "user", "content": "Say hello in one short sentence."}], "max_tokens": 48},
+            timeout=300,
+        )
+    except Exception as exc:
+        stop_hb.set()
+        tail = _read_log_tail(log_path)
+        abort(f"CUDA warm-up failed: {exc}{': ' + tail if tail else ''}")
     tps = round(float((res.get("timings") or {}).get("predicted_per_second") or 0.0), 1)
     stop_hb.set()
 
@@ -574,7 +653,8 @@ def main() -> int:
     while True:
         time.sleep(30)
         if proc.poll() is not None:
-            abort("llama-server terminated unexpectedly")
+            tail = _read_log_tail(log_path)
+            abort(f"llama-server terminated unexpectedly{': ' + tail if tail else ''}")
         try:
             slots = http_get_json(f"http://127.0.0.1:{PORT}/slots", headers=auth_hdr, timeout=8)
             if isinstance(slots, list) and any(isinstance(s, dict) and s.get("is_processing") for s in slots):
@@ -584,4 +664,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as _exc:
+        _terminate_proc(_server_proc[0])
+        _server_proc[0] = None
+        write_status("failed", message=f"Worker failed: {_exc}")
+        sys.exit(1)

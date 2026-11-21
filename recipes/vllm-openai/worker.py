@@ -29,6 +29,7 @@ HF_TOKEN = ENV("BOOST_HF_TOKEN") or ""
 SECRETS = [s for s in (API_KEY, HF_TOKEN) if s and len(s) >= 4]
 
 _proc: list[subprocess.Popen | None] = [None]
+_stage = ["detect"]
 
 
 def scrub(text: str) -> str:
@@ -37,7 +38,56 @@ def scrub(text: str) -> str:
     return text
 
 
+def _read_log_tail(log_path: str, max_lines: int = 8, max_chars: int = 360) -> str:
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()[-max_lines:]
+        tail = " | ".join(line.strip() for line in lines if line.strip())
+        return scrub(tail)[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _terminate_proc(proc: subprocess.Popen | None, grace_s: float = 5.0) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        pass
+    if proc.poll() is None:
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sigkill)
+            else:
+                proc.kill()
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+
+
 def set_status(state: str, stage: str, message: str, progress: float | None = None, outputs: dict | None = None) -> None:
+    _stage[0] = stage
     doc: dict = {"state": state, "stage": stage, "message": scrub(message), "updated_at": time.time()}
     if progress is not None:
         doc["progress"] = progress
@@ -54,6 +104,9 @@ def set_status(state: str, stage: str, message: str, progress: float | None = No
 def beat() -> None:
     if HEARTBEAT_FILE:
         try:
+            parent = os.path.dirname(HEARTBEAT_FILE)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(HEARTBEAT_FILE, "a", encoding="utf-8"):
                 pass
             os.utime(HEARTBEAT_FILE, None)
@@ -65,10 +118,13 @@ def on_sigterm(*_) -> None:
     p = _proc[0]
     if p and p.poll() is None:
         try:
-            os.killpg(p.pid, signal.SIGTERM)
+            if hasattr(os, "killpg"):
+                os.killpg(p.pid, signal.SIGTERM)
+            else:
+                p.terminate()
         except OSError:
             pass
-    set_status("failed", "server", "Cancelled")
+    set_status("failed", _stage[0], "Cancelled")
     os._exit(143)
 
 
@@ -135,8 +191,16 @@ def main() -> int:
         cmd += ["--api-key", API_KEY]
 
     set_status("running", "server", f"Launching vLLM on port {PORT}...", progress=0.75)
-    log_fh = open(os.path.join(RUN_DIR, "vllm.log"), "w", encoding="utf-8")
-    proc = subprocess.Popen(cmd, env=clean_env, stdout=log_fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    log_path = os.path.join(RUN_DIR, "vllm.log")
+    with open(log_path, "w", encoding="utf-8") as log_fh:
+        proc = subprocess.Popen(
+            cmd,
+            env=clean_env,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     _proc[0] = proc
 
     t0 = time.time()
@@ -156,7 +220,14 @@ def main() -> int:
 
     if not ready:
         stop_hb.set()
-        set_status("failed", "server", "vLLM failed to reach /health; inspect vllm.log")
+        _terminate_proc(proc)
+        _proc[0] = None
+        tail = _read_log_tail(log_path)
+        set_status(
+            "failed",
+            "server",
+            f"vLLM failed to reach /health{': ' + tail if tail else '; inspect vllm.log'}",
+        )
         return 1
 
     stop_hb.set()
@@ -170,9 +241,18 @@ def main() -> int:
     while True:
         time.sleep(30)
         if proc.poll() is not None:
-            set_status("failed", "server", "vLLM server exited unexpectedly")
+            tail = _read_log_tail(log_path)
+            set_status("failed", "server", f"vLLM server exited unexpectedly{': ' + tail if tail else ''}")
             return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as _exc:
+        _terminate_proc(_proc[0])
+        _proc[0] = None
+        set_status("failed", _stage[0], f"Worker failed: {_exc}")
+        sys.exit(1)
