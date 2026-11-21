@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 import webbrowser
 
 import httpx
@@ -44,6 +46,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _default_api_url() -> str:
     return (os.environ.get("COLAB_BOOST_API_URL") or "http://127.0.0.1:8765").rstrip("/")
+
+
+def _default_api_token() -> str:
+    return os.environ.get("COLAB_BOOST_API_TOKEN", "").strip()
+
+
+def _is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 def _parse_kv_pairs(pairs: list[str]) -> dict[str, Any]:
@@ -119,6 +137,12 @@ def _build_client_parser() -> argparse.ArgumentParser:
 
 
 def _api_call(client: httpx.Client, method: str, path: str, **kwargs: Any) -> Any:
+    token = _default_api_token()
+    if token:
+        headers = dict(kwargs.pop("headers", None) or {})
+        if not any(k.lower() == "authorization" for k in headers):
+            headers["Authorization"] = f"Bearer {token}"
+        kwargs["headers"] = headers
     resp = client.request(method, path, **kwargs)
     try:
         payload = resp.json()
@@ -134,7 +158,8 @@ def _api_call(client: httpx.Client, method: str, path: str, **kwargs: Any) -> An
 def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None) -> int:
     args = _build_client_parser().parse_args(argv)
     owns_client = client is None
-    http = client or httpx.Client(base_url=args.api_url.rstrip("/"), timeout=300.0)
+    req_timeout = max(300.0, float(args.timeout) + 30.0) if args.cmd == "exec" else 300.0
+    http = client or httpx.Client(base_url=args.api_url.rstrip("/"), timeout=req_timeout)
     try:
         if args.cmd == "status":
             data = _api_call(http, "GET", "/api/bootstrap")
@@ -195,10 +220,11 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
             return 0 if run.get("state") not in ("failed", "cancelled") else 1
 
         if args.cmd == "exec":
+            sess_seg = quote(args.session, safe="")
             res = _api_call(
                 http,
                 "POST",
-                f"/api/sessions/{args.session}/exec",
+                f"/api/sessions/{sess_seg}/exec",
                 json={"code": args.code, "shell": args.shell, "timeout_s": args.timeout},
             )
             if args.as_json:
@@ -211,10 +237,11 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
             return 0 if res.get("ok") else 1
 
         if args.cmd == "upload":
+            sess_seg = quote(args.session, safe="")
             res = _api_call(
                 http,
                 "POST",
-                f"/api/sessions/{args.session}/upload",
+                f"/api/sessions/{sess_seg}/upload",
                 json={"local_path": args.local_path, "remote_path": args.remote_path},
             )
             if args.as_json:
@@ -224,10 +251,11 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
             return 0
 
         if args.cmd == "download":
+            sess_seg = quote(args.session, safe="")
             res = _api_call(
                 http,
                 "POST",
-                f"/api/sessions/{args.session}/download",
+                f"/api/sessions/{sess_seg}/download",
                 json={"remote_path": args.remote_path, "local_path": args.local_path},
             )
             if args.as_json:
@@ -237,12 +265,13 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
             return 0
 
         if args.cmd == "stop":
-            rc = _api_call(http, "POST", f"/api/sessions/{args.identifier}/stop")
+            id_seg = quote(args.identifier, safe="")
+            rc = _api_call(http, "POST", f"/api/sessions/{id_seg}/stop")
             if args.as_json:
                 print(json.dumps(rc, indent=2, ensure_ascii=False))
             else:
                 print(f"Stopped {rc['session_name']} (receipt={rc['receipt_id']}, verified={rc['verified_unassigned']})")
-            return 0
+            return 0 if rc.get("verified_unassigned") else 2
 
         if args.cmd == "stop-all":
             res = _api_call(http, "POST", "/api/sessions/stop-all")
@@ -253,7 +282,7 @@ def run_client_subcommand(argv: list[str], *, client: httpx.Client | None = None
                     f"Stopped {res['stopped_count']} session(s) | "
                     f"remaining={res['remaining_sessions']} | zero_burn_verified={res['zero_burn_verified']}"
                 )
-            return 0
+            return 0 if res.get("zero_burn_verified") else 2
 
         return 2
     except Exception as exc:
@@ -274,6 +303,13 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("Error: --mock-scenario cannot be combined with --real\n")
         return 2
 
+    api_token = _default_api_token()
+    if not _is_loopback_host(args.host) and not api_token:
+        sys.stderr.write(
+            f"Error: Refusing to bind non-loopback host {args.host!r} without COLAB_BOOST_API_TOKEN set.\n"
+        )
+        return 2
+
     paths = WorkspacePaths()
     store = SettingsStore(paths)
     settings = store.load()
@@ -286,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     store.save(settings)
 
     orch = ConsoleOrchestrator(paths=paths)
-    app = create_app(orch)
+    app = create_app(orch, api_token=api_token or None)
 
     url = f"http://{args.host}:{args.port}"
     mode_banner = "SANDBOX DEMO (Zero Billing)" if orch.backend.is_mock else "REAL GOOGLE COLAB"

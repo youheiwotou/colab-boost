@@ -6,6 +6,8 @@ import base64
 import hashlib
 import io
 import json
+import logging
+import os
 import re
 import tarfile
 import threading
@@ -13,7 +15,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from colab_boost.backends.base import (
     RESULT_MARKER,
@@ -50,6 +52,18 @@ from colab_boost.recipe_loader import (
 )
 from colab_boost.ssh_bridge import SshTunnelManager
 from colab_boost.vault import CredentialVault, redact_secrets
+
+logger = logging.getLogger(__name__)
+
+
+def _path_is_within(candidate: Path, root: Path) -> bool:
+    """Case-aware, drive-safe containment check (True if candidate == root or inside root)."""
+    try:
+        c = os.path.normcase(os.path.normpath(str(candidate)))
+        r = os.path.normcase(os.path.normpath(str(root)))
+        return os.path.commonpath([c, r]) == r
+    except ValueError:
+        return False
 
 
 def _utc_now() -> datetime:
@@ -548,6 +562,12 @@ class ConsoleOrchestrator:
     # -------------------- Sessions, Orphans & Cost Guards --------------------
 
     def list_sessions(self, include_all_accounts: bool = True) -> list[SessionInfo]:
+        sessions, _ = self.list_sessions_with_errors(include_all_accounts=include_all_accounts)
+        return sessions
+
+    def list_sessions_with_errors(
+        self, include_all_accounts: bool = True
+    ) -> tuple[list[SessionInfo], list[dict[str, str]]]:
         with self._lock:
             accts = list(self._accounts_dict().values())
             ledger = self._ledger_dict()
@@ -555,13 +575,22 @@ class ConsoleOrchestrator:
         target_accounts = accts if include_all_accounts else [a for a in accts if a.is_active]
         all_tunnels = self.tunnels.list_tunnels()
         sessions: list[SessionInfo] = []
+        failed_accounts: list[dict[str, str]] = []
 
         for acc in target_accounts:
             fetch_started = _utc_now()
             try:
                 tok = self._get_token_for_account(acc.id)
                 assignments = self.backend.list_assignments(acc.id, tok)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed listing assignments for account %s (%s): %s", acc.id, acc.email, exc)
+                failed_accounts.append(
+                    {
+                        "account_id": acc.id,
+                        "email": acc.email,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
                 continue
 
             live_endpoints = {a.endpoint for a in assignments}
@@ -582,9 +611,10 @@ class ConsoleOrchestrator:
                     ledger.pop(ep, None)
                 if stale_eps:
                     self._persist_ledger_if_real()
+                ledger_snap = {ep: dict(meta) for ep, meta in ledger.items()}
 
             for raw in assignments:
-                meta = ledger.get(raw.endpoint)
+                meta = ledger_snap.get(raw.endpoint)
                 managed = meta is not None
                 name = str(meta["name"]) if meta and meta.get("name") else f"orphan-{raw.endpoint[-8:]}"
                 if not self.backend.is_mock:
@@ -668,7 +698,7 @@ class ConsoleOrchestrator:
                     )
                 )
 
-        return sessions
+        return sessions, failed_accounts
 
     def _install_vm_watchdog(
         self,
@@ -733,13 +763,16 @@ class ConsoleOrchestrator:
             "keep_paths": kept,
         }
 
-    def provision_session(self, req: ProvisionRequest) -> SessionInfo:
-        op_id, cancel_ev = self._create_provision_op(req)
-        return self._run_provision_sync(op_id, req, cancel_ev)
+    def provision_session(
+        self, req: ProvisionRequest, *, cancel_ev: Optional[threading.Event] = None
+    ) -> SessionInfo:
+        op_id, effective_cancel = self._create_provision_op(req, cancel_ev=cancel_ev)
+        return self._run_provision_sync(op_id, req, effective_cancel)
 
     def start_provision_async(self, req: ProvisionRequest) -> ProvisionOperation:
         op_id, cancel_ev = self._create_provision_op(req)
-        op = self._provision_ops[op_id].model_copy(deep=True)
+        with self._lock:
+            op = self._provision_ops[op_id].model_copy(deep=True)
         threading.Thread(target=self._run_provision_thread, args=(op_id, req, cancel_ev), daemon=True).start()
         return op
 
@@ -749,7 +782,12 @@ class ConsoleOrchestrator:
         except Exception:
             pass
 
-    def _create_provision_op(self, req: ProvisionRequest) -> tuple[str, threading.Event]:
+    def _create_provision_op(
+        self, req: ProvisionRequest, *, cancel_ev: Optional[threading.Event] = None
+    ) -> tuple[str, threading.Event]:
+        if cancel_ev is not None and cancel_ev.is_set():
+            raise ColabBackendError("cancelled", "Provisioning cancelled by user.")
+
         with self._lock:
             acc = self.active_account() if not req.account_id else self._accounts_dict().get(req.account_id)
         if not acc:
@@ -759,7 +797,7 @@ class ConsoleOrchestrator:
         sess_name = (req.name or "").strip() or f"boost-{req.accelerator.value.lower()}-{uuid.uuid4().hex[:4]}"
         max_tries = self.settings.guards.max_vram_retries if req.min_vram_mib > 0 else 1
         op_id = f"prov-{uuid.uuid4().hex[:8]}"
-        cancel_ev = threading.Event()
+        effective_cancel = cancel_ev if cancel_ev is not None else threading.Event()
         done_ev = threading.Event()
         op = ProvisionOperation(
             op_id=op_id,
@@ -776,6 +814,8 @@ class ConsoleOrchestrator:
 
         active_prov_states = ("allocating", "probing", "retrying", "watchdog")
         with self._lock:
+            if effective_cancel.is_set():
+                raise ColabBackendError("cancelled", "Provisioning cancelled by user.")
             inflight_for_acc = sum(
                 1
                 for o in self._provision_ops.values()
@@ -796,11 +836,11 @@ class ConsoleOrchestrator:
                 raise ColabBackendError("duplicate_name", f"Session '{sess_name}' already exists; pick another name.")
 
             self._provision_ops[op_id] = op
-            self._provision_cancels[op_id] = cancel_ev
+            self._provision_cancels[op_id] = effective_cancel
             self._provision_done[op_id] = done_ev
 
         self._emit("provision_updated", op.model_copy(deep=True).model_dump(mode="json"))
-        return op_id, cancel_ev
+        return op_id, effective_cancel
 
     def cancel_provision(self, op_id: str) -> bool:
         with self._lock:
@@ -836,11 +876,61 @@ class ConsoleOrchestrator:
         auto_stop = req.auto_stop_minutes if req.auto_stop_minutes is not None else self.settings.guards.auto_stop_minutes
         idle_stop = req.idle_stop_minutes if req.idle_stop_minutes is not None else self.settings.guards.idle_stop_minutes
 
+        untracked_raw: Optional[RawAssignment] = None
+        untracked_started: Optional[datetime] = None
+
+        def _cleanup_untracked(raw_vm: RawAssignment, started_at: datetime, reason: str, est_spent: float = 0.01) -> None:
+            verified = False
+            try:
+                verified = self.backend.unassign_runtime(acc_id, tok, raw_vm.endpoint)
+            except Exception as unassign_exc:
+                logger.warning("Best-effort unassign failed for %s (%s): %s", raw_vm.endpoint, reason, unassign_exc)
+            balance_after: Optional[float] = None
+            try:
+                after_usage = self.refresh_account_usage(acc_id)
+                balance_after = after_usage.balance_ccu
+            except Exception as usage_exc:
+                logger.warning("Usage refresh failed during cleanup of %s: %s", raw_vm.endpoint, usage_exc)
+            self._record_receipt(
+                UnassignReceipt(
+                    receipt_id=uuid.uuid4().hex[:8],
+                    timestamp=_utc_now(),
+                    account_id=acc_id,
+                    account_email=acc.email,
+                    session_name=sess_name,
+                    endpoint=raw_vm.endpoint,
+                    accelerator=raw_vm.accelerator.value,
+                    reason=reason,
+                    started_at=started_at,
+                    duration_seconds=round((_utc_now() - started_at).total_seconds(), 2),
+                    estimated_ccu_spent=est_spent,
+                    balance_after_ccu=balance_after,
+                    verified_unassigned=verified,
+                    backend_mode=self.settings.backend_mode,
+                )
+            )
+
+        def _abort_if_cancelled(stage_label: str) -> None:
+            nonlocal untracked_raw, untracked_started
+            if not cancel_ev.is_set():
+                return
+            if untracked_raw is not None:
+                _cleanup_untracked(untracked_raw, untracked_started or _utc_now(), "cancelled_cleanup", est_spent=0.01)
+                untracked_raw = None
+                untracked_started = None
+                self._update_prov(
+                    op_id,
+                    state="cancelled",
+                    message=f"Cancelled during {stage_label}; assigned VM immediately unassigned.",
+                    finished_at=_utc_now(),
+                )
+                raise ColabBackendError("cancelled", "Provisioning cancelled and VM cleaned up.")
+            self._update_prov(op_id, state="cancelled", message="Provisioning cancelled; 0 VMs billed.", finished_at=_utc_now())
+            raise ColabBackendError("cancelled", "Provisioning cancelled by user.")
+
         try:
             for attempt in range(1, max_tries + 1):
-                if cancel_ev.is_set():
-                    self._update_prov(op_id, state="cancelled", message="Provisioning cancelled; 0 VMs billed.", finished_at=_utc_now())
-                    raise ColabBackendError("cancelled", "Provisioning cancelled by user.")
+                _abort_if_cancelled("pre-allocation")
 
                 self._update_prov(
                     op_id,
@@ -850,62 +940,26 @@ class ConsoleOrchestrator:
                 )
                 alloc_started = _utc_now()
                 raw = self.backend.assign_runtime(acc_id, tok, req.accelerator, high_mem=req.high_mem)
+                untracked_raw = raw
+                untracked_started = alloc_started
 
                 # Crucial safety invariant: if cancelled while assign was in flight, immediately release the VM!
-                if cancel_ev.is_set():
-                    verified = self.backend.unassign_runtime(acc_id, tok, raw.endpoint)
-                    after_usage = self.refresh_account_usage(acc_id)
-                    self._record_receipt(
-                        UnassignReceipt(
-                            receipt_id=uuid.uuid4().hex[:8],
-                            timestamp=_utc_now(),
-                            account_id=acc_id,
-                            account_email=acc.email,
-                            session_name=sess_name,
-                            endpoint=raw.endpoint,
-                            accelerator=raw.accelerator.value,
-                            reason="cancelled_cleanup",
-                            started_at=alloc_started,
-                            duration_seconds=round((_utc_now() - alloc_started).total_seconds(), 2),
-                            estimated_ccu_spent=0.01,
-                            balance_after_ccu=after_usage.balance_ccu,
-                            verified_unassigned=verified,
-                            backend_mode=self.settings.backend_mode,
-                        )
-                    )
-                    self._update_prov(
-                        op_id,
-                        state="cancelled",
-                        message="Cancelled during allocation; assigned VM immediately unassigned.",
-                        finished_at=_utc_now(),
-                    )
-                    raise ColabBackendError("cancelled", "Provisioning cancelled and VM cleaned up.")
+                _abort_if_cancelled("allocation")
 
                 self._update_prov(op_id, state="probing", message="Probing GPU VRAM & runtime environment...")
                 probe = self.backend.probe_hardware(raw)
+                _abort_if_cancelled("hardware probe")
 
                 if req.min_vram_mib > 0 and probe.vram_total_mib < req.min_vram_mib:
                     # Assigned GPU has less VRAM than requested (e.g. 40 GB A100 instead of 80 GB) -> release & retry!
-                    verified = self.backend.unassign_runtime(acc_id, tok, raw.endpoint)
-                    after_usage = self.refresh_account_usage(acc_id)
-                    self._record_receipt(
-                        UnassignReceipt(
-                            receipt_id=uuid.uuid4().hex[:8],
-                            timestamp=_utc_now(),
-                            account_id=acc_id,
-                            account_email=acc.email,
-                            session_name=sess_name,
-                            endpoint=raw.endpoint,
-                            accelerator=raw.accelerator.value,
-                            reason=f"vram_retry ({probe.vram_total_mib} < {req.min_vram_mib} MiB)",
-                            started_at=alloc_started,
-                            duration_seconds=round((_utc_now() - alloc_started).total_seconds(), 2),
-                            estimated_ccu_spent=0.02,
-                            balance_after_ccu=after_usage.balance_ccu,
-                            verified_unassigned=verified,
-                            backend_mode=self.settings.backend_mode,
-                        )
+                    _cleanup_untracked(
+                        raw,
+                        alloc_started,
+                        f"vram_retry ({probe.vram_total_mib} < {req.min_vram_mib} MiB)",
+                        est_spent=0.02,
                     )
+                    untracked_raw = None
+                    untracked_started = None
                     if attempt >= max_tries:
                         msg = (
                             f"Released {probe.gpu_name or raw.accelerator.value} ({probe.vram_total_mib} MiB < "
@@ -923,19 +977,29 @@ class ConsoleOrchestrator:
 
                 self._update_prov(op_id, state="watchdog", message="Arming VM-side auto-stop & idle watchdog...")
                 wd_info = self._install_vm_watchdog(raw, probe, auto_stop, idle_stop)
+                _abort_if_cancelled("watchdog setup")
 
+                cancelled_before_commit = False
                 with self._lock:
-                    self._ledger_dict()[raw.endpoint] = {
-                        "name": sess_name,
-                        "account_id": acc_id,
-                        "created_at": alloc_started.isoformat(),
-                        "gpu_name": probe.gpu_name,
-                        "vram_total_mib": probe.vram_total_mib,
-                        "vram_used_mib": probe.vram_used_mib,
-                        "gpu_util_percent": probe.gpu_util_percent,
-                        "watchdog": wd_info,
-                    }
-                    self._persist_ledger_if_real()
+                    if cancel_ev.is_set():
+                        cancelled_before_commit = True
+                    else:
+                        self._ledger_dict()[raw.endpoint] = {
+                            "name": sess_name,
+                            "account_id": acc_id,
+                            "created_at": alloc_started.isoformat(),
+                            "gpu_name": probe.gpu_name,
+                            "vram_total_mib": probe.vram_total_mib,
+                            "vram_used_mib": probe.vram_used_mib,
+                            "gpu_util_percent": probe.gpu_util_percent,
+                            "watchdog": wd_info,
+                        }
+                        self._persist_ledger_if_real()
+                        untracked_raw = None
+                        untracked_started = None
+
+                if cancelled_before_commit:
+                    _abort_if_cancelled("commit")
 
                 self.refresh_account_usage(acc_id)
                 self._update_prov(
@@ -953,13 +1017,31 @@ class ConsoleOrchestrator:
 
             raise ColabBackendError("provision_exhausted", "Provisioning attempts exhausted.")
         except Exception as exc:
+            # Zero-leak invariant: release any allocated VM that was not yet committed to the ledger!
+            if untracked_raw is not None:
+                cleanup_reason = "cancelled_cleanup" if cancel_ev.is_set() else "provision_failed_cleanup"
+                try:
+                    _cleanup_untracked(untracked_raw, untracked_started or _utc_now(), cleanup_reason, est_spent=0.01)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Failed cleaning up allocated VM %s after provision failure: %s",
+                        untracked_raw.endpoint,
+                        cleanup_exc,
+                    )
+                untracked_raw = None
+                untracked_started = None
+
             with self._lock:
                 op_now = self._provision_ops.get(op_id)
-                if op_now and op_now.state not in ("cancelled", "failed"):
-                    op_now.state = "failed"
-                    op_now.error = str(exc)
-                    op_now.message = str(exc)
-                    op_now.finished_at = _utc_now()
+                needs_update = bool(op_now and op_now.state not in ("cancelled", "failed"))
+            if needs_update:
+                self._update_prov(
+                    op_id,
+                    state="cancelled" if cancel_ev.is_set() else "failed",
+                    error=str(exc),
+                    message=str(exc),
+                    finished_at=_utc_now(),
+                )
             raise
         finally:
             with self._lock:
@@ -1013,8 +1095,8 @@ class ConsoleOrchestrator:
             raise KeyError(f"Session '{identifier}' already stopped.")
 
         try:
-            # Best-effort sync of declared [[keep]] artifacts before releasing the VM (always re-sync to capture latest outputs)
-            if reason not in ("deploy_cancelled", "deploy_failed_cleanup"):
+            # Best-effort sync of declared [[keep]] artifacts before releasing the VM (skip on emergency stop / deploy cleanup)
+            if reason not in ("deploy_cancelled", "deploy_failed_cleanup", "emergency_stop_all"):
                 with self._lock:
                     keep_run_ids = [
                         r.run_id
@@ -1075,6 +1157,11 @@ class ConsoleOrchestrator:
                 self._inflight_stops.pop(target.endpoint, None)
 
     def stop_all_sessions(self, reason: str = "emergency_stop_all") -> list[UnassignReceipt]:
+        return self.stop_all_sessions_detailed(reason=reason)["receipts"]
+
+    def stop_all_sessions_detailed(
+        self, reason: str = "emergency_stop_all", *, drain_timeout_s: float = 10.0
+    ) -> dict[str, Any]:
         # 1. Cancel any in-flight provisioning or deployment runs so no new VM slips through after stop_all!
         with self._lock:
             receipts_before = {r.receipt_id for r in self._receipts}
@@ -1084,25 +1171,51 @@ class ConsoleOrchestrator:
                 ev.set()
             pending_prov_done = list(self._provision_done.values())
 
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + max(0.0, drain_timeout_s)
         for done_ev in pending_prov_done:
             rem = max(0.0, deadline - time.monotonic())
-            if rem <= 0:
-                break
-            done_ev.wait(timeout=rem)
+            if rem > 0 and not done_ev.is_set():
+                done_ev.wait(timeout=rem)
+        timed_out_provisions = sum(1 for done_ev in pending_prov_done if not done_ev.is_set())
 
-        # 2. Stop every live session across all accounts
-        sessions = self.list_sessions(include_all_accounts=True)
         receipts: list[UnassignReceipt] = []
         seen_ids: set[str] = set()
-        for s in sessions:
-            try:
-                rc = self.stop_session(s.endpoint, account_id=s.account_id, reason=reason)
-                if rc.receipt_id not in seen_ids:
-                    seen_ids.add(rc.receipt_id)
-                    receipts.append(rc)
-            except KeyError:
-                continue
+        stop_errors: list[dict[str, str]] = []
+        initial_failed_accounts: list[dict[str, str]] = []
+
+        try:
+            # 2. Stop every live session across all accounts (never let one failure abort remaining stops)
+            sessions, initial_failed_accounts = self.list_sessions_with_errors(include_all_accounts=True)
+            for s in sessions:
+                try:
+                    rc = self.stop_session(s.endpoint, account_id=s.account_id, reason=reason)
+                    if rc.receipt_id not in seen_ids:
+                        seen_ids.add(rc.receipt_id)
+                        receipts.append(rc)
+                    if not rc.verified_unassigned:
+                        stop_errors.append(
+                            {
+                                "session_name": s.name,
+                                "endpoint": s.endpoint,
+                                "account_id": s.account_id,
+                                "error": "unassign_not_verified",
+                            }
+                        )
+                except KeyError:
+                    continue
+                except Exception as exc:
+                    logger.warning("stop_all_sessions failed stopping %s (%s): %s", s.name, s.endpoint, exc)
+                    stop_errors.append(
+                        {
+                            "session_name": s.name,
+                            "endpoint": s.endpoint,
+                            "account_id": s.account_id,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+        finally:
+            # Always tear down local SSH tunnels even if any stop failed
+            self.tunnels.stop_all()
 
         # Include any cancelled_cleanup receipts produced while draining in-flight allocations
         with self._lock:
@@ -1110,9 +1223,38 @@ class ConsoleOrchestrator:
                 if r.receipt_id not in receipts_before and r.receipt_id not in seen_ids:
                     seen_ids.add(r.receipt_id)
                     receipts.append(r.model_copy(deep=True))
+                    if not r.verified_unassigned:
+                        stop_errors.append(
+                            {
+                                "session_name": r.session_name,
+                                "endpoint": r.endpoint,
+                                "account_id": r.account_id,
+                                "error": "unassign_not_verified",
+                            }
+                        )
 
-        self.tunnels.stop_all()
-        return receipts
+        # 3. Re-verify zero remaining sessions across all accounts and track any account listing errors
+        remaining, verify_failed_accounts = self.list_sessions_with_errors(include_all_accounts=True)
+        merged_failed_map: dict[str, dict[str, str]] = {}
+        for item in (*initial_failed_accounts, *verify_failed_accounts):
+            merged_failed_map[item["account_id"]] = item
+        failed_accounts = list(merged_failed_map.values())
+
+        zero_burn_verified = (
+            len(remaining) == 0
+            and len(failed_accounts) == 0
+            and len(stop_errors) == 0
+            and timed_out_provisions == 0
+        )
+        return {
+            "stopped_count": len(receipts),
+            "remaining_sessions": len(remaining),
+            "zero_burn_verified": zero_burn_verified,
+            "receipts": receipts,
+            "failed_accounts": failed_accounts,
+            "stop_errors": stop_errors,
+            "timed_out_provisions": timed_out_provisions,
+        }
 
     def extend_session_deadline(self, session_name: str, add_minutes: int = 120) -> SessionInfo:
         if add_minutes <= 0 or add_minutes > 1440:
@@ -1223,6 +1365,14 @@ class ConsoleOrchestrator:
                             )
                         except KeyError:
                             continue
+                        except Exception as exc:
+                            logger.warning(
+                                "Cost guard balance_floor failed stopping %s (%s): %s",
+                                s.name,
+                                s.endpoint,
+                                exc,
+                            )
+                            continue
                     continue
 
             if guards.session_spend_cap_ccu > 0:
@@ -1237,6 +1387,14 @@ class ConsoleOrchestrator:
                                 )
                             )
                         except KeyError:
+                            continue
+                        except Exception as exc:
+                            logger.warning(
+                                "Cost guard spend_cap failed stopping %s (%s): %s",
+                                s.name,
+                                s.endpoint,
+                                exc,
+                            )
                             continue
         return triggered
 
@@ -2208,8 +2366,18 @@ class ConsoleOrchestrator:
         manifest = recipe.manifest
         session_info: Optional[SessionInfo] = None
         try:
+            if cancel_ev.is_set():
+                self._update_run(
+                    run_id,
+                    secrets,
+                    state="cancelled",
+                    message="Deployment cancelled before provisioning; 0 VMs billed.",
+                    finished_at=_utc_now(),
+                )
+                return
+
             if provisioned_fresh:
-                session_info = self.provision_session(prov_req)
+                session_info = self.provision_session(prov_req, cancel_ev=cancel_ev)
             else:
                 sessions = self.list_sessions(include_all_accounts=True)
                 session_info = next((s for s in sessions if s.name == prov_req.name), None)
@@ -2550,6 +2718,80 @@ class ConsoleOrchestrator:
             raise ValueError(f"Invalid remote VM path: {remote_path!r} (must be absolute without '..')")
         return cleaned
 
+    def _validate_local_path(self, local_path: str, *, mode: Literal["read", "write"] = "read") -> Path:
+        """Validates host-side upload/download paths against sensitive app, credential, and system directories."""
+        raw_text = (local_path or "").strip()
+        if not raw_text or "\x00" in raw_text:
+            raise ValueError(f"Invalid local path: {local_path!r}")
+
+        # Reject explicit POSIX system paths even when evaluated on Windows
+        posix_norm = raw_text.replace("\\", "/")
+        for posix_sys in ("/etc", "/proc", "/sys"):
+            if posix_norm == posix_sys or posix_norm.startswith(posix_sys + "/"):
+                raise ValueError(f"Access to protected system path is forbidden ({mode}): {local_path!r}")
+
+        expanded = Path(raw_text).expanduser()
+        abs_candidate = Path(os.path.abspath(str(expanded)))
+        real_candidate = Path(os.path.realpath(str(expanded)))
+        candidates = (abs_candidate, real_candidate)
+
+        app_home = Path(os.path.realpath(str(self.paths.home)))
+        app_home_abs = Path(os.path.abspath(str(self.paths.home)))
+        forbidden_roots: list[Path] = []
+        for base in (app_home, app_home_abs):
+            forbidden_roots.extend(
+                [
+                    base / "vault.local.json",
+                    base / "accounts.json",
+                    base / "settings.json",
+                    base / "keys",
+                    base / "ssh",
+                ]
+            )
+
+        user_home = Path.home()
+        for home_root in (Path(os.path.abspath(str(user_home))), Path(os.path.realpath(str(user_home)))):
+            forbidden_roots.extend(
+                [
+                    home_root / ".ssh",
+                    home_root / ".aws",
+                    home_root / ".gnupg",
+                    home_root / ".config" / "gcloud",
+                    home_root / ".gemini",
+                ]
+            )
+
+        if os.name == "nt":
+            win_dirs = {
+                r"C:\Windows",
+                os.environ.get("SystemRoot", "").strip(),
+                os.environ.get("WINDIR", "").strip(),
+            }
+            for wd in win_dirs:
+                if wd:
+                    forbidden_roots.append(Path(os.path.abspath(wd)))
+        else:
+            forbidden_roots.extend([Path("/etc"), Path("/proc"), Path("/sys")])
+
+        for cand in candidates:
+            for root in forbidden_roots:
+                if _path_is_within(cand, root):
+                    raise ValueError(f"Access to protected local path is forbidden ({mode}): {local_path!r}")
+
+        allowed_env = os.environ.get("COLAB_BOOST_ALLOWED_LOCAL_ROOTS", "").strip()
+        if allowed_env:
+            allowed_roots = [
+                Path(os.path.realpath(str(Path(item.strip()).expanduser())))
+                for item in allowed_env.split(os.pathsep)
+                if item.strip()
+            ]
+            if allowed_roots and not any(_path_is_within(real_candidate, ar) for ar in allowed_roots):
+                raise ValueError(
+                    f"Local path is outside COLAB_BOOST_ALLOWED_LOCAL_ROOTS ({mode}): {local_path!r}"
+                )
+
+        return real_candidate
+
     def _resolve_session_and_assignment(self, identifier: str) -> tuple[SessionInfo, RawAssignment]:
         sessions = self.list_sessions(include_all_accounts=True)
         target = next((s for s in sessions if s.name == identifier or s.endpoint == identifier), None)
@@ -2648,12 +2890,12 @@ class ConsoleOrchestrator:
         if bool(local_path) == bool(content_b64 is not None):
             raise ValueError("Provide exactly one of 'local_path' or 'content_b64'")
 
+        validated_src: Optional[Path] = self._validate_local_path(local_path, mode="read") if local_path else None
         target, raw = self._resolve_session_and_assignment(identifier)
-        if local_path:
-            lp = Path(local_path).expanduser().resolve()
-            if not lp.is_file():
-                raise KeyError(f"Local file not found: {lp}")
-            data_bytes = lp.read_bytes()
+        if validated_src is not None:
+            if not validated_src.is_file():
+                raise KeyError(f"Local file not found: {validated_src}")
+            data_bytes = validated_src.read_bytes()
         else:
             try:
                 data_bytes = base64.b64decode(content_b64 or "", validate=True)
@@ -2751,14 +2993,15 @@ class ConsoleOrchestrator:
     ) -> dict[str, Any]:
         """Downloads a remote file from an active Colab VM with chunked SHA256 verification."""
         rpath = self._validate_remote_path(remote_path)
+        validated_dst: Optional[Path] = self._validate_local_path(local_path, mode="write") if local_path else None
         target, raw = self._resolve_session_and_assignment(identifier)
 
         if self.backend.is_mock:
             raw_bytes = self._mock_backend.get_mock_file(target.endpoint, rpath)
             sha = hashlib.sha256(raw_bytes).hexdigest()
             chunks = max(1, (len(raw_bytes) + chunk_bytes - 1) // chunk_bytes)
-            if local_path:
-                dst = Path(local_path).expanduser().resolve()
+            if validated_dst is not None:
+                dst = validated_dst
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 tmp = dst.with_name(dst.name + ".tmp")
                 tmp.write_bytes(raw_bytes)
@@ -2814,8 +3057,8 @@ class ConsoleOrchestrator:
 
         dst: Optional[Path] = None
         tmp_path: Optional[Path] = None
-        if local_path:
-            dst = Path(local_path).expanduser().resolve()
+        if validated_dst is not None:
+            dst = validated_dst
             dst.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = dst.with_name(dst.name + f".{uuid.uuid4().hex[:6]}.tmp")
 

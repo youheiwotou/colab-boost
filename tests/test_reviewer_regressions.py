@@ -511,6 +511,28 @@ def test_real_playground_chat_auto_discovers_model_from_vllm_models_endpoint_and
         orch.update_settings({"backend_mode": "real"})
         app = create_app(orch)
         with TestClient(app) as client:
+            # Unregistered loopback port is blocked by SSRF guard unless registered or explicitly opted in
+            blocked = client.post(
+                "/api/playground/chat",
+                json={
+                    "base_url": f"http://127.0.0.1:{vport}",
+                    "model": "default",
+                    "api_key": "sk-vllm-999",
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+            )
+            assert blocked.status_code == 403
+            assert blocked.json()["detail"]["kind"] == "ssrf_blocked"
+
+            # Registering the local tunnel port allows Playground chat cleanly
+            orch.tunnels.register_mock_tunnel(
+                session_name="vllm-sess",
+                account_id="acc-real",
+                remote_port=vport,
+                local_port=vport,
+                path="/v1",
+                kind="openai",
+            )
             resp = client.post(
                 "/api/playground/chat",
                 json={

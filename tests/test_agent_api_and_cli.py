@@ -199,3 +199,123 @@ def test_real_mode_chunked_upload_download_and_secret_redacted_exec(isolated_pat
     assert ex["ok"] is True
     assert "hf_secret_token_do_not_leak" not in ex["stdout"]
     assert "***" in ex["stdout"]
+
+
+def test_local_path_security_boundary_blocks_sensitive_and_honors_whitelist(
+    orchestrator: ConsoleOrchestrator, tmp_path: Path, monkeypatch
+) -> None:
+    import os
+
+    sess_name = orchestrator.list_sessions()[0].name
+
+    # Seed app-internal sensitive files to prove both read (upload) and write (download) are blocked
+    orchestrator.paths.vault_fallback_file.write_text('{"secret":"top"}', encoding="utf-8")
+    orchestrator.paths.accounts_file.write_text("[]", encoding="utf-8")
+    orchestrator.paths.settings_file.write_text("{}", encoding="utf-8")
+    keys_dir = orchestrator.paths.home / "keys"
+    keys_dir.mkdir(parents=True, exist_ok=True)
+    key_file = keys_dir / "id_ed25519"
+    key_file.write_text("PRIVATE KEY", encoding="utf-8")
+
+    # Seed a mock remote file for download boundary checks
+    safe_src = tmp_path / "safe.bin"
+    safe_src.write_bytes(b"ok-bytes")
+    orchestrator.upload_to_session(sess_name, "/content/safe.bin", local_path=str(safe_src))
+
+    protected_paths = [
+        str(orchestrator.paths.vault_fallback_file),
+        str(orchestrator.paths.accounts_file),
+        str(orchestrator.paths.settings_file),
+        str(key_file),
+        str(orchestrator.paths.ssh_dir / "id_ed25519"),
+        str(Path.home() / ".ssh" / "id_rsa"),
+        str(Path.home() / ".aws" / "credentials"),
+        str(Path.home() / ".gnupg" / "secring.gpg"),
+        str(Path.home() / ".config" / "gcloud" / "credentials.db"),
+        str(Path.home() / ".gemini" / "settings.json"),
+        "/etc/passwd",
+        "/proc/self/environ",
+        "/sys/kernel/notes",
+    ]
+    if os.name == "nt":
+        protected_paths.append(r"C:\Windows\System32\drivers\etc\hosts")
+
+    for bad_path in protected_paths:
+        with pytest.raises(ValueError, match="forbidden"):
+            orchestrator.upload_to_session(sess_name, "/content/exfil.bin", local_path=bad_path)
+        with pytest.raises(ValueError, match="forbidden"):
+            orchestrator.download_from_session(sess_name, "/content/safe.bin", local_path=bad_path)
+
+    # Symlink escaping into protected vault file must also be blocked (when OS permits symlinks)
+    link_path = tmp_path / "innocent_link.json"
+    try:
+        os.symlink(orchestrator.paths.vault_fallback_file, link_path)
+    except OSError:
+        link_path = None
+    if link_path is not None:
+        with pytest.raises(ValueError, match="forbidden"):
+            orchestrator.upload_to_session(sess_name, "/content/exfil.bin", local_path=str(link_path))
+
+    # Optional COLAB_BOOST_ALLOWED_LOCAL_ROOTS whitelist restricts paths to approved directories
+    allowed_dir = tmp_path / "allowed"
+    denied_dir = tmp_path / "denied"
+    allowed_dir.mkdir()
+    denied_dir.mkdir()
+    ok_file = allowed_dir / "ok.txt"
+    ok_file.write_bytes(b"allowed-data")
+    outside_file = denied_dir / "outside.txt"
+    outside_file.write_bytes(b"denied-data")
+
+    monkeypatch.setenv("COLAB_BOOST_ALLOWED_LOCAL_ROOTS", str(allowed_dir))
+    up_ok = orchestrator.upload_to_session(sess_name, "/content/ok.txt", local_path=str(ok_file))
+    assert up_ok["bytes"] == len(b"allowed-data")
+    with pytest.raises(ValueError, match="COLAB_BOOST_ALLOWED_LOCAL_ROOTS"):
+        orchestrator.upload_to_session(sess_name, "/content/out.txt", local_path=str(outside_file))
+    with pytest.raises(ValueError, match="COLAB_BOOST_ALLOWED_LOCAL_ROOTS"):
+        orchestrator.download_from_session(sess_name, "/content/ok.txt", local_path=str(denied_dir / "out.txt"))
+
+
+def test_cli_stop_exit_codes_bearer_token_and_non_loopback_host_guard(
+    isolated_paths, monkeypatch, capsys
+) -> None:
+    from colab_boost.backends.mock import MockColabBackend
+    from colab_boost.cli import main as cli_main
+
+    # 1. Refusing non-loopback host without COLAB_BOOST_API_TOKEN
+    monkeypatch.delenv("COLAB_BOOST_API_TOKEN", raising=False)
+    assert cli_main(["--host", "0.0.0.0", "--mock"]) == 2
+    assert "COLAB_BOOST_API_TOKEN" in capsys.readouterr().err
+
+    # 2. CLI automatically sends COLAB_BOOST_API_TOKEN Bearer header & exits non-zero on unverified stop/stop-all
+    class UnverifiedStopMock(MockColabBackend):
+        def unassign_runtime(self, account_id: str, token_json: str, endpoint: str) -> bool:
+            return False
+
+    orch = ConsoleOrchestrator(
+        paths=isolated_paths,
+        mock_backend=UnverifiedStopMock(scenario="single"),
+        force_file_vault=True,
+    )
+    sess = orch.provision_session(__import__("colab_boost.models", fromlist=["ProvisionRequest"]).ProvisionRequest(accelerator=Accelerator.T4))
+    app = create_app(orch, api_token="cli-bearer-xyz")
+
+    with TestClient(app) as client:
+        # Without token -> CLI fails with exit code 1 (HTTP 401)
+        assert run_client_subcommand(["status", "--json"], client=client) == 1
+        capsys.readouterr()
+
+        # With token -> status succeeds
+        monkeypatch.setenv("COLAB_BOOST_API_TOKEN", "cli-bearer-xyz")
+        assert run_client_subcommand(["status", "--json"], client=client) == 0
+        capsys.readouterr()
+
+        # Single stop when verified_unassigned=False -> exit code 2
+        assert run_client_subcommand(["stop", sess.name, "--json"], client=client) == 2
+        stop_out = json.loads(capsys.readouterr().out)
+        assert stop_out["verified_unassigned"] is False
+
+        # stop-all when zero_burn_verified=False -> exit code 2
+        assert run_client_subcommand(["stop-all", "--json"], client=client) == 2
+        sa_out = json.loads(capsys.readouterr().out)
+        assert sa_out["zero_burn_verified"] is False
+        assert len(sa_out["stop_errors"]) >= 1

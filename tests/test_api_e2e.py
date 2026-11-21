@@ -446,3 +446,149 @@ vm.runInContext(fs.readFileSync(input.appJs, 'utf8'), ctx);
 
         client.post("/api/sessions/stop-all")
 
+
+def test_guard_monitor_loop_survives_exception_and_clean_shutdown(isolated_paths) -> None:
+    import time
+
+    orch = ConsoleOrchestrator(paths=isolated_paths, force_file_vault=True)
+    ticks = [0]
+
+    def flaky_guards():
+        ticks[0] += 1
+        if ticks[0] == 1:
+            raise RuntimeError("Simulated transient guard error")
+        return []
+
+    orch.evaluate_cost_guards = flaky_guards  # type: ignore[method-assign]
+    app = create_app(orch, guard_interval_s=0.05)
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and ticks[0] < 2:
+            time.sleep(0.03)
+    assert ticks[0] >= 2
+
+
+def test_http_and_ws_security_host_origin_csrf_and_bearer_token(orchestrator: ConsoleOrchestrator, monkeypatch) -> None:
+    import pytest
+    from starlette.websockets import WebSocketDisconnect
+
+    token = "secret-console-token-9988"
+    app = create_app(orchestrator, api_token=token)
+    with TestClient(app) as client:
+        # 1. Disallowed Host header (DNS rebinding) -> 403
+        bad_host = client.get("/api/health", headers={"Host": "evil.attacker.example:8765"})
+        assert bad_host.status_code == 403
+        assert bad_host.json()["detail"]["kind"] == "forbidden_host"
+
+        # Allowed via COLAB_BOOST_ALLOWED_HOSTS
+        monkeypatch.setenv("COLAB_BOOST_ALLOWED_HOSTS", "my-dev-box.local")
+        ok_custom_host = client.get("/api/health", headers={"Host": "my-dev-box.local:8765"})
+        assert ok_custom_host.status_code == 200
+        monkeypatch.delenv("COLAB_BOOST_ALLOWED_HOSTS", raising=False)
+
+        # 2. /api/health stays accessible without token, while other /api/* require Bearer token
+        assert client.get("/api/health").status_code == 200
+        unauth = client.get("/api/bootstrap")
+        assert unauth.status_code == 401
+        wrong_tok = client.get("/api/bootstrap", headers={"Authorization": "Bearer wrong-token"})
+        assert wrong_tok.status_code == 401
+        ok_auth = client.get("/api/bootstrap", headers={"Authorization": f"Bearer {token}"})
+        assert ok_auth.status_code == 200
+
+        # 3. Cross-site CSRF & bad Origin blocked on mutating /api/* even with valid token
+        bad_origin = client.patch(
+            "/api/settings",
+            json={"theme": "light"},
+            headers={"Authorization": f"Bearer {token}", "Origin": "https://evil.example"},
+        )
+        assert bad_origin.status_code == 403
+        assert bad_origin.json()["detail"]["kind"] == "csrf_blocked"
+
+        bad_sfs = client.patch(
+            "/api/settings",
+            json={"theme": "light"},
+            headers={"Authorization": f"Bearer {token}", "Sec-Fetch-Site": "cross-site"},
+        )
+        assert bad_sfs.status_code == 403
+
+        ok_same_origin = client.patch(
+            "/api/settings",
+            json={"theme": "light"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Origin": "http://127.0.0.1:8765",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        assert ok_same_origin.status_code == 200
+
+        # 4. WebSocket rejects bad Host, bad Origin, cross-site Sec-Fetch-Site, and missing/wrong token
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/events"):
+                pass
+
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                "/ws/events",
+                headers={"Authorization": f"Bearer {token}", "Origin": "https://evil.example"},
+            ):
+                pass
+
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                "/ws/events",
+                headers={"Authorization": f"Bearer {token}", "Host": "evil.example"},
+            ):
+                pass
+
+        # Valid WS with Bearer header or query token connects cleanly
+        with client.websocket_connect("/ws/events", headers={"Authorization": f"Bearer {token}"}) as ws:
+            assert ws.receive_json()["type"] == "connected"
+        with client.websocket_connect(f"/ws/events?token={token}") as ws:
+            assert ws.receive_json()["type"] == "connected"
+
+
+def test_playground_chat_real_mode_ssrf_protection(isolated_paths, monkeypatch) -> None:
+    from colab_boost.backends.mock import MockColabBackend
+
+    class RealStub(MockColabBackend):
+        @property
+        def is_mock(self) -> bool:
+            return False
+
+    orch = ConsoleOrchestrator(paths=isolated_paths, direct_backend=RealStub("signed_out"), force_file_vault=True)
+    orch.update_settings({"backend_mode": "real"})
+    app = create_app(orch)
+    with TestClient(app) as client:
+        # External / metadata IP blocked with 403
+        r_meta = client.post(
+            "/api/playground/chat",
+            json={"base_url": "http://169.254.169.254/latest", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r_meta.status_code == 403
+        assert r_meta.json()["detail"]["kind"] == "ssrf_blocked"
+
+        # Unregistered loopback port blocked with 403
+        r_unreg = client.post(
+            "/api/playground/chat",
+            json={"base_url": "http://127.0.0.1:59999", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r_unreg.status_code == 403
+        assert r_unreg.json()["detail"]["kind"] == "ssrf_blocked"
+
+        # Non-HTTP scheme blocked with 400
+        r_file = client.post(
+            "/api/playground/chat",
+            json={"base_url": "file:///etc/passwd", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r_file.status_code == 400
+
+        # Explicit env opt-in bypasses the SSRF allowlist (reaches upstream connection attempt -> 502)
+        monkeypatch.setenv("COLAB_BOOST_ALLOW_CUSTOM_PLAYGROUND_URL", "1")
+        r_custom = client.post(
+            "/api/playground/chat",
+            json={"base_url": "http://127.0.0.1:59999", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r_custom.status_code == 502
+

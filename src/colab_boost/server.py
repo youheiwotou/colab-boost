@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hmac
+import logging
+import os
 from pathlib import Path
 import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field
@@ -25,6 +29,71 @@ from colab_boost.gguf_planner import (
 from colab_boost.models import DeployRequest, ProvisionRequest
 from colab_boost.orchestrator import ConsoleOrchestrator
 from colab_boost.recipe_loader import RecipeValidationError
+
+logger = logging.getLogger(__name__)
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "testserver"})
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _extract_hostname_from_host(host_header: Optional[str]) -> Optional[str]:
+    raw = (host_header or "").strip()
+    if not raw or any(ch.isspace() for ch in raw) or "/" in raw or "\\" in raw or "@" in raw:
+        return None
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end == -1:
+            return None
+        host = raw[1:end].strip().lower()
+        rest = raw[end + 1 :]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return None
+        return host or None
+    if ":" in raw:
+        host, port = raw.rsplit(":", 1)
+        if not port.isdigit():
+            return None
+        return host.strip().lower() or None
+    return raw.lower()
+
+
+def _get_allowed_hosts() -> set[str]:
+    allowed = set(_DEFAULT_ALLOWED_HOSTS)
+    extra = os.environ.get("COLAB_BOOST_ALLOWED_HOSTS", "").strip()
+    if extra:
+        for item in extra.split(","):
+            parsed = _extract_hostname_from_host(item)
+            if parsed:
+                allowed.add(parsed)
+    return allowed
+
+
+def _is_allowed_origin(origin_header: str, allowed_hosts: set[str]) -> bool:
+    raw = origin_header.strip()
+    if not raw or raw.lower() == "null":
+        return False
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    return parsed.hostname.lower() in allowed_hosts
+
+
+def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
+    if not auth_header:
+        return None
+    scheme, sep, token = auth_header.strip().partition(" ")
+    if not sep or scheme.lower() != "bearer":
+        return None
+    cleaned = token.strip()
+    return cleaned or None
+
+
+def _resolve_api_token(explicit_token: Optional[str]) -> str:
+    if explicit_token is not None:
+        return explicit_token.strip()
+    return os.environ.get("COLAB_BOOST_API_TOKEN", "").strip()
 
 
 class OAuthCompleteBody(BaseModel):
@@ -138,7 +207,12 @@ def _map_domain_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail={"kind": "internal_error", "message": f"{type(exc).__name__}: {exc}"})
 
 
-def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
+def create_app(
+    orchestrator: Optional[ConsoleOrchestrator] = None,
+    *,
+    api_token: Optional[str] = None,
+    guard_interval_s: float = 30.0,
+) -> FastAPI:
     orch = orchestrator or ConsoleOrchestrator()
     ws_clients: set[WebSocket] = set()
     loop_ref: list[Optional[asyncio.AbstractEventLoop]] = [None]
@@ -169,13 +243,21 @@ def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
     async def lifespan(_app: FastAPI):
         loop_ref[0] = asyncio.get_running_loop()
         stop_bg = asyncio.Event()
+        poll_interval = max(0.01, float(guard_interval_s))
 
         async def guard_monitor_loop() -> None:
             while not stop_bg.is_set():
                 try:
-                    await asyncio.wait_for(stop_bg.wait(), timeout=30.0)
+                    await asyncio.wait_for(stop_bg.wait(), timeout=poll_interval)
                 except asyncio.TimeoutError:
-                    await asyncio.to_thread(orch.evaluate_cost_guards)
+                    try:
+                        await asyncio.to_thread(orch.evaluate_cost_guards)
+                    except Exception:
+                        logger.exception("Cost guard background evaluation failed; continuing monitor loop")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Unexpected error in guard_monitor_loop; continuing")
 
         guard_task = asyncio.create_task(guard_monitor_loop())
         try:
@@ -183,6 +265,12 @@ def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
         finally:
             stop_bg.set()
             guard_task.cancel()
+            try:
+                await guard_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Error awaiting cancelled guard_monitor_loop")
             unsubscribe()
             orch.shutdown()
 
@@ -192,6 +280,46 @@ def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.orchestrator = orch
+
+    @app.middleware("http")
+    async def security_guard_middleware(request: Request, call_next):
+        allowed_hosts = _get_allowed_hosts()
+        host_header = request.headers.get("host")
+        hostname = _extract_hostname_from_host(host_header)
+        if not hostname or hostname not in allowed_hosts:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": {"kind": "forbidden_host", "message": f"Disallowed Host header: {host_header!r}"}},
+            )
+
+        path = request.url.path
+        if path.startswith("/api/"):
+            if request.method.upper() in _MUTATING_METHODS:
+                sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+                if sec_fetch_site == "cross-site":
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": {"kind": "csrf_blocked", "message": "Cross-site mutating request rejected"}},
+                    )
+                origin = request.headers.get("origin")
+                if origin is not None and not _is_allowed_origin(origin, allowed_hosts):
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": {"kind": "csrf_blocked", "message": f"Disallowed Origin header: {origin!r}"}},
+                    )
+
+            if path != "/api/health":
+                expected_token = _resolve_api_token(api_token)
+                if expected_token:
+                    provided = _extract_bearer_token(request.headers.get("authorization"))
+                    if not provided or not hmac.compare_digest(provided, expected_token):
+                        return JSONResponse(
+                            status_code=401,
+                            content={"detail": {"kind": "unauthorized", "message": "Missing or invalid API bearer token"}},
+                            headers={"WWW-Authenticate": "Bearer"},
+                        )
+
+        return await call_next(request)
 
     web_dir = Path(__file__).resolve().parent / "web"
     app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
@@ -299,14 +427,7 @@ def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
     @app.post("/api/sessions/stop-all")
     async def api_stop_all_sessions() -> dict[str, Any]:
         try:
-            receipts = await asyncio.to_thread(orch.stop_all_sessions, "emergency_stop_all")
-            remaining = await asyncio.to_thread(orch.list_sessions, True)
-            return {
-                "stopped_count": len(receipts),
-                "remaining_sessions": len(remaining),
-                "zero_burn_verified": len(remaining) == 0,
-                "receipts": receipts,
-            }
+            return await asyncio.to_thread(orch.stop_all_sessions_detailed, "emergency_stop_all")
         except Exception as exc:
             raise _map_domain_error(exc) from exc
 
@@ -602,6 +723,33 @@ def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
 
         if not target_url:
             raise HTTPException(status_code=400, detail={"kind": "invalid_input", "message": "Select an active OpenAI tunnel or enter base_url"})
+
+        parsed_target = urlparse(target_url)
+        if parsed_target.scheme not in ("http", "https") or not parsed_target.hostname:
+            raise HTTPException(status_code=400, detail={"kind": "invalid_input", "message": "Invalid base_url (must be http:// or https://)"})
+        if parsed_target.username or parsed_target.password:
+            raise HTTPException(status_code=400, detail={"kind": "invalid_input", "message": "Credentials in base_url are not allowed"})
+
+        if tun is None:
+            allow_custom = os.environ.get("COLAB_BOOST_ALLOW_CUSTOM_PLAYGROUND_URL", "").strip().lower() in ("1", "true", "yes")
+            if not allow_custom:
+                target_host = parsed_target.hostname.lower()
+                target_port = parsed_target.port or (443 if parsed_target.scheme == "https" else 80)
+                registered_ports = {
+                    t.local_port for t in orch.tunnels.list_tunnels() if t.status == "open" and t.local_port
+                }
+                if target_host not in _LOOPBACK_HOSTS or target_port not in registered_ports:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "kind": "ssrf_blocked",
+                            "message": (
+                                "Playground base_url must target an active registered local tunnel port "
+                                "(or set COLAB_BOOST_ALLOW_CUSTOM_PLAYGROUND_URL=1)."
+                            ),
+                        },
+                    )
+
         if not target_url.endswith("/v1") and "/v1/" not in target_url:
             target_url = target_url + "/v1"
 
@@ -611,7 +759,7 @@ def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
 
         t0 = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
+            async with httpx.AsyncClient(timeout=180.0, follow_redirects=False) as client:
                 if resolved_model in ("", "default", "auto"):
                     try:
                         m_resp = await client.get(f"{target_url}/models", headers=headers, timeout=10.0)
@@ -657,6 +805,29 @@ def create_app(orchestrator: Optional[ConsoleOrchestrator] = None) -> FastAPI:
 
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket) -> None:
+        allowed_hosts = _get_allowed_hosts()
+        hostname = _extract_hostname_from_host(ws.headers.get("host"))
+        if not hostname or hostname not in allowed_hosts:
+            await ws.close(code=1008)
+            return
+
+        sec_fetch_site = (ws.headers.get("sec-fetch-site") or "").strip().lower()
+        if sec_fetch_site == "cross-site":
+            await ws.close(code=1008)
+            return
+
+        origin = ws.headers.get("origin")
+        if origin is not None and not _is_allowed_origin(origin, allowed_hosts):
+            await ws.close(code=1008)
+            return
+
+        expected_token = _resolve_api_token(api_token)
+        if expected_token:
+            provided = _extract_bearer_token(ws.headers.get("authorization")) or (ws.query_params.get("token") or "").strip() or None
+            if not provided or not hmac.compare_digest(provided, expected_token):
+                await ws.close(code=1008)
+                return
+
         await ws.accept()
         ws_clients.add(ws)
         try:
